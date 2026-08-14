@@ -1332,3 +1332,50 @@ machine reproducing (or failing to reproduce) it locally, and by dumping
 the OVMF serial console log (`-serial file:...`, already captured but
 never printed anywhere) for both boots to see if OVMF's own boot-time
 messages show what's actually being measured differently.
+
+## Debian added to the distro packaging matrix (2026-08-15)
+
+User asked for Debian coverage specifically, separate from Ubuntu, and
+asked what distro coverage already existed first. Answer at the time:
+Ubuntu 24.04, Fedora 40, Arch (rolling), openSUSE Tumbleweed (rolling) +
+an arm64 cross-build of the Ubuntu one - no Debian proper.
+
+Worth its own Dockerfile even though Debian and Ubuntu both go through
+`install.sh`'s same `apt` branch: same package manager, but a different
+base image, different default package set, and different exact package
+versions (Debian stable tends to ship older versions of everything than
+Ubuntu's latest LTS) - "works on Ubuntu" was never actual proof it works
+on Debian too, just an untested assumption. Added
+`test/distro/Dockerfile.debian` (`FROM debian:13` - Trixie, current
+Debian stable at the time of writing, mirrors the existing pattern of
+pinning a specific numbered release rather than a floating tag, same as
+`ubuntu:24.04`/`fedora:40`), wired into `test/run-all.sh`, `Makefile`'s
+`test-packaging` target, and the `packaging` matrix in
+`.github/workflows/test.yml`.
+
+No changes needed to `install.sh` itself - its `apt` branch already
+covers Debian generically (same `libpam0g-dev`/`tpm2-tools`/`gcc` package
+names as Ubuntu; unlike the openSUSE case, which needed an explicit
+`tpm2-tools` → `tpm2.0-tools` name translation, Debian's package names
+matched Ubuntu's exactly, confirmed by the test actually passing on the
+first build rather than assumed).
+
+Verified directly, not just "should work": built and ran the new
+container standalone (`docker build -f test/distro/Dockerfile.debian ...
+&& docker run ...`) - passed on the first try, `find_pam_module_dir()`
+correctly landed on `/lib/x86_64-linux-gnu/security` with `pam_unix.so`
+present, confirming "Debian GNU/Linux 13 (trixie)" in the container's own
+output. Then re-ran the full `test/run-all.sh` end to end to confirm nothing
+else regressed - all layers `PASS` (arm64 leg correctly `SKIPPED` on this
+machine, no qemu binfmt registered locally, same as before).
+
+Done on a fresh branch (`test/debian-docker`) off `main`, deliberately not
+based on the not-yet-merged `feat/vm-tests-init` branch (the VM test layer
+from the previous session, held back from merging pending a CI failure
+investigation there - see that branch's own JOURNAL.md entries above) to
+avoid any dependency between the two pieces of unmerged work.
+`feat/vm-tests-init` was merged into `main` in the meantime (PR #1); this
+entry originally followed immediately after the "Docker test suite
+reviewed" entry on this branch's own history, reordered here after the
+merge conflict with `main` to keep the file in actual chronological order
+rather than merge order.

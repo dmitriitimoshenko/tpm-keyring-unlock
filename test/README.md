@@ -33,14 +33,18 @@ actually runs there, never skips.
   the timeout (`-DHELPER_TIMEOUT_SECS=2` for the test, instead of waiting
   out the real 15s - asserts the process actually gets killed and the call
   returns promptly instead of hanging).
-- **`test/distro/Dockerfile.{ubuntu,fedora,arch,opensuse}`** +
+- **`test/distro/Dockerfile.{ubuntu,debian,fedora,arch,opensuse}`** +
   **`test/distro/test-packaging.sh`** — on each distro's own real base
   image: install the declared dependencies via that distro's real package
   manager (exercising `install.sh`'s actual per-manager package-name
   mapping, not a mock of it), compile the module against that distro's
   real PAM headers, and confirm `find_pam_module_dir()` (`bin/lib.sh`)
   lands on a directory that genuinely contains `pam_unix.so` on that
-  distro - not just "some directory existed".
+  distro - not just "some directory existed". Debian gets its own
+  Dockerfile alongside Ubuntu's even though both go through the same
+  `apt` codepath in `install.sh`: same package manager, different base
+  image and default package versions, so "works on Ubuntu" isn't proof it
+  works on Debian proper too.
 - **arm64 cross-build** of the Ubuntu packaging test, via `docker buildx
   --platform linux/arm64` (needs `qemu-user-static`/binfmt registered on
   the host - see your distro's docs for `docker buildx` + QEMU

@@ -28,7 +28,7 @@ test-runtime:
 
 # Just the per-distro dependency/compile/PAM-dir-detection tests.
 test-packaging:
-	@for d in ubuntu fedora arch opensuse; do \
+	@for d in ubuntu debian fedora arch opensuse; do \
 		echo "--- $$d ---"; \
 		docker build -q -f test/distro/Dockerfile.$$d -t tpm-keyring-unlock-test-$$d . && \
 		docker run --rm tpm-keyring-unlock-test-$$d || exit 1; \
