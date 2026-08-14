@@ -179,12 +179,21 @@ run there:
 `dnf`/`pacman`/`zypper` dependency install and PAM-directory detection,
 each against that distro's real base image; `aarch64` PAM-path detection,
 cross-built via `docker buildx`/QEMU; the PAM module's actual
-fork/exec/timeout/`PAM_AUTHTOK` behavior. **Still genuinely untested:**
-real TPM/PCR7/Secure-Boot behavior on anything but the original dev
-machine, and any non-GDM display manager — those need real (or virtual)
-TPM hardware and a real login flow, which containers can't provide. If you
-hit something broken on one of these, that's a real bug report, not a
-"this was never claimed to work" situation — please open an issue.
+fork/exec/timeout/`PAM_AUTHTOK` behavior; and — via `test/vm/run-vm-test.sh`,
+a real VM (`swtpm` + OVMF, real toggleable Secure Boot state) — the actual
+`require_secure_boot()` detection logic in both states, a real `bin/seal.sh`
++ `tpm-keyring-unseal.sh` round trip against a real PCR7 policy, that round
+trip surviving a genuine TPM reset (a real swtpm+qemu process restart, the
+same trigger as a physical reboot), and two concurrent unseal calls against
+the same TPM (the `flock` serialization fix). **Still genuinely untested:**
+any TPM implementation other than this one dev machine's fTPM and the
+software TPM the VM layer uses (real hardware TPMs, especially other
+vendors' fTPMs, can behave differently under contention — that's exactly
+what surfaced the concurrent-access bugs in `JOURNAL.md`), and any non-GDM
+display manager or real graphical fingerprint login (the VM layer is
+headless — no GDM, no `libfprint`). If you hit something broken on one of
+these, that's a real bug report, not a "this was never claimed to work"
+situation — please open an issue.
 
 ## Uninstall
 

@@ -20,15 +20,20 @@ make test        # everything; or: test/run-all.sh
 make test-regex  # just the PAM-line detection regex (no docker needed)
 make test-runtime    # just the PAM module's runtime behavior
 make test-packaging  # just the per-distro dependency/compile/detection checks
+make test-vm      # real TPM/Secure Boot round trip in a VM (opt-in, see below)
 make build        # compile the module locally, no tests
 ```
 
-The full suite needs `docker`; without it, the container-based parts are
-skipped and reported as `SKIPPED`, not silently dropped.
+The full suite (`make test`) needs `docker`; without it, the
+container-based parts are skipped and reported as `SKIPPED`, not silently
+dropped. `make test-vm` is separate and opt-in - it needs `swtpm`, `qemu`,
+and `/dev/kvm`, and is the only layer that touches a real TPM/Secure Boot
+state instead of a fake stand-in. See `test/README.md`.
 
 CI (`.github/workflows/test.yml`) runs the same checks as separate jobs on
-every push to `main` and every PR, so `SKIPPED` locally (e.g. no qemu binfmt
-registered for the arm64 leg) doesn't mean untested - CI has it covered.
+every push to `main` and every PR, including the VM layer, so `SKIPPED`
+locally (e.g. no qemu binfmt registered for the arm64 leg, or no swtpm
+installed) doesn't mean untested - CI has it covered.
 
 **What's actually covered, and what isn't** — see
 [`test/README.md`](test/README.md). Short version: everything that

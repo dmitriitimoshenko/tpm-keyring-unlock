@@ -2,16 +2,24 @@
 # use this project - install.sh/uninstall.sh never call make - this is
 # purely for running the test suite without remembering paths.
 
-.PHONY: test test-regex test-runtime test-packaging build clean
+.PHONY: test test-regex test-runtime test-packaging test-vm build clean
 
 # Full suite: regex/detection (no docker), runtime behavior, per-distro
 # packaging + arm64 cross-build. See test/README.md for what each covers.
+# Doesn't include test-vm - see that target, it's opt-in (slower, needs
+# swtpm/KVM).
 test:
 	./test/run-all.sh
 
 # Just the fast, no-docker regex/detection logic test.
 test-regex:
 	./test/unit-regex-test.sh
+
+# Real TPM/Secure Boot round trip in a VM (swtpm + OVMF) - the layer Docker
+# structurally can't cover. Needs swtpm, qemu, and /dev/kvm; degrades to a
+# clean SKIPPED if any are missing. See test/README.md.
+test-vm:
+	./test/vm/run-vm-test.sh
 
 # Just the PAM module runtime-behavior test (pamtester + fake helper).
 test-runtime:
