@@ -1150,3 +1150,92 @@ product code it's testing. All four bugs above were in the test harness,
 none in `bin/seal.sh`, `pam/tpm-keyring-unseal.sh`, or `bin/lib.sh` - but
 finding and fixing them was exactly as real a debugging exercise as the
 TPM/PCR bugs those scripts already went through.
+
+## Bug 5: reboot-survival check failed on real GitHub Actions CI, passed locally (2026-08-15)
+
+First actual CI run of the `vm` job (GitHub Actions, PR #1) failed on
+exactly the check bugs 1-4 above were fixed to make trustworthy - the
+reboot-survival unseal - even though it had just passed twice in a row
+locally before pushing. Every other check in the job passed (SB OFF, SB
+ON, seal, same-boot unseal, concurrent unseal).
+
+**Symptom, from the CI log:** all 5 of `tpm-keyring-unseal.sh`'s internal
+retry attempts failed identically:
+
+```
+WARNING:esys:src/tss2-esys/api/Esys_Unseal.c:295:Esys_Unseal_Finish() Received TPM Error
+ERROR:esys:src/tss2-esys/api/Esys_Unseal.c:98:Esys_Unseal() Esys Finish ErrorCode (0x0000099d)
+ERROR: Esys_Unseal(0x99D) - tpm:session(1):a policy check failed
+ERROR: Unable to run tpm2_unseal
+```
+
+**This is a different, more telling error than the ones earlier in this
+file.** The real-hardware bugs above are all `0x128` ("PCR have changed
+since checked" - a *race*, the PCR value changes concurrently mid-session).
+This is `0x99D` (`TPM_RC_POLICY_FAIL`) - the policy digest computed at
+unseal time simply does not match the sealed object's `authPolicy`, full
+stop. All 5 retries failing *identically*, instead of eventually
+succeeding the way a timing race would, means PCR7's live value at
+unseal-time (boot 2) genuinely differed from what got captured into the
+policy at seal-time (boot 1) - a real, deterministic mismatch, not
+flakiness. Retrying the fast check-and-use step (which is what those 5
+attempts are, by design - see the "profiled where the ~7-8s actually
+goes" entry above) can never fix a *correct* readout of a value that has
+actually changed; it only helps when the *TPM* transiently rejects a
+still-valid check due to contention.
+
+**Root cause (reasoned, not directly instrumented - see caveat below):**
+the B1->B2 transition tore down qemu with a plain `kill` (`stop_pid`),
+after only a guest-side `sync` (bug 3's fix). That `sync` flushes the
+*guest's* ext4 write-back cache to the virtual disk - it says nothing
+about qemu's *own* device-model buffering for the OVMF_VARS pflash store,
+which is a `-drive if=pflash` with no explicit `cache=`, defaulting to
+`writeback` at the qemu/host layer - a completely different cache the
+guest-side `sync` never touches. If OVMF's firmware wrote anything to
+that vars store during boot 1 that hadn't reached the actual file bytes
+on disk when qemu got killed, boot 2's firmware could measure PCR7 from a
+stale or partially-written vars store, producing a genuinely different
+PCR7 - which deterministically breaks the policy check, every retry,
+exactly as observed. Plausible why this didn't reproduce on the machine
+this was developed and verified on twice, but did on GitHub's runner:
+different disk speed/scheduling changes how much unflushed state exists
+at the moment of a kill, the same category of environment-dependent
+timing sensitivity as every TPM contention bug earlier in this file, just
+one layer further down the stack.
+
+**Fix:** replaced the abrupt kill (and the now-redundant `sync`) with
+`graceful_poweroff_and_wait()`: issue `sudo systemctl poweroff` inside the
+guest (backgrounded and not waited on - the SSH connection dies mid-shutdown,
+which would otherwise make the `ssh` call itself hang or return a spurious
+non-zero), then poll `kill -0` on the qemu PID (not `wait` - see bug 4's
+comment on why `wait` doesn't work on a `-daemonize`d process) for up to
+30s for qemu to exit on its own - qemu isn't passed `-no-shutdown`, so it
+exits by itself once the guest's ACPI poweroff completes - falling back to
+the existing forceful `stop_pid` only if it doesn't exit in time. A real
+reboot is always an orderly shutdown before power is actually cut, never a
+yanked cord; letting the guest own its own shutdown and letting qemu's
+block backends go through their normal close/flush path addresses the
+guest cache, the qemu-pflash cache, and any other buffering layer at once,
+rather than requiring a fifth bug report the next time a different layer
+turns out to matter. Considered also setting `cache=directsync` on the
+pflash drive as extra defense; decided against it as redundant - a clean
+qemu exit already flushes its block backends regardless of cache mode, so
+it would add complexity without covering anything the graceful shutdown
+doesn't already cover.
+
+**Verified locally:** re-ran the full suite twice in a row after the fix,
+on the same machine bugs 1-4 were verified on - both runs: all 7 checks
+`ok`, exit 0, including `tpm-keyring-unseal.sh survives a real reboot`,
+zero leftover processes after each run.
+
+**Honest caveat, unlike every other entry in this file: the actual root
+cause was never directly instrumented or confirmed on the CI runner
+itself** - unlike bugs 1-4, which were each reproduced and re-verified in
+the same environment they were diagnosed in, this fix is reasoned from the
+error code's meaning and the one asymmetry (abrupt kill vs. clean
+shutdown) between the local and CI runs, not from adding logging to the CI
+run itself and watching it fail again with more detail. It passing locally
+twice, both before and after this fix, cannot by itself prove the CI
+failure is resolved, since it was never reproduced locally in the first
+place. The only real confirmation will be an actual green (or red, with
+more detail this time) run on GitHub Actions after this is pushed.

@@ -52,6 +52,40 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Issues a clean guest shutdown and waits for qemu to exit on its own,
+# instead of an abrupt kill, before the B1->B2 transition specifically -
+# the transition that's supposed to model a real reboot. This replaces
+# (not just supplements) the earlier guest-side `sync` fix: `sync` only
+# guaranteed the *guest's* ext4 write-back cache reached the virtual disk.
+# It said nothing about whatever qemu's own device models had or hadn't
+# flushed to their backing files by the time the process died - the pflash
+# store backing OVMF_VARS in particular (a `-drive if=pflash` with no
+# explicit cache= defaults to writeback, buffered at the qemu/host layer,
+# a completely different cache from the guest's own). A real reboot is
+# always an orderly OS shutdown before power is actually cut, never a
+# yanked cord - letting the guest own its own shutdown, and letting qemu's
+# block backends go through their normal close/flush path on ACPI poweroff
+# (no -no-shutdown is passed, so qemu exits on its own once the guest
+# powers off), addresses every buffering layer at once instead of chasing
+# them one at a time as each is discovered. See JOURNAL.md.
+graceful_poweroff_and_wait() {
+  local qemu_pid="$1" port="$2" timeout="${3:-30}" waited=0
+  # Backgrounded and not waited on: the SSH session/connection dies out
+  # from under this command mid-shutdown, which would otherwise make the
+  # ssh invocation itself hang or return a spurious non-zero.
+  vm_ssh "$port" 'sudo systemctl poweroff' >/dev/null 2>&1 &
+  while [ "$waited" -lt "$timeout" ]; do
+    kill -0 "$qemu_pid" 2>/dev/null || return 0
+    sleep 1
+    waited=$((waited + 1))
+  done
+  # Didn't exit cleanly in time - fall back so the script can't hang
+  # forever, though this reintroduces the exact question this function
+  # exists to avoid, for whatever fraction of the poweroff was still
+  # pending.
+  stop_pid "$qemu_pid"
+}
+
 check() {
   local desc="$1" got="$2" want="$3" errfile="${4:-}"
   if [ "$got" = "$want" ]; then
@@ -359,23 +393,21 @@ if wait_for_ssh "$B1_SSHPORT"; then
   fi
   check "two concurrent unseal calls both succeed (flock serialization)" "$got" "both-correct"
 
-  # Force the guest's dirty page cache (the just-written seal.pub/seal.priv
-  # in particular) out to the virtual disk before killing qemu below. We
-  # want *this* teardown to model a real reboot's TPM reset-count increment
-  # (why qemu+swtpm get fully killed and restarted rather than just issuing
-  # an in-guest `reboot`), not an unrelated hard-power-cut disk-durability
-  # bug - without this, a kill landing before ext4's normal ~30s writeback
-  # interval could make boot 2 come up with the *pre-seal* filesystem state,
-  # which looks identical to a real reboot-survival failure but isn't one.
-  vm_ssh "$B1_SSHPORT" 'sync' || true
-
   B1_OK=1
 else
   check "VM B reachable over SSH (boot 1)" "unreachable" "reachable"
   B1_OK=0
 fi
 
-stop_pid "$B1_QEMU_PID"
+if [ "$B1_OK" -eq 1 ]; then
+  # Clean guest shutdown, not an abrupt kill - see graceful_poweroff_and_wait's
+  # comment. Only matters when boot 2 is actually going to happen (B1_OK=1);
+  # if B1 never came up at all, there's nothing to flush and no reboot check
+  # will run, so a plain stop_pid is fine.
+  graceful_poweroff_and_wait "$B1_QEMU_PID" "$B1_SSHPORT"
+else
+  stop_pid "$B1_QEMU_PID"
+fi
 stop_pid "$B1_SWTPM_PID"
 
 if [ "$B1_OK" -eq 1 ]; then
