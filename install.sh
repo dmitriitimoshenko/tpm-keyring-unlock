@@ -14,6 +14,9 @@ DATA_DIR="$HOME/.local/share/tpm-keyring-unlock"
 HELPER_DST="/usr/local/sbin/tpm-keyring-unseal"
 PCR_BANK="sha256:7"
 
+# shellcheck source=bin/lib.sh
+source "$REPO_DIR/bin/lib.sh"
+
 confirm() {
   local prompt="$1"
   local ans
@@ -23,6 +26,16 @@ confirm() {
 
 echo "== tpm-keyring-unlock installer =="
 echo
+
+# --- 0. hard requirements - checked before touching anything, including
+# before installing dependencies, so a machine that can't use this tool
+# finds out immediately instead of after a sudo package install -----------
+[ -e /dev/tpmrm0 ] || {
+  echo "No /dev/tpmrm0 found. This machine doesn't expose a TPM 2.0 resource" >&2
+  echo "manager device - is TPM 2.0 enabled in BIOS/UEFI?" >&2
+  exit 1
+}
+require_secure_boot
 
 # --- 1. dependencies ---------------------------------------------------
 missing=()
@@ -58,7 +71,7 @@ if [ "${#missing[@]}" -gt 0 ]; then
       echo "Install them manually and re-run this script." >&2; exit 1
     fi
   elif command -v zypper >/dev/null; then
-    pkgs=(); for m in "${missing[@]}"; do [ "$m" = pam-dev ] && pkgs+=(pam-devel) || pkgs+=("$m"); done
+    pkgs=(); for m in "${missing[@]}"; do case "$m" in pam-dev) pkgs+=(pam-devel);; tpm2-tools) pkgs+=(tpm2.0-tools);; *) pkgs+=("$m");; esac; done
     if confirm "Install via zypper now? (${pkgs[*]})"; then
       sudo zypper install -y "${pkgs[@]}"
     else
@@ -72,26 +85,35 @@ if [ "${#missing[@]}" -gt 0 ]; then
   fi
 fi
 
-[ -e /dev/tpmrm0 ] || {
-  echo "No /dev/tpmrm0 found. This machine doesn't expose a TPM 2.0 resource" >&2
-  echo "manager device - is TPM 2.0 enabled in BIOS/UEFI?" >&2
-  exit 1
-}
-
 # --- 2. tss group (passwordless TPM access) -----------------------------
-if getent group tss >/dev/null && ! groups "$USER" | grep -qw tss; then
-  echo "You're not in the 'tss' group (needed for passwordless TPM access)."
-  if confirm "Add $USER to the tss group now?"; then
-    sudo usermod -aG tss "$USER"
-    echo "Added. You must log out and back in before continuing (group"
-    echo "membership only applies to new sessions). Re-run this script after."
-    exit 0
+TSS_GROUP_PRESENT=false
+if getent group tss >/dev/null; then
+  TSS_GROUP_PRESENT=true
+  if ! groups "$USER" | grep -qw tss; then
+    echo "You're not in the 'tss' group (needed for passwordless TPM access)."
+    if confirm "Add $USER to the tss group now?"; then
+      sudo usermod -aG tss "$USER"
+      echo "Added. You must log out and back in before continuing (group"
+      echo "membership only applies to new sessions). Re-run this script after."
+      exit 0
+    fi
   fi
+else
+  echo "No 'tss' group on this system - skipping the group-membership check."
+  echo "TPM access must be granted some other way here; if the next check"
+  echo "fails, that's where to look (your distro's tpm2-tools/tpm2-abrmd"
+  echo "packaging docs should say how)."
 fi
 
 if ! tpm2_pcrread "$PCR_BANK" >/dev/null 2>&1; then
-  echo "Can't read TPM PCRs even though the tss group looks right." >&2
-  echo "Try logging out and back in, then re-run this script." >&2
+  if [ "$TSS_GROUP_PRESENT" = true ]; then
+    echo "Can't read TPM PCRs even though you're in the 'tss' group." >&2
+    echo "Try logging out and back in (group membership needs a fresh" >&2
+    echo "session), then re-run this script." >&2
+  else
+    echo "Can't read TPM PCRs, and there's no 'tss' group on this system to" >&2
+    echo "add you to. Check how your distro grants /dev/tpmrm0 access." >&2
+  fi
   exit 1
 fi
 
@@ -102,15 +124,7 @@ gcc -Wall -Wextra -fPIC -shared \
   -o "$REPO_DIR/pam/pam_tpm_keyring_authtok.so" \
   "$REPO_DIR/pam/pam_tpm_keyring_authtok.c" -lpam
 
-PAM_MODULE_DIR=""
-for candidate in /lib/x86_64-linux-gnu/security /usr/lib/x86_64-linux-gnu/security \
-                 /lib/aarch64-linux-gnu/security /usr/lib/aarch64-linux-gnu/security \
-                 /lib/security /usr/lib64/security /usr/lib/security; do
-  if [ -d "$candidate" ] && [ -f "$candidate/pam_unix.so" ]; then
-    PAM_MODULE_DIR="$candidate"
-    break
-  fi
-done
+PAM_MODULE_DIR="$(find_pam_module_dir || true)"
 if [ -z "$PAM_MODULE_DIR" ]; then
   echo "Couldn't auto-detect the PAM modules directory (looked for pam_unix.so" >&2
   echo "next to it). Find it yourself (dpkg -L libpam-modules | grep pam_unix.so)" >&2
@@ -159,7 +173,7 @@ echo "reopens the exact same PAM_AUTHTOK gap on a service that has nothing"
 echo "to do with fingerprints in its name."
 echo
 
-mapfile -t candidates < <(grep -lE '^\s*auth\s+\S+\s+pam_gnome_keyring\.so' /etc/pam.d/* 2>/dev/null)
+mapfile -t candidates < <(grep -lE "$PAM_GNOME_KEYRING_AUTH_RE" /etc/pam.d/* 2>/dev/null)
 
 if [ "${#candidates[@]}" -eq 0 ]; then
   echo "No /etc/pam.d/ service has an auth-phase pam_gnome_keyring.so line."
@@ -189,7 +203,7 @@ for TARGET in "${candidates[@]}"; do
   echo
   if confirm "Apply this change to $TARGET?"; then
     sudo cp "$TARGET" "$TARGET.bak-$(date +%Y%m%d%H%M%S)"
-    sudo sed -i '/^\s*auth\s\+\S\+\s\+pam_gnome_keyring\.so/i auth    optional        pam_tpm_keyring_authtok.so' "$TARGET"
+    sudo sed -E -i "/${PAM_GNOME_KEYRING_AUTH_RE}/i auth    optional        pam_tpm_keyring_authtok.so" "$TARGET"
     echo "Done."
   else
     echo "Skipped $TARGET. It will keep showing the manual unlock prompt"

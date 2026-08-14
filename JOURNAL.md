@@ -423,6 +423,249 @@ original Ubuntu machine — the fixes are code-reviewed for correctness,
 not field-verified. README's new "Compatibility" section says this
 explicitly rather than claiming broader support than is actually known.
 
+## Fixes from a fresh-eyes review, post-publish (2026-08-14)
+
+Repo was already pushed to GitHub at this point (`origin/main` matched
+HEAD). Ran an independent review with no context from this project's
+history — deliberately, to catch things too familiar to notice anymore.
+It found one real blocking issue and several worth-fixing ones. Fixed all
+except one, judgment call below.
+
+**Blocking, fixed: README claimed Secure Boot was a "hard requirement -
+the tool refuses to proceed without it," but nothing in the code ever
+checked it.** `install.sh` would happily seal a password against PCR7 in
+whatever state Secure Boot happened to be in and declare success - on a
+machine with it off, that's a seal that looks like a lock but isn't one,
+which is exactly the failure mode this tool's whole design is supposed to
+prevent. Fixed with a new `bin/lib.sh` (`require_secure_boot()`), sourced
+by both `install.sh` and `bin/seal.sh` (seal.sh can be run standalone per
+the re-seal instructions in README, so it needs the same guard
+independently, not just via install.sh). Detection: `mokutil --sb-state`
+first, falling back to reading the `SecureBoot` EFI variable directly
+(`/sys/firmware/efi/efivars/SecureBoot-...`, byte at offset 4: 1=on,
+0=off) if mokutil isn't installed; hard exit if determined off, hard exit
+with a legacy-BIOS-specific message if `/sys/firmware/efi` doesn't exist
+at all, hard exit asking for manual confirmation if neither method can
+determine the state. Verified both detection paths agree and correctly
+report "on" on the real dev machine before wiring it in.
+
+**Fixed: PAM module logged nothing, anywhere, ever.** `pam_ext.h` (the
+header `pam_syslog` comes from) was included but never called - every
+failure path returned `PAM_IGNORE` in total silence. Compounding this, the
+helper subprocess's own stderr was explicitly redirected to `/dev/null`,
+throwing away tpm2-tools' own diagnostic output too. Meanwhile README's
+Troubleshooting section tells people to check `journalctl` for exactly
+this module's failures. Fixed: added `pam_syslog` calls on the genuinely
+unexpected failure paths (`pam_get_user`/`getpwnam`/`pipe`/`fork`
+failures, at `LOG_ERR`) and on "helper produced no usable output" (at
+`LOG_NOTICE` - deliberately lower severity, since "no sealed secret yet"
+is a normal state, not an error); stopped discarding the helper's stderr
+so tpm2-tools' own messages flow to the journal via the login process's
+existing stderr→journald path, same as `gkr-pam`'s messages already do.
+
+**Fixed: no timeout on the TPM call.** `waitpid()` on the helper process
+had no bound - a hung TPM call (firmware hiccup, resource-manager
+contention) would block the login prompt indefinitely with no fallback.
+Added an `alarm(15)` + `SIGALRM` handler (deliberately not `SA_RESTART`,
+so it interrupts the blocking `read()`/`waitpid()` instead of silently
+retrying) that kills the helper and falls through to `PAM_IGNORE`, logged
+at `LOG_ERR`, on timeout.
+
+**Fixed: `install.sh` installed dependencies before checking hardware.** A
+machine with no TPM at all got walked through a sudo package install
+before being told, only afterward, that it can't use the tool anyway.
+Reordered: `/dev/tpmrm0` + `require_secure_boot` now run first, as step 0,
+before any package installation.
+
+**Fixed: `TPM_KEYRING_UNLOCK_DATA_DIR` env override in `seal.sh` was a
+trap.** It let you override the sealed-secret path when sealing, but the
+PAM module execve's the helper with a **completely empty environment**
+(hardening, intentional), so the override could never reach
+`tpm-keyring-unseal.sh` at actual login time even if someone used it.
+Anyone who found and used this undocumented override would get a
+permanently-silent login failure. Removed the override entirely rather
+than plumbing it through - the path needs to be the same constant on both
+sides of the seal/unseal boundary, an env var can't safely be that.
+
+**Fixed: PAM-line detection/insertion regex assumed a single-token control
+field.** `grep -lE '...auth\s+\S+\s+pam_gnome_keyring...'` and the matching
+`sed` insert address would silently fail to match a line like `auth
+[success=ok default=ignore] pam_gnome_keyring.so` (bracketed control syntax
+contains spaces, `\S+` stops at the first one). Low real-world odds for
+this specific module, but this is code that edits live login-auth files,
+so "silently does nothing instead of failing loudly" is the wrong failure
+mode. Fixed the pattern to `(\S+|\[[^]]*\])` in both `install.sh`'s
+detection grep and its sed insert address; tested both the plain-keyword
+and bracketed-control cases directly against sample PAM lines before
+committing to the fix.
+
+**Fixed: misleading error message when TPM PCR read fails and there's no
+`tss` group at all.** The old message always said "even though the tss
+group looks right" - but if the group doesn't exist on this system, that
+was never actually verified, it just wasn't checked. Now tracks whether
+the group was actually confirmed present and tailors the message
+accordingly.
+
+**Fixed: `uninstall.sh` didn't mirror `install.sh`'s `tss` group step.**
+`install.sh` can add the user to `tss`; `uninstall.sh` had no way to
+reverse that, meaning full removal required knowing to go find
+`install.sh`'s source to figure out what to undo by hand. Added a matching
+confirm-gated `gpasswd -d "$USER" tss` step.
+
+**Fixed: `pam/tpm-keyring-unseal.sh` was committed non-executable** while
+every other script in the repo was `755`. Harmless in practice
+(`install.sh` deploys it via `install -m 0700`, which sets the mode
+explicitly regardless of the source file's own bit), but inconsistent.
+`chmod +x`'d.
+
+**Not fixed, deliberate: real Linux username ("dmitrii") appears in
+example commands in this file's older entries.** Flagged by the review
+as low-severity since `LICENSE` already publicly attributes the whole
+project to "Dmitrii Timoshenko" by full name - the username adds
+essentially no new exposure. Chose not to scrub it: this file's value is
+being an accurate record of what was actually typed and why, and
+retroactively genericizing historical entries would quietly misrepresent
+that history for a redaction that isn't actually protecting anything.
+
+All fixes syntax-checked (`bash -n`), the C module recompiled clean with
+`-Wall -Wextra` (zero warnings) after each change, and the new
+Secure-Boot detection and PAM-regex fixes were each tested in isolation
+(against the real machine's actual EFI state, and against synthetic
+sample PAM lines for both control-syntax cases) before being wired into
+the real scripts.
+
+## Missing feature-test macro found by VS Code IntelliSense (2026-08-14)
+
+User spotted a red squiggle in VS Code on the `struct sigaction sa, old_sa;`
+line added in the previous pass: "incomplete type 'struct sigaction' is not
+allowed". Initial instinct was to dismiss it as an IntelliSense false
+positive, since `gcc -Wall -Wextra` (the exact command `install.sh` uses)
+had already compiled the file clean, repeatedly. Checked instead of
+asserting that - and it wasn't a false positive.
+
+Reproduced with `gcc -std=c11 -pedantic` and `-std=c99 -pedantic`: both
+failed for real, with `struct sigaction`'s storage size "not known" and
+`sigemptyset`/`sigaction`/`kill` all "implicit declaration". Root cause:
+glibc's `<signal.h>` guards the POSIX.1-2008 signal-handling declarations
+behind feature-test macros (`_POSIX_C_SOURCE` and friends). Plain `gcc`
+with no `-std=` flag defaults to GNU mode, which defines these implicitly
+- so the code "worked," but only because of a compiler default it never
+asked for, not because it was actually correct C. VS Code's IntelliSense
+(and any stricter/non-default build - a different compiler, a different
+libc, someone adding `-std=c11` for portability) would legitimately break.
+
+Fixed properly rather than papering over it: added `#define
+_POSIX_C_SOURCE 200809L` as the first thing in the file, before any
+`#include`. Feature-test macros only take effect if defined before the
+first system header that checks them, so it has to be that early.
+Re-verified clean under plain `gcc`, `-std=c11 -pedantic`, and `-std=c99
+-pedantic` - zero errors, zero warnings, all three.
+
+Lesson: "the exact build command we ship compiles clean" and "this code is
+actually portable C" are different claims. The former was true the whole
+time; the latter wasn't until this fix. Worth remembering for any future
+signal/POSIX-API code added here.
+
+## Docker-based test suite added (2026-08-14)
+
+User asked for real E2E coverage across distros/architectures via Docker
+or VMs. Worked out what Docker can and can't actually prove here, rather
+than assuming either "containers can test everything" or "containers are
+useless for this":
+
+**Can't touch, structurally**: TPM/PCR7/Secure-Boot state (containers
+share the host kernel, no independent TPM or UEFI firmware) and real
+GDM/PAM login flow. Said so plainly in `test/README.md` rather than
+building something that looks like coverage but isn't - that layer needs
+a VM with `swtpm`+OVMF, per the earlier testing-methodology research.
+
+**Can genuinely test, and now does**: the PAM_AUTHTOK bridge module's
+actual runtime logic, and the packaging/detection layer, both without
+needing a TPM at all - because the module's only contact with "TPM stuff"
+is executing a fixed helper path and reading its stdout, a boundary that's
+trivially fakeable.
+
+Added `bin/lib.sh` extensions (`PAM_MODULE_DIR_CANDIDATES` array,
+`find_pam_module_dir()`, `PAM_GNOME_KEYRING_AUTH_RE`) so `install.sh`,
+`uninstall.sh`, and the test suite all share one copy of this logic
+instead of three that could drift - this was already a latent
+duplication risk between install/uninstall before tests were added.
+
+Test suite (`test/run-all.sh`):
+- `test/unit-regex-test.sh` - detection/insertion regex against fixture
+  PAM files (plain control, bracketed control, already-patched,
+  no-match). No container needed, pure logic. Ran it directly - passes.
+- `test/runtime-test.sh` (container) - compiles the module with
+  `-DHELPER_PATH`/`-DHELPER_TIMEOUT_SECS` overrides (added to the C
+  source specifically for this - `#ifndef`-guarded, so `install.sh`'s
+  plain compile is untouched and still gets the real path/15s default),
+  swaps in a fake helper script that branches on username
+  (success/no-output-failure/hang), and uses `pamtester` +
+  `pam_exec.so expose_authtok` to observe whether `PAM_AUTHTOK` actually
+  landed correctly in each case - including timing the hang case to
+  confirm the `SIGALRM`+`SIGKILL` timeout path really interrupts it
+  instead of just eventually returning on its own.
+- `test/distro/Dockerfile.{ubuntu,fedora,arch,opensuse}` +
+  `test/distro/test-packaging.sh` (containers) - install deps via each
+  distro's real package manager, compile against that distro's real PAM
+  headers, verify `find_pam_module_dir()` lands on a directory that
+  genuinely has `pam_unix.so` there. Plus an arm64 cross-build of the
+  Ubuntu one via `docker buildx --platform linux/arm64` (qemu-user-static
+  emulation), to exercise the `aarch64-linux-gnu` candidate paths under
+  real ARM64 userspace rather than just trusting the string is correct.
+
+**Real bug found while writing the openSUSE Dockerfile, before any
+container was even run**: looked up openSUSE's actual `tpm2-tools`
+package name to write the Dockerfile's `RUN zypper install` line, and it
+turned out to be `tpm2.0-tools`, not `tpm2-tools` like every other distro
+(confirmed via software.opensuse.org). `install.sh`'s zypper branch was
+passing the generic `tpm2-tools` name through unchanged - would have
+failed with a package-not-found error on real openSUSE, the exact
+regression class the openSUSE Dockerfile exists to catch. Fixed
+`install.sh`'s zypper package-name mapping to translate this specific
+case, before the test suite even ran once.
+
+**Update: Docker installed, full suite actually run.** First real run
+found two genuine problems, neither of which were bugs in the product
+code being tested - both in the test harness and host setup:
+
+1. `runtime-test.sh`'s "helper succeeds" case failed:
+   `PAM_AUTHTOK equals what the helper printed (got: , want:
+   unit-test-fake-password-do-not-use)`. Root cause turned out to be the
+   test's own assumption about `pam_exec.so`'s `expose_authtok` option -
+   this container's base image strips man pages (`dpkg -L` listed
+   `pam_exec.8.gz`, the file wasn't actually on disk), so the assumption
+   couldn't even be checked against docs. Rather than keep guessing,
+   wrote a minimal purpose-built "spy" PAM module
+   (`test/fixtures/pam_spy_authtok.c`) that calls `pam_get_item(pamh,
+   PAM_AUTHTOK, ...)` directly - the exact same call the real
+   `pam_gnome_keyring.so` makes - and confirmed with it that
+   `pam_tpm_keyring_authtok.so` was setting `PAM_AUTHTOK` correctly the
+   whole time. The module was never broken; `pam_exec expose_authtok` in
+   `test-runtime-test.sh` was the wrong tool for observing it, in this
+   particular stripped-down image. Swapped the test to use the spy module
+   instead - more direct, and no longer dependent on a pam_exec option
+   whose exact behavior couldn't be verified locally.
+2. The arm64 cross-build failed outright: `exec /bin/sh: exec format
+   error`. Root cause: no QEMU binfmt handlers were registered on this
+   host at all (`ls /proc/sys/fs/binfmt_misc/` had zero `qemu-*` entries)
+   - `docker buildx` had a working builder instance, but nothing to
+   actually emulate foreign-architecture binaries with. Fixed via the
+   standard approach: `docker run --privileged --rm tonistiigi/binfmt
+   --install all`.
+
+After both fixes: full suite green - regex/detection, runtime (all four
+PAM_AUTHTOK scenarios including the timeout path), and packaging on
+Ubuntu/Fedora/Arch/openSUSE plus the arm64 cross-build, all `PASS`, in
+one `make test` run.
+
+Lesson, again: writing a test and running a test catch different classes
+of bug. The openSUSE package name was caught by *writing* the Dockerfile
+(a lookup, no execution needed). The `pam_exec` assumption and the
+missing binfmt registration were only found by *actually running*
+everything end to end - both would have shipped as "tests exist" while
+being silently wrong or silently unable to run at all.
+
 ## Old status notes (superseded by "Resolved" above, kept for history)
 
 Everything is built and verified except the last production edit. **User has

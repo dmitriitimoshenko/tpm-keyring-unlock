@@ -1,0 +1,14 @@
+# Packaging/detection test on openSUSE - mirrors install.sh's zypper
+# branch. Package name note: it's tpm2.0-tools here, not tpm2-tools like
+# everywhere else (confirmed via software.opensuse.org) - install.sh's
+# zypper branch maps this explicitly, this Dockerfile has to match it.
+FROM opensuse/tumbleweed:latest
+
+RUN zypper --non-interactive install tpm2.0-tools gcc pam-devel
+
+WORKDIR /src
+COPY bin/lib.sh bin/lib.sh
+COPY pam/pam_tpm_keyring_authtok.c pam/pam_tpm_keyring_authtok.c
+COPY test/distro/test-packaging.sh test/distro/test-packaging.sh
+
+CMD ["bash", "test/distro/test-packaging.sh"]

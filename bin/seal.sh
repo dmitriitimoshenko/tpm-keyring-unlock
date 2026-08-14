@@ -5,8 +5,11 @@
 # history, or anywhere outside this process.
 set -euo pipefail
 
-DATA_DIR="${TPM_KEYRING_UNLOCK_DATA_DIR:-$HOME/.local/share/tpm-keyring-unlock}"
+DATA_DIR="$HOME/.local/share/tpm-keyring-unlock"
 PCR_BANK="sha256:7"
+
+# shellcheck source=lib.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
 command -v tpm2_createprimary >/dev/null || {
   echo "tpm2-tools not found. Install it: sudo apt install tpm2-tools" >&2
@@ -20,6 +23,7 @@ tpm2_pcrread "$PCR_BANK" >/dev/null 2>&1 || {
   echo "Can't read TPM PCRs. Are you in the 'tss' group? (log out/in after usermod -aG tss \$USER)" >&2
   exit 1
 }
+require_secure_boot
 
 mkdir -p "$DATA_DIR"
 chmod 700 "$DATA_DIR"

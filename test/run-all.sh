@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# Runs the full test suite: the no-container regex test, the runtime
+# behavior test (pamtester + fake helper, in a container), and the
+# packaging/detection test across four distros (+ an arm64 cross-build of
+# the Ubuntu one, if buildx/qemu-user-static are set up). See test/README.md
+# for what this does and doesn't cover.
+set -uo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_DIR"
+
+RESULTS=()
+record() {
+  RESULTS+=("$1: $2")
+}
+
+echo "########################################"
+echo "# 1/3 - regex/detection logic (no container)"
+echo "########################################"
+if test/unit-regex-test.sh; then
+  record "regex/detection" PASS
+else
+  record "regex/detection" FAIL
+fi
+
+if ! command -v docker >/dev/null 2>&1; then
+  echo
+  echo "docker not found - skipping the container-based tests (runtime" >&2
+  echo "behavior + per-distro packaging). Install docker to run those." >&2
+  record "runtime (pamtester + fake helper)" SKIPPED
+  for d in ubuntu fedora arch opensuse; do
+    record "packaging: $d" SKIPPED
+  done
+  record "packaging: ubuntu (arm64, cross-build)" SKIPPED
+else
+  echo
+  echo "########################################"
+  echo "# 2/3 - PAM module runtime behavior (container)"
+  echo "########################################"
+  if docker build -q -f test/distro/Dockerfile.runtime -t tpm-keyring-unlock-test-runtime . \
+       && docker run --rm tpm-keyring-unlock-test-runtime; then
+    record "runtime (pamtester + fake helper)" PASS
+  else
+    record "runtime (pamtester + fake helper)" FAIL
+  fi
+
+  echo
+  echo "########################################"
+  echo "# 3/3 - packaging + PAM-dir detection per distro (container)"
+  echo "########################################"
+  for d in ubuntu fedora arch opensuse; do
+    echo
+    echo "--- $d ---"
+    if docker build -q -f "test/distro/Dockerfile.$d" -t "tpm-keyring-unlock-test-$d" . \
+         && docker run --rm "tpm-keyring-unlock-test-$d"; then
+      record "packaging: $d" PASS
+    else
+      record "packaging: $d" FAIL
+    fi
+  done
+
+  echo
+  echo "--- ubuntu (arm64, cross-build via buildx + qemu-user-static) ---"
+  if docker buildx version >/dev/null 2>&1; then
+    if docker buildx build --platform linux/arm64 -f test/distro/Dockerfile.ubuntu \
+         -t tpm-keyring-unlock-test-ubuntu-arm64 --load . \
+         && docker run --rm --platform linux/arm64 tpm-keyring-unlock-test-ubuntu-arm64; then
+      record "packaging: ubuntu (arm64, cross-build)" PASS
+    else
+      record "packaging: ubuntu (arm64, cross-build)" FAIL
+    fi
+  else
+    echo "docker buildx not available - skipping the arm64 cross-build." >&2
+    echo "(needs: docker buildx install, and qemu-user-static / binfmt" >&2
+    echo "support registered on the host - see test/README.md)" >&2
+    record "packaging: ubuntu (arm64, cross-build)" SKIPPED
+  fi
+fi
+
+echo
+echo "########################################"
+echo "# Summary"
+echo "########################################"
+overall=0
+for r in "${RESULTS[@]}"; do
+  echo "$r"
+  case "$r" in *FAIL*) overall=1 ;; esac
+done
+exit "$overall"

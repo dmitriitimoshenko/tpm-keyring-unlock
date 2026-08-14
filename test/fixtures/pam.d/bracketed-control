@@ -1,0 +1,5 @@
+#%PAM-1.0
+auth	requisite	pam_nologin.so
+@include common-auth
+auth [success=ok default=ignore]	pam_gnome_keyring.so
+session	optional	pam_gnome_keyring.so auto_start

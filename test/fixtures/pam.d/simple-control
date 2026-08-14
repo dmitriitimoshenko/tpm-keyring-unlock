@@ -1,0 +1,5 @@
+#%PAM-1.0
+auth	requisite	pam_nologin.so
+auth	required	pam_fprintd.so
+auth	optional	pam_gnome_keyring.so
+session	optional	pam_gnome_keyring.so auto_start

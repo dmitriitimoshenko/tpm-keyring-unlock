@@ -1,0 +1,11 @@
+# Packaging/detection test on Arch - mirrors install.sh's pacman branch.
+FROM archlinux:latest
+
+RUN pacman -Sy --noconfirm tpm2-tools base-devel pam
+
+WORKDIR /src
+COPY bin/lib.sh bin/lib.sh
+COPY pam/pam_tpm_keyring_authtok.c pam/pam_tpm_keyring_authtok.c
+COPY test/distro/test-packaging.sh test/distro/test-packaging.sh
+
+CMD ["bash", "test/distro/test-packaging.sh"]

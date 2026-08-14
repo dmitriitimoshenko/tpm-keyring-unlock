@@ -1,0 +1,17 @@
+# Runtime-behavior test for the compiled PAM module: fork/exec/pipe/timeout/
+# PAM_AUTHTOK plumbing, using a fake helper instead of the real TPM one.
+# Distro choice here doesn't matter much (this isn't testing packaging) -
+# Debian slim just happens to have pamtester in its repos.
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      gcc libpam0g-dev libpam-modules pamtester passwd ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY bin/lib.sh bin/lib.sh
+COPY pam/pam_tpm_keyring_authtok.c pam/pam_tpm_keyring_authtok.c
+COPY test/fixtures/pam_spy_authtok.c test/fixtures/pam_spy_authtok.c
+COPY test/runtime-test.sh test/runtime-test.sh
+
+CMD ["bash", "test/runtime-test.sh"]

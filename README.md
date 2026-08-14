@@ -173,11 +173,16 @@ run there:
   headers yourself first, the rest of `install.sh` doesn't care how they
   got there.
 
-**Untested, logic present but not exercised on real hardware:** `dnf`/
-`pacman`/`zypper` dependency install, `aarch64` PAM paths, any non-GDM
-display manager. If you hit something broken on one of these, that's a
-real bug report, not a "this was never claimed to work" situation — please
-open an issue.
+**Covered by an automated test suite (see [CONTRIBUTING.md](CONTRIBUTING.md)), not just code review:** `apt`/
+`dnf`/`pacman`/`zypper` dependency install and PAM-directory detection,
+each against that distro's real base image; `aarch64` PAM-path detection,
+cross-built via `docker buildx`/QEMU; the PAM module's actual
+fork/exec/timeout/`PAM_AUTHTOK` behavior. **Still genuinely untested:**
+real TPM/PCR7/Secure-Boot behavior on anything but the original dev
+machine, and any non-GDM display manager — those need real (or virtual)
+TPM hardware and a real login flow, which containers can't provide. If you
+hit something broken on one of these, that's a real bug report, not a
+"this was never claimed to work" situation — please open an issue.
 
 ## Uninstall
 
@@ -218,6 +223,12 @@ break it.
 - **Worked, then broke after enabling `pam-auth-update --enable
   fprintd`.** See "Also want fingerprint for sudo" above — re-run
   `install.sh`.
+- **`install.sh` refuses to run, saying it can't determine the Secure Boot
+  state.** It checks via `mokutil --sb-state` first, falling back to
+  reading the `SecureBoot` EFI variable directly if `mokutil` isn't
+  installed. If neither works (rare — usually means a very locked-down
+  efivarfs or a non-standard firmware setup), install `mokutil` or confirm
+  Secure Boot is on some other way, then re-run.
 - Diagnosing anything deeper: `JOURNAL.md` in this repo is the full,
   warts-and-all investigation log this tool came out of, including two
   regressions found after this README was first written and exactly how
