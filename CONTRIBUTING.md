@@ -26,6 +26,10 @@ make build        # compile the module locally, no tests
 The full suite needs `docker`; without it, the container-based parts are
 skipped and reported as `SKIPPED`, not silently dropped.
 
+CI (`.github/workflows/test.yml`) runs the same checks as separate jobs on
+every push to `main` and every PR, so `SKIPPED` locally (e.g. no qemu binfmt
+registered for the arm64 leg) doesn't mean untested - CI has it covered.
+
 **What's actually covered, and what isn't** — see
 [`test/README.md`](test/README.md). Short version: everything that
 doesn't need a TPM or a real login (the PAM_AUTHTOK bridge logic, PAM-file

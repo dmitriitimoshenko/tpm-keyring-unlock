@@ -1,0 +1,61 @@
+# Mirrors test/run-all.sh, but as separate jobs instead of one script, so a
+# PR check shows which specific layer broke instead of one pass/fail blob.
+# See test/README.md for what each layer actually covers (and doesn't -
+# nothing here touches a TPM, Secure Boot, or a real PAM login; that needs a
+# VM with swtpm+OVMF, out of scope for GitHub-hosted runners).
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regex:
+    name: regex/detection (no docker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: test/unit-regex-test.sh
+
+  runtime:
+    name: PAM module runtime behavior
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f test/distro/Dockerfile.runtime -t tpm-keyring-unlock-test-runtime .
+      - run: docker run --rm tpm-keyring-unlock-test-runtime
+
+  packaging:
+    name: packaging (${{ matrix.distro }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [ubuntu, fedora, arch, opensuse]
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f "test/distro/Dockerfile.${{ matrix.distro }}" -t "tpm-keyring-unlock-test-${{ matrix.distro }}" .
+      - run: docker run --rm "tpm-keyring-unlock-test-${{ matrix.distro }}"
+
+  packaging-arm64:
+    name: packaging (ubuntu, arm64 cross-build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Registers qemu binfmt handlers on the (ephemeral, GitHub-owned)
+      # runner - the local equivalent of `docker run --privileged
+      # tonistiigi/binfmt --install all` from test/README.md, scoped to this
+      # job's throwaway VM instead of a real machine.
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@v3
+      - run: |
+          docker buildx build --platform linux/arm64 -f test/distro/Dockerfile.ubuntu \
+            -t tpm-keyring-unlock-test-ubuntu-arm64 --load .
+      - run: docker run --rm --platform linux/arm64 tpm-keyring-unlock-test-ubuntu-arm64

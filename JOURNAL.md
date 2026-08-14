@@ -966,3 +966,70 @@ needing a retry (retries would show as multiple close-together
 `tpm2_startauthsession` policy-session attempts inside one script run,
 currently not separately logged to journald - only the script's own final
 outcome is visible to PAM). Version bumped to 1.1.2 in `VERSION`.
+
+## Docker test suite reviewed, arm64-skip bug fixed, CI added (2026-08-14)
+
+Independent review of the whole Docker test suite (no prior context from
+this file, deliberately - same "fresh eyes" method as the earlier
+post-publish review). Actually ran every layer live rather than trusting
+the "full suite green" claim above at face value:
+
+- `test/unit-regex-test.sh`: PASS (11/11), run directly, no container.
+- `test/distro/Dockerfile.runtime` + `runtime-test.sh`: PASS, all 3
+  `PAM_AUTHTOK` scenarios including the timeout-actually-interrupts-the-hang
+  timing check.
+- All four `test/distro/Dockerfile.{ubuntu,fedora,arch,opensuse}`: PASS.
+- The arm64 cross-build: **FAIL** - on this machine, right now, with no
+  qemu binfmt handler registered (`ls /proc/sys/fs/binfmt_misc/` empty of
+  `qemu-*` entries, same check the original binfmt fix used).
+
+**Real bug found, not a flake:** `run-all.sh`'s decision to skip the arm64
+leg checked only `docker buildx version` (does the CLI plugin exist), not
+whether foreign-arch containers can actually *run* on this host. Two
+consequences confirmed directly:
+
+1. `docker buildx build --platform linux/arm64 ... --load` can succeed
+   with **zero actual emulation**, if the layer that would need it (here,
+   `apt-get install`) is already cached from a previous build that *did*
+   have a working qemu handler - buildx just replays the cached layer
+   without re-executing it. Reproduced this exactly: rebuilt with a stale
+   cache, `docker buildx build` reported `CACHED` all the way through and
+   exited 0, then `docker run --rm --platform linux/arm64 ...` failed with
+   `exec /usr/bin/bash: exec format error`.
+2. Because the check only gated on `buildx` existing, a host with buildx
+   installed but no registered binfmt handler got a hard `FAIL` from
+   `run-all.sh`, not the `SKIPPED` the rest of the suite gives for
+   "capability genuinely absent here." `make test` could go red purely
+   from host state, unrelated to any actual code regression.
+
+**Fix:** added `arm64_emulation_available()` to `test/run-all.sh` -
+checks `docker buildx version` *and* greps
+`/proc/sys/fs/binfmt_misc` for a registered `aarch64`/`arm64` handler
+before attempting anything. Verified: after removing the stale cached
+image and re-running on this same qemu-less machine, the leg now reports
+`SKIPPED` (with a pointer to the `tonistiigi/binfmt` install command from
+`test/README.md`) and the overall suite exits 0, instead of the previous
+false `FAIL`.
+
+**Also added: GitHub Actions CI** (`.github/workflows/test.yml`), since
+none existed - the whole suite above, container-based tests included, was
+only ever run by hand. Mirrors `run-all.sh`'s four layers as separate jobs
+(`regex`, `runtime`, `packaging` as a 4-way distro matrix,
+`packaging-arm64`) rather than one script-in-a-job, so a PR check shows
+which specific layer broke. Triggers on push to `main` and on every PR.
+The arm64 job uses `docker/setup-qemu-action` to register binfmt on the
+ephemeral GitHub-hosted runner - the CI equivalent of the manual
+`tonistiigi/binfmt` install, scoped to that job's throwaway VM - so in CI
+this leg always actually executes, never falls into the `SKIPPED` branch
+above (that branch exists for contributors' local machines, which usually
+won't have qemu registered).
+
+Validated: `bash -n` on the changed `run-all.sh`, the workflow YAML parsed
+with `python3 -c "import yaml; yaml.safe_load(...)"`, and the full local
+suite re-run end to end after the fix (regex/runtime/all four distros:
+PASS, arm64: correctly `SKIPPED`, overall exit 0).
+
+**Not yet verified: whether the CI workflow itself is green on GitHub.**
+Everything above was checked locally, including the YAML's syntax, but the
+workflow has not yet been pushed/run on GitHub Actions infrastructure -
+that's the next real confirmation step once this is committed and pushed.

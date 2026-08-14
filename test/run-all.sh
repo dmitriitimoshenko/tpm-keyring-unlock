@@ -14,6 +14,17 @@ record() {
   RESULTS+=("$1: $2")
 }
 
+# `docker buildx version` only proves the buildx CLI plugin exists - it says
+# nothing about whether foreign-arch containers can actually *run* (cached
+# layers can make `buildx build` itself succeed with no emulation at all, see
+# JOURNAL.md). Check the kernel's binfmt_misc table directly instead, the
+# same way this was diagnosed by hand originally, so a host with buildx but
+# no registered qemu handler gets a clean SKIPPED instead of a false FAIL.
+arm64_emulation_available() {
+  docker buildx version >/dev/null 2>&1 \
+    && ls /proc/sys/fs/binfmt_misc 2>/dev/null | grep -qiE 'aarch64|arm64'
+}
+
 echo "########################################"
 echo "# 1/3 - regex/detection logic (no container)"
 echo "########################################"
@@ -61,7 +72,7 @@ else
 
   echo
   echo "--- ubuntu (arm64, cross-build via buildx + qemu-user-static) ---"
-  if docker buildx version >/dev/null 2>&1; then
+  if arm64_emulation_available; then
     if docker buildx build --platform linux/arm64 -f test/distro/Dockerfile.ubuntu \
          -t tpm-keyring-unlock-test-ubuntu-arm64 --load . \
          && docker run --rm --platform linux/arm64 tpm-keyring-unlock-test-ubuntu-arm64; then
@@ -70,9 +81,11 @@ else
       record "packaging: ubuntu (arm64, cross-build)" FAIL
     fi
   else
-    echo "docker buildx not available - skipping the arm64 cross-build." >&2
-    echo "(needs: docker buildx install, and qemu-user-static / binfmt" >&2
-    echo "support registered on the host - see test/README.md)" >&2
+    echo "docker buildx and/or a registered qemu binfmt handler not" >&2
+    echo "available - skipping the arm64 cross-build. (needs: docker" >&2
+    echo "buildx install, and qemu-user-static / binfmt support registered" >&2
+    echo "on the host, e.g. 'docker run --privileged --rm tonistiigi/binfmt" >&2
+    echo "--install all' - see test/README.md)" >&2
     record "packaging: ubuntu (arm64, cross-build)" SKIPPED
   fi
 fi

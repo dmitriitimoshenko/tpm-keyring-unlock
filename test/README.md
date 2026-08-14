@@ -6,7 +6,15 @@ test/run-all.sh
 
 Runs everything below and prints a pass/fail summary. Needs `docker` for
 everything except the first item; without it, those are reported as
-`SKIPPED`, not silently omitted.
+`SKIPPED`, not silently omitted. Same for the arm64 cross-build specifically
+- it also needs a registered qemu binfmt handler (`docker run --privileged
+--rm tonistiigi/binfmt --install all`), separately from `docker buildx`
+itself being installed; without one it's `SKIPPED` too, rather than failing.
+
+CI runs the same layers as separate GitHub Actions jobs on every push to
+`main` and every PR - see `.github/workflows/test.yml`. The CI runner
+registers qemu itself (`docker/setup-qemu-action`), so the arm64 job always
+actually runs there, never skips.
 
 ## What's actually covered
 

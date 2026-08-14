@@ -1,5 +1,7 @@
 # tpm-keyring-unlock
 
+[![test](https://github.com/dmitriitimoshenko/tpm-keyring-unlock/actions/workflows/test.yml/badge.svg)](https://github.com/dmitriitimoshenko/tpm-keyring-unlock/actions/workflows/test.yml)
+
 Auto-unlock the GNOME login keyring on fingerprint login, without weakening
 it — the keyring stays password-protected; the password is sealed inside
 the TPM instead of typed by hand.
