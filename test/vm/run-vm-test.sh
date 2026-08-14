@@ -75,15 +75,37 @@ graceful_poweroff_and_wait() {
   # ssh invocation itself hang or return a spurious non-zero.
   vm_ssh "$port" 'sudo systemctl poweroff' >/dev/null 2>&1 &
   while [ "$waited" -lt "$timeout" ]; do
-    kill -0 "$qemu_pid" 2>/dev/null || return 0
+    if ! kill -0 "$qemu_pid" 2>/dev/null; then
+      echo "-- graceful shutdown: qemu exited cleanly after ${waited}s --"
+      return 0
+    fi
     sleep 1
     waited=$((waited + 1))
   done
   # Didn't exit cleanly in time - fall back so the script can't hang
   # forever, though this reintroduces the exact question this function
   # exists to avoid, for whatever fraction of the poweroff was still
-  # pending.
+  # pending. Logged explicitly (not just silently falling back) because
+  # this is exactly the kind of thing that could differ between a local
+  # run and a resource-constrained CI runner without any other visible
+  # symptom - see JOURNAL.md's bug-5 instrumentation entry.
+  echo "-- graceful shutdown: qemu did NOT exit within ${timeout}s, forcing kill --"
   stop_pid "$qemu_pid"
+}
+
+# Diagnostic only, not an assertion: prints the live PCR7 digest from
+# inside the guest, labeled, straight to the test's own stdout (so it
+# lands in the CI log directly, not buried in a file nobody looks at
+# unless a check already failed). Exists specifically to get real evidence
+# on whether PCR7 actually differs between boot 1 and boot 2 on CI - see
+# JOURNAL.md's bug-5 entry: the graceful-shutdown fix didn't resolve the
+# reboot-survival failure there, so the working hypothesis (buffered
+# writes to the OVMF_VARS pflash store) needs to be confirmed or ruled out
+# with a real reading instead of guessed at again.
+log_pcr7() {
+  local port="$1" label="$2"
+  echo "-- PCR7 ($label): --"
+  vm_ssh "$port" 'tpm2_pcrread sha256:7' 2>&1 | sed 's/^/  | /'
 }
 
 check() {
@@ -370,6 +392,7 @@ if wait_for_ssh "$B1_SSHPORT"; then
     'bash ~/tpm-keyring-unlock/bin/seal.sh' >"$WORK/seal.out" 2>"$WORK/seal.err"
   if [ $? -eq 0 ]; then got=sealed; else got=failed; fi
   check "seal.sh seals the throwaway secret" "$got" "sealed" "$WORK/seal.err"
+  log_pcr7 "$B1_SSHPORT" "boot 1, right after seal"
 
   GOT_SECRET="$(vm_ssh "$B1_SSHPORT" 'sudo bash ~/tpm-keyring-unlock/pam/tpm-keyring-unseal.sh ubuntu' \
     2>"$WORK/unseal1.err")"
@@ -400,6 +423,7 @@ else
 fi
 
 if [ "$B1_OK" -eq 1 ]; then
+  log_pcr7 "$B1_SSHPORT" "boot 1, right before teardown"
   # Clean guest shutdown, not an abrupt kill - see graceful_poweroff_and_wait's
   # comment. Only matters when boot 2 is actually going to happen (B1_OK=1);
   # if B1 never came up at all, there's nothing to flush and no reboot check
@@ -419,6 +443,7 @@ if [ "$B1_OK" -eq 1 ]; then
   B2_SWTPM_PID="$B_BOOT_SWTPM_PID"
 
   if wait_for_ssh "$B2_SSHPORT"; then
+    log_pcr7 "$B2_SSHPORT" "boot 2, right after SSH up, before unseal"
     GOT_SECRET2="$(vm_ssh "$B2_SSHPORT" 'sudo bash ~/tpm-keyring-unlock/pam/tpm-keyring-unseal.sh ubuntu' \
       2>"$WORK/unseal2.err")"
     check "tpm-keyring-unseal.sh survives a real reboot (fresh primary, same sealed blob)" \
