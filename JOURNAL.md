@@ -894,3 +894,75 @@ open session` → `gkr-pam: gnome-keyring-daemon started properly and
 unlocked keyring`. No manual password prompt. Status: keyring auto-unlock
 on fingerprint login survives a real cold reboot again, this time with the
 concurrent-TPM-access race actually closed rather than just not triggered.
+
+**Correction, same day, released as v1.1.1: incomplete.** The `flock` fix
+above only rules out one specific *source* of the race (two copies of this
+same script running at once). It recurred a few hours later, this time on
+a resume-from-suspend re-authentication (`gdm-fingerprint` PAM stack
+re-runs on unlock-after-suspend the same way it does on a cold boot login -
+not the same thing as a plain screen-lock/unlock, which was already
+established not to reproduce this class of bug). This time only **one**
+PAM stack ran - no second concurrent instance of the script, `flock`
+acquired instantly, and it still failed with the exact same `Esys_Unseal
+... PCR have changed since checked` error. So contention between two
+copies of *this* script was a real, confirmed cause (see above) but not
+the *only* one.
+
+**Profiled where the ~7-8s actually goes** (`/usr/bin/time`, each `tpm2_*`
+step timed individually, secret output discarded, never printed):
+`tpm2_createprimary` alone: **6.90s**. `tpm2_load`: 0.21s.
+`tpm2_startauthsession`: 0.02s. `tpm2_policypcr`: 0.06s. `tpm2_unseal`:
+0.12s. `tpm2_flushcontext`: 0.02s. So the actual PCR-check-then-use window
+(`startauthsession` → `policypcr` → `unseal`) is only ~0.2s - tight - but
+whatever is perturbing it doesn't need a wide window, and `createprimary`
+dominating the runtime means every single login pays a fixed ~7s tax
+before even reaching that window, every time, by design (recreating the
+primary fresh instead of loading a saved context is the reboot-survival
+fix from earlier - see above - so this cost isn't avoidable without
+reopening that bug).
+
+Checked for another concrete concurrent TPM consumer in the same window:
+`gnome-remote-desktop-configuration.service` starts near every login/boot
+and its daemon fails its *own* TPM credential init almost immediately
+(`tcti:IO failure, using GKeyFile as fallback`) - but this happens on
+*every* boot checked so far, including the one that succeeded, so it
+doesn't correlate with failure specifically and isn't a confirmed cause,
+just a permanently-broken, unrelated fallback path on this hardware.
+
+**Fix (v1.1.2): retry the fast part, not the slow part.** Since
+`createprimary`+`load` are deterministic and only need to happen once,
+and the actual check-and-use step is cheap (~0.2s), `tpm-keyring-unseal.sh`
+now retries *only* `tpm2_startauthsession` → `tpm2_policypcr` →
+`tpm2_unseal` (fresh session context each attempt, old one flushed before
+retrying), up to 5 attempts with a 0.3s backoff between them, before
+giving up. This is a defensive measure, not a root-cause fix - the exact
+reason a single, uncontended run can still see "PCR have changed since
+checked" on this fTPM remains unconfirmed. It's treated the same way as
+any other transient hardware hiccup: detect, back off briefly, retry,
+bounded.
+
+Worst-case timing budget grew as a result: `flock` wait (≤10s, only under
+real contention) + `createprimary`/`load` (~7.1s, fixed) + up to 5 retries
+of the fast step (~0.5s each with backoff, ~2.5s) ≈ 20s worst case. The PAM
+module's `HELPER_TIMEOUT_SECS` was raised from 15 to 25 to give that
+headroom - at 15s, a retry that would have eventually succeeded could get
+killed by the module's own alarm-based timeout instead, turning a
+recoverable transient failure into a hard "timed out" one. Normal case
+(single stack, first attempt succeeds) is unchanged, still ~7.4s.
+
+Verified: `bash -n` on the script, `gcc -Wall -Wextra` under plain, `-std=c11
+-pedantic`, and `-std=c99 -pedantic` all clean on the module. Ran the
+updated script directly (via `tss` group membership, no sudo needed to
+reach `/dev/tpmrm0`) against the real sealed blob with a throwaway lock
+path (the real `/run/lock/tpm-keyring-unseal.lock` is root-owned 0644 from
+the actual login attempts, correctly unwritable by a non-root test) -
+`exit 0`, secret discarded to `/dev/null` without ever being displayed.
+
+**Not yet confirmed by a real reboot/resume test with this version
+installed** - same verification loop as before: cold boot or
+resume-from-suspend, fingerprint login, `journalctl -b 0 | grep -i "tpm
+keyring unseal"` should show the `succeeded` line, ideally without even
+needing a retry (retries would show as multiple close-together
+`tpm2_startauthsession` policy-session attempts inside one script run,
+currently not separately logged to journald - only the script's own final
+outcome is visible to PAM). Version bumped to 1.1.2 in `VERSION`.

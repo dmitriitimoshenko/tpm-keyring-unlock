@@ -42,13 +42,21 @@
  * strictly for the test suite under test/, so it can point at a throwaway
  * fake helper and use a short timeout instead of waiting out the real one.
  * Production builds (install.sh) never pass these flags, so they always
- * get the real path and the real 15s budget. */
+ * get the real path and the real 25s budget.
+ *
+ * 25s, not 15s: the helper's own worst case is flock wait (up to 10s, only
+ * if a second parallel PAM stack is also unsealing right now) + a ~7s
+ * tpm2_createprimary (this machine's fTPM; deterministic per call, not
+ * skippable - see JOURNAL.md) + up to 5 retries of the fast policy-session
+ * check-and-use step (~0.5s each including backoff). ~20s worst case;
+ * 25s leaves headroom instead of the alarm cutting off a retry that would
+ * have succeeded. See JOURNAL.md, 2026-08-14. */
 #ifndef HELPER_PATH
 #define HELPER_PATH "/usr/local/sbin/tpm-keyring-unseal"
 #endif
 #define MAX_PW_LEN 4096
 #ifndef HELPER_TIMEOUT_SECS
-#define HELPER_TIMEOUT_SECS 15
+#define HELPER_TIMEOUT_SECS 25
 #endif
 
 static volatile sig_atomic_t g_timed_out = 0;

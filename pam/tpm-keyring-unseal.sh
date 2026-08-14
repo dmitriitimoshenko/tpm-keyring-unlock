@@ -41,9 +41,29 @@ tpm2_load -C "$WORKDIR/primary.ctx" \
   -u "$DATA_DIR/seal.pub" -r "$DATA_DIR/seal.priv" \
   -c "$WORKDIR/seal.ctx" >/dev/null
 
-tpm2_startauthsession -S "$WORKDIR/session" --policy-session >/dev/null
-tpm2_policypcr -S "$WORKDIR/session" -l "$PCR_BANK" >/dev/null
-
-tpm2_unseal -c "$WORKDIR/seal.ctx" -p "session:$WORKDIR/session"
-
-tpm2_flushcontext "$WORKDIR/session" >/dev/null
+# The policy-session-check-then-use step (startauthsession -> policypcr ->
+# unseal) has been observed to fail with "Esys_Unseal ... PCR have changed
+# since checked" even with the flock above held and no other concurrent
+# caller of this script - the flock only rules out racing against a *second
+# copy of this same script*, not whatever else on this machine's fTPM
+# (AMD PSP firmware TPM, session-slot-constrained) can perturb a policy
+# session in that window. createprimary/load above already cost ~7s and are
+# deterministic given the same sealed blob, so only the fast, cheap final
+# step is retried here - not the whole sequence. See JOURNAL.md, 2026-08-14.
+UNSEAL_MAX_ATTEMPTS=5
+attempt=1
+while :; do
+  SESSION_CTX="$WORKDIR/session.$attempt"
+  if tpm2_startauthsession -S "$SESSION_CTX" --policy-session >/dev/null \
+     && tpm2_policypcr -S "$SESSION_CTX" -l "$PCR_BANK" >/dev/null \
+     && tpm2_unseal -c "$WORKDIR/seal.ctx" -p "session:$SESSION_CTX"; then
+    tpm2_flushcontext "$SESSION_CTX" >/dev/null 2>&1 || true
+    break
+  fi
+  tpm2_flushcontext "$SESSION_CTX" >/dev/null 2>&1 || true
+  if [ "$attempt" -ge "$UNSEAL_MAX_ATTEMPTS" ]; then
+    exit 1
+  fi
+  attempt=$((attempt + 1))
+  sleep 0.3
+done
