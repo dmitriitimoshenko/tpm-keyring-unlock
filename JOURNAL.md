@@ -723,3 +723,174 @@ Then: real logout/login **via fingerprint**, check `Locked` property and
   installing the .so and helper, masking the systemd units, sealing the
   password (interactive, user-run), and inserting the gdm-fingerprint line
   (with a clear warning/confirmation prompt, mirroring the caution used here).
+
+## Recurrence after a real cold reboot, post-publish (2026-08-14) — open, instrumented
+
+First real cold-boot test since publishing (v1.1.0) failed: user logged in
+via fingerprint, keyring did not auto-unlock, Chrome's "Authentication
+required" popup appeared minutes later and had to be answered by hand.
+Same failure signature as the `gdm-password` regression fixed on 2026-08-13
+(`gkr-pam: no password is available for user`), but this time the file was
+already correctly patched, so it's a different failure with the same
+symptom.
+
+**Ruled out, with evidence, before touching any code:**
+- PAM files reverted/missing the bridge line — no, `grep`/`cat` on
+  `/etc/pam.d/gdm-password` and `gdm-fingerprint` both still have `auth
+  optional pam_tpm_keyring_authtok.so` right before `pam_gnome_keyring.so`.
+- The systemd race is back — no, `systemctl --user is-enabled
+  gnome-keyring-daemon.socket gnome-keyring-daemon.service` still reports
+  `masked` for both, and the journal shows no `Started
+  gnome-keyring-daemon.service` line for the user's own session this boot
+  (only for the unrelated `gdm-greeter` user's session, which is expected
+  and harmless).
+- The helper/TPM path itself is broken — no, `sudo
+  /usr/local/sbin/tpm-keyring-unseal dmitrii` (full env, run manually,
+  hours after the failed login) returned exit 0. Since PCR values only ever
+  extend forward within a boot and never reset until the next one, if it
+  unseals now it was equally unsealable at 09:55:34 this same boot.
+- The module crashing (segfault, etc.) — no `coredumpctl` available to
+  fully confirm, but a crash inside a `.so` loaded into GDM's own PAM
+  client process would very likely have taken down more than just this one
+  optional auth step, and login/session-open proceeded cleanly right after.
+
+**What the journal actually shows:** GDM spawns two parallel PAM
+conversations on this login screen — `gdm-fingerprint][3936]` (requires
+`pam_fprintd.so` only) and `gdm-password][3935]` (via `common-auth`, which
+now leads with `pam_fprintd.so` too, `[success=3 default=ignore]`, since
+`pam-auth-update --enable fprintd` was enabled earlier this session). The
+user touched the sensor; the login that actually succeeded and opened the
+session for `dmitrii` was `gdm-password][3935]`, meaning fingerprint
+success came through `common-auth`'s leading `pam_fprintd.so` line (which
+jumps straight to `pam_permit`, skipping `pam_unix`/`pam_sss`/`pam_deny`
+entirely) — not through the dedicated `gdm-fingerprint` service. Either
+way, `pam_unix` never ran in the winning stack, so `PAM_AUTHTOK` was
+genuinely never set by anyone *except* whatever our bridge module did.
+
+**The actual gap: the module is observationally silent on its two most
+important paths.** `pam_tpm_keyring_authtok.so` only calls `pam_syslog()`
+on explicit failure branches (`pam_get_user`/`getpwnam`/`pipe`/`fork`
+failure, timeout, non-zero helper exit). It logs *nothing* on: (a) the
+early-return no-op path when `PAM_AUTHTOK` is already set, and (b) the
+success path after `pam_set_item()`. `journalctl -b 0` (all priorities,
+including `debug`, both PAM services) shows **zero** lines from this
+module for the failing login — not even a failure log. That means either
+it silently succeeded and something *else* dropped `PAM_AUTHTOK` before
+`pam_gnome_keyring` read it, or it silently no-op'd for a reason that
+shouldn't have applied here. Logs alone can't currently tell these apart —
+this is a real observability gap in the module, not a red herring.
+
+**Fix applied (this entry): instrumentation, not a guessed root-cause
+fix.** Added two `pam_syslog(LOG_INFO, ...)` calls: one right before the
+fork/exec attempt ("PAM_AUTHTOK not set yet, attempting TPM keyring unseal
+for user %s" — only fires on the non-trivial path, so ordinary
+typed-password logins stay silent as before), and one right after a
+successful `pam_set_item()` ("TPM keyring unseal succeeded for user %s,
+PAM_AUTHTOK set"). Also started checking `pam_set_item()`'s own return
+value for the first time (previously assumed to always succeed) and log if
+it fails. Compiles clean under plain `gcc -Wall -Wextra`, `-std=c11
+-pedantic`, and `-std=c99 -pedantic`.
+
+**Not yet resolved.** Needs a full cold reboot (not a screen lock/unlock —
+the assistant initially suggested `Super+L` + fingerprint, which the user
+correctly flagged as not equivalent: lock/unlock reuses the already-running
+`gnome-keyring-daemon` and an already-measured boot, so it can't reproduce
+a boot-time-only race or a fresh-PCR unseal failure) with the rebuilt
+module installed, then a fingerprint login, then `journalctl -b 0 | grep
+tpm-keyring-unseal` (user-run, since installing a compiled PAM module
+requires `sudo`) to see which of the three outcomes actually happened:
+never attempted, attempted but `pam_set_item` itself reported failure, or
+attempted-and-reported-success (which would mean the bug is on
+`pam_gnome_keyring`'s side, not ours, and a very different investigation).
+
+One live hypothesis not yet tested: GDM ran *two* parallel PAM stacks this
+boot, and both include `auth optional pam_tpm_keyring_authtok.so`. If both
+fired near-simultaneously, two concurrent `tpm2_*` sessions against the
+same TPM (this machine's is an AMD PSP firmware TPM, more resource-
+constrained than a discrete chip) could race for session slots on
+`/dev/tpmrm0`. If that happened, the losing side's helper script would
+`exit` non-zero under `set -e`, which *should* already be caught by the
+"helper produced no usable output" log — but that log was equally silent,
+so this needs the instrumentation above to confirm either way, not more
+speculation.
+
+### Root cause found and fixed (same day, after a real cold reboot with the instrumentation above)
+
+The instrumentation worked immediately. `journalctl -b 0` on the next real
+cold boot + fingerprint login showed, for **both** parallel PAM stacks:
+`PAM_AUTHTOK not set yet, attempting TPM keyring unseal for user dmitrii`
+followed ~13-14 seconds later by `tpm-keyring-unseal helper produced no
+usable output (exit 1)`. Not a timeout (would say so explicitly) — a real
+`exit 1` after a suspiciously long delay for what should be a sub-second
+TPM operation.
+
+The helper's own `exit 1` from `set -e` doesn't say *which* command failed,
+and the child's stderr — deliberately left inherited from the login
+process specifically so this kind of thing would be diagnosable (see
+`pam_tpm_keyring_authtok.c` comment) — doesn't show up under the PAM
+service's own syslog tag, because it's a **different PID** (the forked
+child, not the PAM module's own process). Widening the `journalctl` window
+to *all* lines (no tag/PID filter) for that ~14s window surfaced it, under
+`gdm-session-worker[4460]` and `gdm-session-worker[4463]` — two child
+processes, 92ms apart:
+
+```
+ERROR:esys:...Esys_Unseal.c:98:Esys_Unseal() Esys Finish ErrorCode (0x00000128)
+ERROR: Esys_Unseal(0x128) - tpm:error(2.0): PCR have changed since checked
+ERROR: Unable to run tpm2_unseal
+```
+
+**Root cause confirmed:** GDM always spawns two parallel PAM conversations
+on this login screen (`gdm-fingerprint` and `gdm-password`, since
+`common-auth` now leads with `pam_fprintd.so` too), and our bridge module
+is wired into both — by design, since either one could be the one that
+ends up needing it. On this boot, both fired within about a second of each
+other, both ran the full `tpm2_createprimary` → `tpm2_load` →
+`tpm2_startauthsession --policy-session` → `tpm2_policypcr` → `tpm2_unseal`
+sequence *concurrently* against the same TPM device. `tpm2_policypcr`
+checks and locks in the current PCR7 value into its session's policy
+digest; by the time that session's own `tpm2_unseal` actually runs, the
+interleaving with the *other* concurrent session's activity on the same
+device caused the TPM to see the PCR-checked-at-policy-time state as
+invalidated ("PCR have changed since checked") — even though PCR7 never
+actually, legitimately changed. The ~13s delay is consistent with
+contention/serialization overhead on this machine's AMD PSP firmware TPM
+(fTPM), which is more resource-constrained (fewer session slots, slower)
+than a discrete TPM chip. The script itself never races with anything
+external — this is strictly two copies of *our own* helper stepping on
+each other, something no earlier reboot test happened to trigger (both
+parallel stacks have to actually attempt fingerprint-path unsealing at
+close enough timing, which depends on exactly how/when the user touches
+the sensor relative to GDM's own stack setup).
+
+**Fix:** serialize `pam/tpm-keyring-unseal.sh` with `flock` around a lock
+file at `/run/lock/tpm-keyring-unseal.lock` (`exec 9>...; flock -w 10 9 ||
+exit 1`, right after the `seal.priv` existence check, before any `tpm2_*`
+call). The losing invocation now just waits up to 10s for the winner to
+finish and release the TPM, instead of racing it and failing. 10s wait +
+the actual sub-second unseal work comfortably fits inside the PAM module's
+existing 15s `HELPER_TIMEOUT_SECS` budget, so a normal double-fire still
+completes well within the login-blocking timeout. `/run/lock` (tmpfs,
+world-writable-sticky, cleared every boot) was used instead of `/var/lock`
+to avoid depending on the latter being a symlink to it on every distro.
+Only the login-time helper needs this — `bin/seal.sh` is a one-off,
+user-run, interactive command with no concurrent-invocation exposure.
+
+**Lesson:** GDM's habit of running multiple PAM stacks in parallel for one
+login screen (already the cause of the `gdm-password` regression above) has
+a *second*, independent failure mode beyond "which files are patched" —
+concurrent execution of the same helper against shared hardware. Anything
+this bridge module shells out to that touches genuinely single-consumer
+hardware state (a TPM session, in this case) needs to assume it can be
+invoked twice in the same half-second, because on this login manager, it
+routinely is.
+
+**Confirmed fixed by an actual cold reboot test.** Fingerprint login, clean
+log sequence: `PAM_AUTHTOK not set yet, attempting...` → (this time ~8s,
+consistent with `flock` serialization overhead even though only one stack
+ended up needing to unseal) → `TPM keyring unseal succeeded for user
+dmitrii, PAM_AUTHTOK set` → `gkr-pam: stashed password to try later in
+open session` → `gkr-pam: gnome-keyring-daemon started properly and
+unlocked keyring`. No manual password prompt. Status: keyring auto-unlock
+on fingerprint login survives a real cold reboot again, this time with the
+concurrent-TPM-access race actually closed rather than just not triggered.

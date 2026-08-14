@@ -82,6 +82,10 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc,
         return PAM_IGNORE;
     }
 
+    pam_syslog(pamh, LOG_INFO,
+               "PAM_AUTHTOK not set yet, attempting TPM keyring unseal for "
+               "user %s", user);
+
     int pipefd[2];
     if (pipe(pipefd) != 0) {
         pam_syslog(pamh, LOG_ERR, "pipe() failed: %s", strerror(errno));
@@ -175,8 +179,18 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc,
         buf[total - 1] = '\0';
     }
 
-    pam_set_item(pamh, PAM_AUTHTOK, buf);
+    int set_rv = pam_set_item(pamh, PAM_AUTHTOK, buf);
     memset(buf, 0, sizeof(buf));
+
+    if (set_rv != PAM_SUCCESS) {
+        pam_syslog(pamh, LOG_ERR, "pam_set_item(PAM_AUTHTOK) failed: %s",
+                   pam_strerror(pamh, set_rv));
+        return PAM_IGNORE;
+    }
+
+    pam_syslog(pamh, LOG_INFO,
+               "TPM keyring unseal succeeded for user %s, PAM_AUTHTOK set",
+               user);
 
     return PAM_IGNORE;
 }

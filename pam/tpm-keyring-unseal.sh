@@ -15,6 +15,17 @@ PCR_BANK="sha256:7"
 
 [ -f "$DATA_DIR/seal.priv" ] || exit 1
 
+# GDM spawns parallel PAM conversations on one login screen (e.g.
+# gdm-fingerprint and gdm-password at once), and this helper is wired into
+# both. Two concurrent tpm2_* sequences against the same TPM have been
+# observed to fail with "Esys_Unseal ... PCR have changed since checked" -
+# one session's PCR-policy check gets invalidated by the other session's
+# concurrent activity on the same device. See JOURNAL.md, 2026-08-14. Serialize
+# so only one unseal talks to the TPM at a time; the loser just waits its turn
+# instead of racing and failing.
+exec 9>/run/lock/tpm-keyring-unseal.lock
+flock -w 10 9 || exit 1
+
 WORKDIR=$(mktemp -d)
 trap 'rm -rf "$WORKDIR"' EXIT
 
