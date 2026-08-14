@@ -36,7 +36,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        distro: [ubuntu, fedora, arch, opensuse]
+        distro: [ubuntu, debian, fedora, arch, opensuse]
     steps:
       - uses: actions/checkout@v4
       - run: docker build -f "test/distro/Dockerfile.${{ matrix.distro }}" -t "tpm-keyring-unlock-test-${{ matrix.distro }}" .

@@ -1,0 +1,20 @@
+# Packaging/detection test on Debian - mirrors install.sh's apt branch,
+# same as Dockerfile.ubuntu, but on Debian proper rather than an
+# Ubuntu/Debian derivative. Worth testing separately even though both go
+# through the same apt codepath in install.sh: Debian's base image, default
+# package set, and exact package versions differ enough from Ubuntu's that
+# "works on Ubuntu" isn't proof it works here too (e.g. Debian stable tends
+# to ship older tpm2-tools/PAM header versions than Ubuntu's latest LTS).
+FROM debian:13
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      tpm2-tools gcc libpam0g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY bin/lib.sh bin/lib.sh
+COPY pam/pam_tpm_keyring_authtok.c pam/pam_tpm_keyring_authtok.c
+COPY test/distro/test-packaging.sh test/distro/test-packaging.sh
+
+CMD ["bash", "test/distro/test-packaging.sh"]

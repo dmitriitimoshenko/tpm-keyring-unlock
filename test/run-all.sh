@@ -39,7 +39,7 @@ if ! command -v docker >/dev/null 2>&1; then
   echo "docker not found - skipping the container-based tests (runtime" >&2
   echo "behavior + per-distro packaging). Install docker to run those." >&2
   record "runtime (pamtester + fake helper)" SKIPPED
-  for d in ubuntu fedora arch opensuse; do
+  for d in ubuntu debian fedora arch opensuse; do
     record "packaging: $d" SKIPPED
   done
   record "packaging: ubuntu (arm64, cross-build)" SKIPPED
@@ -59,7 +59,7 @@ else
   echo "########################################"
   echo "# 3/3 - packaging + PAM-dir detection per distro (container)"
   echo "########################################"
-  for d in ubuntu fedora arch opensuse; do
+  for d in ubuntu debian fedora arch opensuse; do
     echo
     echo "--- $d ---"
     if docker build -q -f "test/distro/Dockerfile.$d" -t "tpm-keyring-unlock-test-$d" . \
