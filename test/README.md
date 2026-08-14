@@ -49,24 +49,53 @@ actually runs there, never skips.
   `aarch64-linux-gnu` candidates resolve correctly under real ARM64
   userspace, not just that the string is in the candidate list.
 
-## What's deliberately not covered here, and why
+## The VM layer: `test/vm/run-vm-test.sh`
 
-Nothing here touches a TPM, Secure Boot, or a real PAM-driven login. A
-plain container shares the host kernel and has no independent TPM or UEFI
-firmware state - there's no PCR7 to seal against, so `bin/seal.sh`,
-`require_secure_boot()`'s actual detection paths, and the real
-`tpm-keyring-unseal` helper are structurally untestable in Docker. That's
-also true of a real graphical login (GDM/PAM prompting for a fingerprint) -
-containers don't have one.
+```bash
+test/vm/run-vm-test.sh   # or: make test-vm
+```
 
-For that layer, the right tool is a VM with `swtpm` (virtual TPM 2.0) and
-OVMF (UEFI firmware with real, toggleable Secure Boot state) - see the
-main README's testing recommendations. `virt-manager` makes both easy to
-add through its GUI. `libfprint` also ships a virtual/test fingerprint
-device driver (used in its own CI) that can exercise the fingerprint path
-inside such a VM without physical hardware.
+Everything above shares the host kernel and has no independent TPM or UEFI
+firmware state, so `bin/seal.sh`, `require_secure_boot()`'s actual
+detection paths, and the real `tpm-keyring-unseal` helper are structurally
+untestable in a container. This script covers that layer with a real VM:
+`qemu`/KVM + OVMF (real, toggleable Secure Boot state - both the plain and
+`.ms` vars templates) + `swtpm` (a real TPM 2.0 device, not a fake helper
+script). Two scenarios:
 
-In short: this suite proves the PAM_AUTHTOK bridge logic and the
-packaging/detection layer work, across four distros and two
-architectures. It doesn't and can't prove the TPM sealing itself works -
-that's a VM-and-real-hardware question, not a Docker question.
+- **Secure Boot OFF** - boots with the empty (no enrolled keys) OVMF vars
+  template and confirms `require_secure_boot()` genuinely refuses.
+- **Secure Boot ON** - boots with the `.ms` (Microsoft keys pre-enrolled)
+  vars template, confirms `require_secure_boot()` allows, then runs the
+  real `bin/seal.sh` (a throwaway test secret, never a real password) and
+  `pam/tpm-keyring-unseal.sh` against the real PCR7 policy. Then it fully
+  stops both `swtpm` and `qemu` and restarts them against the same
+  on-disk TPM state / OVMF vars / disk image - a genuine TPM reset-count
+  increment, the same trigger as a real reboot - and confirms
+  `tpm-keyring-unseal.sh` still unseals correctly. That's exactly the "integrity
+  check failed" / "PCR have changed since checked" failure class documented
+  in `JOURNAL.md`'s reboot-survival bugs, which no container can reproduce.
+  It also fires two concurrent unseal calls at the real TPM to check the
+  `flock` serialization fix for the second reboot regression in the journal.
+
+Needs `swtpm`, `qemu-system-x86_64`/`qemu-img`, `/dev/kvm`, and network
+access once to fetch a small Ubuntu cloud image (cached afterward,
+re-verified against Ubuntu's published checksum every run). Missing any of
+these is a clean `SKIPPED`, same convention as everywhere else in this
+suite - see the script's preflight section for exact package names.
+
+Opt-in, not part of `test/run-all.sh`: real VM boots are slower than
+containers. It does run in CI though (the `vm` job in
+`.github/workflows/test.yml`) - GitHub-hosted Linux runners expose
+`/dev/kvm`, which is what makes that possible there at all.
+
+## What even the VM layer doesn't cover, and why
+
+A real graphical login (GDM prompting for and reading a fingerprint) isn't
+exercised here either - that needs a full desktop session inside the VM,
+not just a booted OS. `libfprint` ships a virtual/test fingerprint device
+driver (used in its own CI) that could exercise that path inside a VM
+without physical hardware, but automating a real GDM greeter reliably is a
+meaningfully heavier, more failure-prone undertaking than the headless
+seal/unseal round trip above - not implemented here. `virt-manager` makes
+building such a VM by hand easy through its GUI, for manual testing.

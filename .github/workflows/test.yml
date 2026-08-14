@@ -1,8 +1,9 @@
 # Mirrors test/run-all.sh, but as separate jobs instead of one script, so a
 # PR check shows which specific layer broke instead of one pass/fail blob.
-# See test/README.md for what each layer actually covers (and doesn't -
-# nothing here touches a TPM, Secure Boot, or a real PAM login; that needs a
-# VM with swtpm+OVMF, out of scope for GitHub-hosted runners).
+# See test/README.md for what each layer actually covers. The `vm` job below
+# is the only one that touches a real TPM/Secure Boot state (swtpm + OVMF,
+# via test/vm/run-vm-test.sh) - GitHub-hosted Linux runners expose /dev/kvm,
+# which is what makes that possible here at all.
 name: test
 
 on:
@@ -59,3 +60,28 @@ jobs:
           docker buildx build --platform linux/arm64 -f test/distro/Dockerfile.ubuntu \
             -t tpm-keyring-unlock-test-ubuntu-arm64 --load .
       - run: docker run --rm --platform linux/arm64 tpm-keyring-unlock-test-ubuntu-arm64
+
+  vm:
+    name: VM (swtpm + OVMF) - real TPM/Secure Boot round trip
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y swtpm swtpm-tools ovmf qemu-system-x86 qemu-utils
+      # GitHub-hosted Linux runners expose /dev/kvm but don't put the runner
+      # user in the `kvm` group by default - this udev rule (the standard
+      # fix used across many QEMU-based Actions workflows) makes the device
+      # world-accessible instead. test/vm/run-vm-test.sh itself already
+      # degrades to a clean SKIPPED if /dev/kvm turns out to be unusable, so
+      # this is defense in depth, not something the job depends on blindly.
+      - run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      # Caches the downloaded base cloud image (~250MB) across runs -
+      # run-vm-test.sh still re-verifies it against Ubuntu's currently
+      # published checksum before trusting a cache hit.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/tpm-keyring-unlock-vm-test
+          key: vm-test-cloud-image-ubuntu-24.04-minimal
+      - run: test/vm/run-vm-test.sh

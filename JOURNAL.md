@@ -1033,3 +1033,120 @@ PASS, arm64: correctly `SKIPPED`, overall exit 0).
 Everything above was checked locally, including the YAML's syntax, but the
 workflow has not yet been pushed/run on GitHub Actions infrastructure -
 that's the next real confirmation step once this is committed and pushed.
+
+## VM test layer added: real TPM/Secure Boot, not a fake helper (2026-08-14, later)
+
+User asked for the layer `test/README.md` had always said Docker
+structurally can't provide: something that exercises a real TPM 2.0
+device and real, toggleable UEFI Secure Boot state, since containers share
+the host kernel and have neither. Built `test/vm/run-vm-test.sh`
+(`make test-vm`): `qemu`/KVM + OVMF (this machine already had both the
+plain and `.ms`-with-Microsoft-keys `OVMF_VARS_4M*.fd` templates installed
+via the `ovmf`/`ovmf-generic` packages - no new package needed for
+toggleable Secure Boot state) + `swtpm` (needed installing, handed to the
+user per this repo's standing sudo rule - `sudo apt install -y swtpm
+swtpm-tools`). Cloud-init seed served over the SLIRP gateway via a local
+`python3 -m http.server` (`ds=nocloud-net` datasource) instead of building
+an ISO, since neither `cloud-localds` nor `genisoimage`/`mkisofs` were
+installed and pulling in another package wasn't worth it for this.
+
+Two scenarios, both against a real Ubuntu 24.04 minimal cloud image
+(downloaded once, cached under `~/.cache/tpm-keyring-unlock-vm-test/`,
+re-verified against Ubuntu's currently-published `SHA256SUMS` on every run
+rather than a hash frozen in the script, since the file at that URL gets
+refreshed upstream periodically):
+
+- **Secure Boot OFF** (plain `OVMF_VARS_4M.fd`, no enrolled keys): confirms
+  `require_secure_boot()` genuinely refuses.
+- **Secure Boot ON** (`OVMF_VARS_4M.ms.fd`): confirms `require_secure_boot()`
+  allows, then runs the real `bin/seal.sh` (a throwaway secret piped via
+  stdin - `read -rsp` doesn't need a tty - never a real password) and
+  `pam/tpm-keyring-unseal.sh` against a real PCR7 policy, fires two
+  concurrent unseal calls at the same real TPM (validates the `flock` fix
+  for the second reboot regression further up this file), then fully stops
+  both `swtpm` and `qemu` and restarts them against the same on-disk TPM
+  state / OVMF vars / disk image and confirms unseal still works - a
+  genuine TPM reset-count increment, the same trigger as the "integrity
+  check failed" / "PCR have changed since checked" bugs earlier in this
+  file, which no container can reproduce.
+
+**All real, run-blocking bugs, found by actually running this repeatedly
+rather than trusting it after one green run** - consistent with this
+project's established pattern (see the Docker-suite entry above) that
+writing a test and running a test catch different classes of bug, and that
+running it *once* isn't the same as it being *correct*:
+
+1. **`start_swtpm`'s backgrounded `swtpm &` had no output redirect.**
+   Harmless everywhere it was called directly - but `boot_b()` (which
+   calls it) was originally invoked as `B1_SSHPORT=$(boot_b)`, a command
+   substitution, which is a pipe. Since `swtpm` never exits, it inherited
+   that pipe's write end and the pipe never saw EOF - `$(boot_b)` hung
+   forever, on the very first line of scenario B, no SSH connection ever
+   attempted. Fixed by redirecting `swtpm`'s (and, defensively, `qemu`'s)
+   output to a log file instead of leaving it as an inherited fd.
+
+2. **`boot_b()`'s "return values" were bash globals set inside a command
+   substitution.** Fixing bug 1 exposed this one immediately: even with
+   the hang gone, `$(boot_b)` still runs in a *subshell* - every variable
+   `boot_b()` set (`B_BOOT_QEMU_PID`, `B_BOOT_SWTPM_PID`) vanished the
+   moment that subshell exited, well before the caller could read them.
+   Failed with `B_BOOT_QEMU_PID: unbound variable` (`set -u` caught it
+   immediately rather than silently killing the wrong PID later, which
+   would have been much worse). Fixed by calling `boot_b` directly (not
+   substituted) and reading its globals straight afterward - the port
+   itself became one more such global (`B_BOOT_SSHPORT`) instead of an
+   echoed return value.
+
+3. **Killing `qemu` right after `seal.sh` could race the guest's own
+   write-back cache.** The reboot-survival check failed once with `got:
+   ` (empty) - `tpm-keyring-unseal.sh` exits 1 silently if
+   `$DATA_DIR/seal.priv` doesn't exist, which is consistent with the
+   just-sealed files still sitting in the guest's dirty page cache when
+   `qemu` got SIGTERM'd (no ACPI shutdown, no chance for ext4's normal
+   writeback to run) - i.e. this was accidentally testing "survives a hard
+   power cut before the disk syncs," a real but *different* question from
+   the intended "survives a clean reboot's TPM reset." Fixed by running
+   `sync` over SSH inside the guest immediately before tearing down `qemu`
+   for the B1→B2 transition - keeps the deliberate full process
+   restart (needed for a genuine TPM reset-count increment) while removing
+   the unintended disk-durability variable.
+
+4. **Found only after everything reported "All VM tests passed" and exited
+   0: `qemu`/`swtpm`/the seed `http.server` were still running minutes
+   later.** `stop_pid()` (and the `cleanup()` EXIT trap) sent `kill` then
+   called `wait "$pid"` to confirm death - but `qemu` runs with
+   `-daemonize`, which forks internally and reparents away from this
+   script's shell, so the PID read back from `$pidfile` was never actually
+   a direct child of this shell. `wait` on a non-child PID fails
+   immediately ("not a child of this shell") and returns right away
+   regardless of whether the process is still alive - so "cleanup"
+   declared victory instantly, every single time, without ever confirming
+   anything. Caught by manually checking `ps` well after a run had already
+   printed its success summary and exited - the kind of thing that's
+   invisible from the test's own output, only from watching the system
+   around it. Fixed by replacing the `wait`-based confirmation with an
+   active `kill -0` poll loop (up to 5s), escalating to `SIGKILL` if the
+   process is still there after that.
+
+**Confirmed genuinely stable, not just "passed once":** re-ran the full
+suite twice in a row after all four fixes, including a direct `ps` check
+for leftover `qemu`/`swtpm`/`http.server` processes after each run - both
+runs: all 7 checks `ok`, exit 0, zero leftover processes. Also added a
+`vm` job to `.github/workflows/test.yml` (the KVM device on GitHub-hosted
+Linux runners needs a udev rule to be group-accessible to the default
+runner user - the standard `KERNEL=="kvm", GROUP="kvm", MODE="0666"` fix
+used by many QEMU-based Actions workflows; not yet confirmed green on
+actual GitHub infrastructure, same caveat as the earlier CI entry).
+
+Also added `errfile` support to the test's `check()` helper (prints
+captured stderr inline on failure) - this is what made bug 3 diagnosable
+at all instead of just "got empty string, guess why."
+
+Lesson, same shape as the earlier "GDM runs multiple PAM stacks at once"
+and "openSUSE package name" lessons in this file: a test suite for
+infrastructure-adjacent code (bash driving real daemons, real subshells,
+real process lifecycles) has its own bug surface, orthogonal to the
+product code it's testing. All four bugs above were in the test harness,
+none in `bin/seal.sh`, `pam/tpm-keyring-unseal.sh`, or `bin/lib.sh` - but
+finding and fixing them was exactly as real a debugging exercise as the
+TPM/PCR bugs those scripts already went through.
