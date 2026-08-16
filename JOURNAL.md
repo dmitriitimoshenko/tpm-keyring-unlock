@@ -1379,3 +1379,117 @@ entry originally followed immediately after the "Docker test suite
 reviewed" entry on this branch's own history, reordered here after the
 merge conflict with `main` to keep the file in actual chronological order
 rather than merge order.
+
+## Login latency fix: primary key persisted in TPM NV storage instead of recreated every login (2026-08-16)
+
+User reported the real-world symptom directly: fingerprint login on this
+laptop pauses for "5, maybe 7 seconds" after the fingerprint touch before
+the session actually opens, versus ~1s when this repo's PAM module isn't
+in the loop at all. Not a new bug - it's the same ~7.4s hot-path cost
+already profiled in the "Correction... incomplete" entry above
+(2026-08-14): `tpm2_createprimary` alone measured **6.90s** per call on
+this machine's fTPM, out of ~7.4s total, because both `bin/seal.sh` and
+`pam/tpm-keyring-unseal.sh` recreate the primary key from scratch on
+*every single invocation* - a deliberate choice at the time, to sidestep
+the reboot-survival bug documented further up this file (a saved *context
+file* for a transient object is tied to the TPM's reset counter and
+becomes unloadable after a reboot: `Esys_ContextLoad() ... integrity check
+failed`).
+
+That earlier fix conflated two different things: "don't save a transient
+object's context blob across reboots" (correctly true, and the actual root
+cause of that bug) with "the primary can't be cached across logins at
+all" (never actually true - just the simplest fix available at the time).
+TPM 2.0 has a separate, purpose-built mechanism for exactly this:
+`tpm2_evictcontrol`, which asks the TPM to move an object into its own
+persistent NV storage under a fixed handle. A persistent object is *not* a
+context blob - it lives inside the TPM's own state, survives resets by
+design, and is the same mechanism `systemd-cryptenroll --tpm2-device=auto`
+uses to keep a reusable SRK for LUKS unlocking. Since `tpm2_createprimary
+-C o` with a fixed hierarchy+template is deterministic (already confirmed
+by the reboot-survival fix above - same TPM, same template in, same key
+out, every time), persisting it once is safe: it's the exact same key
+either way, just computed once instead of on every login.
+
+**Fix:**
+- `bin/seal.sh`: still creates the primary fresh (needed either way, to
+  get a context to persist or to compare against), but now checks whether
+  a fixed handle (`0x81018000` by default, or whatever's already recorded
+  in `$DATA_DIR/primary.handle` on a re-seal) already holds a persisted
+  object. Empty → `tpm2_evictcontrol`s the fresh primary into it. Occupied
+  → compares the *name* (`tpm2_readpublic -n`) of what's there against the
+  freshly-derived primary's name: match → reuse it (idempotent re-seal, no
+  wasted evictcontrol call); mismatch → hard-refuse rather than silently
+  reusing or clobbering an object this tool didn't create. Records
+  whichever handle actually got used in `$DATA_DIR/primary.handle`, then
+  seals the child secret under that handle directly (`-C $PRIMARY_HANDLE`)
+  instead of under a transient context file.
+- `pam/tpm-keyring-unseal.sh`: reads `$DATA_DIR/primary.handle` if
+  present and uses it directly as `tpm2_load`'s parent - skips
+  `tpm2_createprimary` entirely. Falls back to the old recreate-fresh
+  behavior, byte-for-byte unchanged, if the file is absent (sealed data
+  from before this change, not yet re-sealed) - nothing breaks for anyone
+  mid-migration, it's just still slow until they re-seal.
+- `uninstall.sh`: new step evicts the persisted primary
+  (`tpm2_evictcontrol -C o -c $HANDLE`, no output handle given = remove)
+  before offering to delete `$DATA_DIR` - otherwise a full uninstall would
+  leave an orphaned object sitting in the TPM's small number of
+  persistent-object NV slots forever.
+- `pam_tpm_keyring_authtok.c`: comment-only update - the 25s
+  `HELPER_TIMEOUT_SECS` budget's ~7s `createprimary` term is now only paid
+  on the pre-migration fallback path. Left the actual timeout value
+  unchanged: the module has no way to know in advance which path a given
+  login will take, and 25s is already a safe, conservative bound for both.
+- `test/vm/run-vm-test.sh`: added non-assertive wall-clock timing prints
+  (`elapsed_ms`) around both the same-boot and post-reboot unseal calls,
+  so the speedup shows up as real evidence in the test's own output
+  instead of only being asserted in prose.
+
+**Why the handle is looked up from a file instead of hardcoded identically
+in both scripts:** already burned by this exact class of mistake once -
+the `TPM_KEYRING_UNLOCK_DATA_DIR` env-var removal entry above notes "the
+path needs to be the same constant on both sides of the seal/unseal
+boundary, an env var can't safely be that." Same reasoning applies to the
+handle: `seal.sh` is the only writer, `tpm-keyring-unseal.sh` only ever
+reads back whatever `seal.sh` actually used, so the two can never drift
+out of sync with each other even if the default constant changes in a
+future version.
+
+**Verified, not just "should be fast":**
+- `bash -n` clean on all three changed shell scripts; `gcc -Wall -Wextra`
+  clean (zero warnings) on the comment-only `.c` change.
+- `make test` (regex/detection + runtime/pamtester + 5-distro packaging):
+  all PASS, arm64 cross-build correctly SKIPPED (no qemu binfmt registered
+  locally, same as every prior run) - confirms nothing outside
+  seal.sh/unseal.sh/uninstall.sh regressed, as expected (those layers
+  don't exercise real TPM mechanics at all, so they couldn't have caught
+  this change either way - listed for completeness, not as evidence of
+  the fix itself).
+- `make test-vm` (real swtpm + OVMF, throwaway secret, the layer that
+  actually exercises real TPM mechanics): all 7 checks `ok`, including the
+  two that matter most for this change:
+  - same-boot unseal: **407ms**.
+  - **post-reboot unseal: 426ms**, after a real `swtpm`+`qemu` process
+    restart (a genuine TPM reset-count increment - PCR7 read back
+    identical across both boots, `0xC86235C7...`) - this is exactly the
+    scenario the persisted-handle approach had to prove itself against,
+    since a reset-count increment is what broke the old context-file
+    approach in the first place. It didn't just survive, it stayed fast.
+  - The two-concurrent-unseal-calls check (the `flock` serialization fix
+    from 2026-08-14) still passes - the fast path doesn't reopen that
+    race; if anything it shrinks the contention window it has to defend
+    from ~7s to well under half a second.
+- Deliberately did not touch this machine's real
+  `~/.local/share/tpm-keyring-unlock/` or run `bin/seal.sh`/
+  `tpm-keyring-unseal.sh` against it directly - per CLAUDE.md, only the
+  user can do that (it needs the real keyring password). Every number
+  above came from the VM's own throwaway secret and its own isolated
+  swtpm, never the real machine's TPM or real password.
+
+**Not yet done - the one remaining step, and it has to be the user's:**
+this machine's actual sealed secret predates this change (no
+`primary.handle` file yet), so it's still on the slow fallback path today.
+Re-running `bin/seal.sh` (same password as before, choosing "Overwrite"
+when it asks) is what actually adopts the fast path here - can't be done
+through a tool call, same as every other real-secret step in this
+project.

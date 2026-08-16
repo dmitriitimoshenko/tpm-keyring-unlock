@@ -48,18 +48,55 @@ fi
 WORKDIR=$(mktemp -d)
 trap 'rm -rf "$WORKDIR"' EXIT
 
-# Primary key context is not persisted to $DATA_DIR: a saved context for a
-# transient object dies on every TPM reset (reboot). tpm2-keyring-unseal.sh
-# recreates the same deterministic primary fresh on every call instead of
-# relying on a saved context file - see JOURNAL.md.
+# The primary is persisted into the TPM's own NV storage at a fixed handle
+# instead of being recreated on every login. NOT the same thing as the
+# saved-context-file approach that broke across reboots (see JOURNAL.md,
+# "Bug found on full reboot") - that bug was about a *transient* object's
+# serialized context blob, which is tied to the TPM's reset counter and
+# becomes unloadable after every reset. A persistent object lives inside the
+# TPM's own NVRAM (the same mechanism systemd-cryptenroll uses for its
+# TPM-bound LUKS SRK) and survives resets by design - only the
+# *recomputation* of a fresh transient primary on every single login was
+# ever the actual cost (~7s on this machine's fTPM, profiled in
+# JOURNAL.md), never a correctness requirement. See JOURNAL.md, 2026-08-16.
 tpm2_createprimary -C o -c "$WORKDIR/primary.ctx" >/dev/null
+tpm2_readpublic -c "$WORKDIR/primary.ctx" -n "$WORKDIR/fresh.name" >/dev/null
+
+PRIMARY_HANDLE_DEFAULT="0x81018000"
+if [ -f "$DATA_DIR/primary.handle" ]; then
+  PRIMARY_HANDLE="$(cat "$DATA_DIR/primary.handle")"
+else
+  PRIMARY_HANDLE="$PRIMARY_HANDLE_DEFAULT"
+fi
+
+if tpm2_readpublic -c "$PRIMARY_HANDLE" -n "$WORKDIR/existing.name" >/dev/null 2>&1; then
+  if cmp -s "$WORKDIR/fresh.name" "$WORKDIR/existing.name"; then
+    echo "Reusing already-persisted primary key at $PRIMARY_HANDLE."
+  else
+    # Deterministic primary (same hierarchy + template = same key, always) -
+    # a name mismatch means something else persisted an unrelated object at
+    # this exact handle. Refuse rather than silently reusing or clobbering
+    # an object this tool doesn't own.
+    echo "TPM persistent handle $PRIMARY_HANDLE is occupied by an object this" >&2
+    echo "tool didn't create (its name doesn't match our deterministic" >&2
+    echo "primary). Not touching it. Either free it yourself if you know" >&2
+    echo "it's safe (tpm2_evictcontrol -C o -c $PRIMARY_HANDLE), or put a" >&2
+    echo "different free handle in $DATA_DIR/primary.handle first." >&2
+    exit 1
+  fi
+else
+  echo "Persisting primary key into the TPM at $PRIMARY_HANDLE (one-time cost;"
+  echo "avoids recomputing it on every future login - see JOURNAL.md)."
+  tpm2_evictcontrol -C o -c "$WORKDIR/primary.ctx" "$PRIMARY_HANDLE" >/dev/null
+fi
+echo "$PRIMARY_HANDLE" >"$DATA_DIR/primary.handle"
 
 SESSION="$WORKDIR/session"
 tpm2_startauthsession -S "$SESSION" --policy-session >/dev/null
 tpm2_policypcr -S "$SESSION" -l "$PCR_BANK" -L "$DATA_DIR/pcr.policy" >/dev/null
 tpm2_flushcontext "$SESSION" >/dev/null
 
-printf '%s' "$PASSWORD" | tpm2_create -C "$WORKDIR/primary.ctx" \
+printf '%s' "$PASSWORD" | tpm2_create -C "$PRIMARY_HANDLE" \
   -u "$DATA_DIR/seal.pub" -r "$DATA_DIR/seal.priv" \
   -L "$DATA_DIR/pcr.policy" -i- >/dev/null
 

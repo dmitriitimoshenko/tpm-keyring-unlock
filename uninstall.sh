@@ -60,7 +60,25 @@ if systemctl --user is-enabled gnome-keyring-daemon.service 2>/dev/null | grep -
   fi
 fi
 
-# --- 4. sealed secret -----------------------------------------------------
+# --- 4. sealed secret + persisted TPM primary ---------------------------
+# The primary key may live persisted in the TPM's own NV storage (see
+# JOURNAL.md, 2026-08-16) rather than only as ephemeral state - evict it
+# before wiping $DATA_DIR (which is what records the handle), so a leftover
+# object doesn't sit in the TPM's limited persistent-object slots forever.
+# Only present on installs that have re-sealed since that change; older
+# sealed data never persisted anything, so there's nothing to evict.
+if [ -f "$DATA_DIR/primary.handle" ] && command -v tpm2_evictcontrol >/dev/null 2>&1; then
+  PRIMARY_HANDLE="$(cat "$DATA_DIR/primary.handle")"
+  if confirm "Evict the persisted TPM primary key at $PRIMARY_HANDLE?"; then
+    if tpm2_evictcontrol -C o -c "$PRIMARY_HANDLE" >/dev/null 2>&1; then
+      echo "Evicted."
+    else
+      echo "Couldn't evict $PRIMARY_HANDLE (already gone, or TPM not reachable" >&2
+      echo "right now) - continuing anyway." >&2
+    fi
+  fi
+fi
+
 if [ -d "$DATA_DIR" ]; then
   if confirm "Delete the TPM-sealed secret at $DATA_DIR?"; then
     rm -rf "$DATA_DIR"

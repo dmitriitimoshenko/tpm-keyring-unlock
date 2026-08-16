@@ -234,6 +234,12 @@ break it.
 - **Worked, then broke after enabling `pam-auth-update --enable
   fprintd`.** See "Also want fingerprint for sudo" above — re-run
   `install.sh`.
+- **Login pauses for several seconds (fingerprint or password) even though
+  auto-unlock works.** The TPM operation this relies on has a fast path and
+  a slow fallback path; sealed secrets created before that fast path existed
+  use the slow one until re-sealed. Fix: `bin/seal.sh` (choose "Overwrite"
+  when it asks, same password as before). See JOURNAL.md, 2026-08-16, for
+  why this is one-time and safe.
 - **`install.sh` refuses to run, saying it can't determine the Secure Boot
   state.** It checks via `mokutil --sb-state` first, falling back to
   reading the `SecureBoot` EFI variable directly if `mokutil` isn't

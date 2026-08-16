@@ -50,7 +50,14 @@
  * skippable - see JOURNAL.md) + up to 5 retries of the fast policy-session
  * check-and-use step (~0.5s each including backoff). ~20s worst case;
  * 25s leaves headroom instead of the alarm cutting off a retry that would
- * have succeeded. See JOURNAL.md, 2026-08-14. */
+ * have succeeded. See JOURNAL.md, 2026-08-14.
+ *
+ * That ~7s createprimary term is now only paid by sealed data that hasn't
+ * been re-sealed since the persisted-primary optimization (2026-08-16,
+ * JOURNAL.md) - a re-sealed install's real-world time is closer to 1s even
+ * at 5 retries. 25s is kept as-is because this module has no way to know in
+ * advance which path a given login will take, and it's already a safe,
+ * conservative bound for both. */
 #ifndef HELPER_PATH
 #define HELPER_PATH "/usr/local/sbin/tpm-keyring-unseal"
 #endif
