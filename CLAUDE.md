@@ -1,5 +1,20 @@
 # Instructions for Claude working in this repo
 
+## Security of stored data comes first
+
+Above speed, convenience, or minimizing prompts to the user: this repo
+exists to strengthen a machine's security posture (TPM-sealed secrets,
+PCR-bound policies), so a change that quietly weakens it — looser file or
+TPM-object permissions, an unverified trust assumption, reusing state you
+didn't create without checking it's actually yours, a secret transiting
+somewhere it didn't strictly need to, skipping confirmation on something
+hard to reverse — defeats the actual point even if it "works" and even if
+it's faster. When a new situation isn't already covered by a rule below,
+default to whichever option is more careful with data and access, not
+whichever ships sooner. The rules in this file (secret handling, sudo,
+`/etc/pam.d/` edits, commit/push) are concrete instances of this
+principle, not the full list of situations it applies to.
+
 ## Keep JOURNAL.md updated — always
 
 This project has a running journal at `JOURNAL.md`: decisions made, why

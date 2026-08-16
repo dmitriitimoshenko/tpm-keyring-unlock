@@ -108,6 +108,15 @@ log_pcr7() {
   vm_ssh "$port" 'tpm2_pcrread sha256:7' 2>&1 | sed 's/^/  | /'
 }
 
+# Diagnostic only, not an assertion: prints how long a command took, in
+# milliseconds. Added alongside the 2026-08-16 persisted-primary change
+# (JOURNAL.md) so the ~7s -> sub-second speedup is visible directly in this
+# test's own output instead of only trusted from local hand-profiling.
+elapsed_ms() {
+  local start="$1" end="$2"
+  echo $(( (end - start) / 1000000 ))
+}
+
 check() {
   local desc="$1" got="$2" want="$3" errfile="${4:-}"
   if [ "$got" = "$want" ]; then
@@ -394,8 +403,11 @@ if wait_for_ssh "$B1_SSHPORT"; then
   check "seal.sh seals the throwaway secret" "$got" "sealed" "$WORK/seal.err"
   log_pcr7 "$B1_SSHPORT" "boot 1, right after seal"
 
+  UNSEAL1_START=$(date +%s%N)
   GOT_SECRET="$(vm_ssh "$B1_SSHPORT" 'sudo bash ~/tpm-keyring-unlock/pam/tpm-keyring-unseal.sh ubuntu' \
     2>"$WORK/unseal1.err")"
+  UNSEAL1_END=$(date +%s%N)
+  echo "-- tpm-keyring-unseal.sh (same boot) took $(elapsed_ms "$UNSEAL1_START" "$UNSEAL1_END")ms --"
   check "tpm-keyring-unseal.sh returns the sealed secret (same boot)" "$GOT_SECRET" "$SECRET" "$WORK/unseal1.err"
 
   # Two concurrent unseal calls against the same real TPM must both still
@@ -444,8 +456,11 @@ if [ "$B1_OK" -eq 1 ]; then
 
   if wait_for_ssh "$B2_SSHPORT"; then
     log_pcr7 "$B2_SSHPORT" "boot 2, right after SSH up, before unseal"
+    UNSEAL2_START=$(date +%s%N)
     GOT_SECRET2="$(vm_ssh "$B2_SSHPORT" 'sudo bash ~/tpm-keyring-unlock/pam/tpm-keyring-unseal.sh ubuntu' \
       2>"$WORK/unseal2.err")"
+    UNSEAL2_END=$(date +%s%N)
+    echo "-- tpm-keyring-unseal.sh (post-reboot) took $(elapsed_ms "$UNSEAL2_START" "$UNSEAL2_END")ms --"
     # KNOWN_CI_PCR7_DRIFT is set only by .github/workflows/test.yml's `vm`
     # job, never locally - so `make test-vm` still hard-fails on a mismatch
     # here, unchanged. On GitHub-hosted runners specifically, PCR7 has been
