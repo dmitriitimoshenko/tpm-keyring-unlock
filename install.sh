@@ -37,47 +37,36 @@ echo
 }
 require_secure_boot
 
-# --- 1. dependencies ---------------------------------------------------
+# --- 1. plan - figure out everything this run would need to do, without
+# changing anything yet, so we can ask for approval exactly once instead of
+# interrupting partway through with one y/N per step. ---------------------
+
+# 1a. missing packages
 missing=()
 command -v tpm2_createprimary >/dev/null || missing+=(tpm2-tools)
 command -v gcc >/dev/null || missing+=(gcc)
 [ -f /usr/include/security/pam_modules.h ] || missing+=(pam-dev)
 
+PKG_MGR=""
+PKGS=()
 if [ "${#missing[@]}" -gt 0 ]; then
-  echo "Missing: ${missing[*]}"
-
   # Package names differ across distros; pam-dev is a placeholder above,
   # translated per package manager below. gcc's placeholder stays literal
   # everywhere except Arch, where it comes from the base-devel group.
   if command -v apt >/dev/null; then
-    pkgs=(); for m in "${missing[@]}"; do [ "$m" = pam-dev ] && pkgs+=(libpam0g-dev) || pkgs+=("$m"); done
-    if confirm "Install via apt now? (${pkgs[*]})"; then
-      sudo apt update && sudo apt install -y "${pkgs[@]}"
-    else
-      echo "Install them manually and re-run this script." >&2; exit 1
-    fi
+    PKG_MGR=apt
+    for m in "${missing[@]}"; do [ "$m" = pam-dev ] && PKGS+=(libpam0g-dev) || PKGS+=("$m"); done
   elif command -v dnf >/dev/null; then
-    pkgs=(); for m in "${missing[@]}"; do [ "$m" = pam-dev ] && pkgs+=(pam-devel) || pkgs+=("$m"); done
-    if confirm "Install via dnf now? (${pkgs[*]})"; then
-      sudo dnf install -y "${pkgs[@]}"
-    else
-      echo "Install them manually and re-run this script." >&2; exit 1
-    fi
+    PKG_MGR=dnf
+    for m in "${missing[@]}"; do [ "$m" = pam-dev ] && PKGS+=(pam-devel) || PKGS+=("$m"); done
   elif command -v pacman >/dev/null; then
-    pkgs=(); for m in "${missing[@]}"; do case "$m" in gcc) pkgs+=(base-devel);; pam-dev) pkgs+=(pam);; *) pkgs+=("$m");; esac; done
-    if confirm "Install via pacman now? (${pkgs[*]})"; then
-      sudo pacman -Sy --needed "${pkgs[@]}"
-    else
-      echo "Install them manually and re-run this script." >&2; exit 1
-    fi
+    PKG_MGR=pacman
+    for m in "${missing[@]}"; do case "$m" in gcc) PKGS+=(base-devel);; pam-dev) PKGS+=(pam);; *) PKGS+=("$m");; esac; done
   elif command -v zypper >/dev/null; then
-    pkgs=(); for m in "${missing[@]}"; do case "$m" in pam-dev) pkgs+=(pam-devel);; tpm2-tools) pkgs+=(tpm2.0-tools);; *) pkgs+=("$m");; esac; done
-    if confirm "Install via zypper now? (${pkgs[*]})"; then
-      sudo zypper install -y "${pkgs[@]}"
-    else
-      echo "Install them manually and re-run this script." >&2; exit 1
-    fi
+    PKG_MGR=zypper
+    for m in "${missing[@]}"; do case "$m" in pam-dev) PKGS+=(pam-devel);; tpm2-tools) PKGS+=(tpm2.0-tools);; *) PKGS+=("$m");; esac; done
   else
+    echo "Missing: ${missing[*]}"
     echo "No supported package manager found (looked for apt/dnf/pacman/zypper)." >&2
     echo "Install these yourself, then re-run: tpm2-tools, a C compiler (gcc)," >&2
     echo "and PAM development headers (the package providing security/pam_modules.h)." >&2
@@ -85,24 +74,98 @@ if [ "${#missing[@]}" -gt 0 ]; then
   fi
 fi
 
-# --- 2. tss group (passwordless TPM access) -----------------------------
+# 1b. tss group (passwordless TPM access)
 TSS_GROUP_PRESENT=false
+NEED_TSS_ADD=false
 if getent group tss >/dev/null; then
   TSS_GROUP_PRESENT=true
-  if ! groups "$USER" | grep -qw tss; then
-    echo "You're not in the 'tss' group (needed for passwordless TPM access)."
-    if confirm "Add $USER to the tss group now?"; then
-      sudo usermod -aG tss "$USER"
-      echo "Added. You must log out and back in before continuing (group"
-      echo "membership only applies to new sessions). Re-run this script after."
-      exit 0
-    fi
-  fi
+  groups "$USER" | grep -qw tss || NEED_TSS_ADD=true
 else
   echo "No 'tss' group on this system - skipping the group-membership check."
-  echo "TPM access must be granted some other way here; if the next check"
-  echo "fails, that's where to look (your distro's tpm2-tools/tpm2-abrmd"
+  echo "TPM access must be granted some other way here; if the PCR-read check"
+  echo "below fails, that's where to look (your distro's tpm2-tools/tpm2-abrmd"
   echo "packaging docs should say how)."
+  echo
+fi
+
+# 1c. seal vs. re-seal
+RESEAL=false
+[ -f "$DATA_DIR/seal.priv" ] && RESEAL=true
+
+# 1d. login PAM stacks that need the helper wired in
+mapfile -t candidates < <(grep -lE "$PAM_GNOME_KEYRING_AUTH_RE" /etc/pam.d/* 2>/dev/null)
+targets=()
+for c in "${candidates[@]}"; do
+  grep -q pam_tpm_keyring_authtok.so "$c" || targets+=("$c")
+done
+
+# --- 2. print the full plan and ask for approval exactly once ------------
+echo "This installer will make the following changes:"
+echo
+n=1
+if [ "${#PKGS[@]}" -gt 0 ]; then
+  echo "  $n. Install via $PKG_MGR (needs sudo): ${PKGS[*]}"
+  n=$((n + 1))
+fi
+if [ "$NEED_TSS_ADD" = true ]; then
+  echo "  $n. Add $USER to the 'tss' group (needs sudo), for passwordless TPM"
+  echo "     access. This requires logging out and back in before the install"
+  echo "     can continue - you'll need to re-run this script afterward."
+  n=$((n + 1))
+fi
+if [ "$RESEAL" = true ]; then
+  echo "  $n. Re-seal (overwrite) the existing sealed secret at $DATA_DIR."
+else
+  echo "  $n. Seal your keyring password into the TPM."
+fi
+n=$((n + 1))
+echo "  $n. Compile the PAM helper module and install it + its helper script"
+echo "     (needs sudo)."
+n=$((n + 1))
+echo "  $n. Mask systemd's eager gnome-keyring-daemon startup, if present."
+n=$((n + 1))
+if [ "${#targets[@]}" -gt 0 ]; then
+  echo "  $n. Wire the TPM helper into these login PAM stacks (each backed up"
+  echo "     first, as <file>.bak-<timestamp>):"
+  for t in "${targets[@]}"; do
+    echo
+    echo "       $t"
+    echo "         + auth    optional        pam_tpm_keyring_authtok.so   <-- new line"
+    echo "           auth    optional        pam_gnome_keyring.so         <-- existing, unchanged"
+  done
+  echo
+  echo "     This line is 'optional': it can never grant or deny login by"
+  echo "     itself. It only makes the TPM-unsealed password available to the"
+  echo "     pam_gnome_keyring.so line right after it, for whenever that"
+  echo "     service authenticates you via something other than a typed"
+  echo "     password (e.g. fingerprint)."
+fi
+echo
+
+if ! confirm "Proceed with all of the above?"; then
+  echo "Nothing was changed. Re-run when ready."
+  exit 0
+fi
+echo
+
+# --- 3. execute, in order, with no further prompts ------------------------
+
+if [ "${#PKGS[@]}" -gt 0 ]; then
+  echo "-- Installing packages --"
+  case "$PKG_MGR" in
+    apt) sudo apt update && sudo apt install -y "${PKGS[@]}" ;;
+    dnf) sudo dnf install -y "${PKGS[@]}" ;;
+    pacman) sudo pacman -Sy --needed "${PKGS[@]}" ;;
+    zypper) sudo zypper install -y "${PKGS[@]}" ;;
+  esac
+  echo
+fi
+
+if [ "$NEED_TSS_ADD" = true ]; then
+  sudo usermod -aG tss "$USER"
+  echo "Added $USER to the 'tss' group. Log out and back in (group membership"
+  echo "only applies to new sessions), then re-run this script to continue."
+  exit 0
 fi
 
 if ! tpm2_pcrread "$PCR_BANK" >/dev/null 2>&1; then
@@ -117,8 +180,6 @@ if ! tpm2_pcrread "$PCR_BANK" >/dev/null 2>&1; then
   exit 1
 fi
 
-# --- 3. compile + install the PAM module and its helper ----------------
-echo
 echo "-- Building PAM module --"
 gcc -Wall -Wextra -fPIC -shared \
   -o "$REPO_DIR/pam/pam_tpm_keyring_authtok.so" \
@@ -139,7 +200,6 @@ sudo install -o root -g root -m 0644 \
   "$REPO_DIR/pam/pam_tpm_keyring_authtok.so" \
   "$PAM_MODULE_DIR/pam_tpm_keyring_authtok.so"
 
-# --- 4. stop systemd from racing PAM to create the keyring daemon ------
 echo
 echo "-- Masking systemd's eager keyring daemon startup --"
 if systemctl --user list-unit-files 'gnome-keyring-daemon.*' 2>/dev/null | grep -q gnome-keyring-daemon; then
@@ -151,66 +211,31 @@ else
   echo "daemon before login; if yours doesn't, you may not need it at all.)"
 fi
 
-# --- 5. seal the real keyring password ----------------------------------
 echo
-if [ -f "$DATA_DIR/seal.priv" ]; then
-  echo "A sealed secret already exists at $DATA_DIR."
-  confirm "Re-seal (overwrite)?" && "$REPO_DIR/bin/seal.sh"
+if [ "$RESEAL" = true ]; then
+  echo "-- Re-sealing your keyring password into the TPM --"
 else
   echo "-- Sealing your keyring password into the TPM --"
-  "$REPO_DIR/bin/seal.sh"
 fi
+"$REPO_DIR/bin/seal.sh"
 
-# --- 6. wire the PAM module into every login stack that feeds the keyring -
 echo
 echo "-- Login PAM stacks that feed the keyring --"
-echo "Looking for /etc/pam.d/ services with an auth-phase pam_gnome_keyring.so"
-echo "line. Every one of them needs this module, not just a service literally"
-echo "named '*fingerprint*': if you ever enable fingerprint auth system-wide"
-echo "(e.g. 'sudo pam-auth-update --enable fprintd'), services like"
-echo "gdm-password gain the ability to succeed via fingerprint too, which"
-echo "reopens the exact same PAM_AUTHTOK gap on a service that has nothing"
-echo "to do with fingerprints in its name."
-echo
-
-mapfile -t candidates < <(grep -lE "$PAM_GNOME_KEYRING_AUTH_RE" /etc/pam.d/* 2>/dev/null)
-
 if [ "${#candidates[@]}" -eq 0 ]; then
   echo "No /etc/pam.d/ service has an auth-phase pam_gnome_keyring.so line."
-  echo "Password logins are already fixed by the systemd mask above; skipping"
-  echo "this step. Wire it in manually if you find the right file - see"
-  echo "README.md 'How it works'."
-  exit 0
-fi
-
-for TARGET in "${candidates[@]}"; do
-  if grep -q pam_tpm_keyring_authtok.so "$TARGET"; then
-    echo "$TARGET already has the module wired in - skipping."
-    continue
-  fi
-
-  echo
-  echo "About to make this change to $TARGET:"
-  echo
-  echo "+ auth optional   pam_tpm_keyring_authtok.so   <-- new line"
-  echo "  auth optional   pam_gnome_keyring.so         <-- existing line, unchanged"
-  echo
-  echo "This line is 'optional': it can never grant or deny login by itself."
-  echo "It only makes the TPM-unsealed password available to the"
-  echo "pam_gnome_keyring.so line right after it, for whenever this service"
-  echo "authenticates you via something other than a typed password (e.g."
-  echo "fingerprint). A backup of the original file is kept alongside it."
-  echo
-  if confirm "Apply this change to $TARGET?"; then
+  echo "Password logins are already fixed by the systemd mask above. Wire it"
+  echo "in manually if you find the right file - see README.md 'How it works'."
+else
+  for TARGET in "${candidates[@]}"; do
+    if grep -q pam_tpm_keyring_authtok.so "$TARGET"; then
+      echo "$TARGET already had the module wired in - left unchanged."
+      continue
+    fi
     sudo cp "$TARGET" "$TARGET.bak-$(date +%Y%m%d%H%M%S)"
     sudo sed -E -i "/${PAM_GNOME_KEYRING_AUTH_RE}/i auth    optional        pam_tpm_keyring_authtok.so" "$TARGET"
-    echo "Done."
-  else
-    echo "Skipped $TARGET. It will keep showing the manual unlock prompt"
-    echo "whenever it authenticates you via something other than a typed"
-    echo "password, until you add that line yourself."
-  fi
-done
+    echo "Wired: $TARGET"
+  done
+fi
 
 echo
 echo "Log out and back in (however you normally authenticate) to test."
