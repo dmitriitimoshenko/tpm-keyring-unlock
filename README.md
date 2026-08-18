@@ -14,14 +14,15 @@ cd tpm-keyring-unlock
 ./install.sh
 ```
 
-Walks through, with a confirmation before the one step that touches a
-login-critical file: installing dependencies, adding you to the `tss` group
-(needed for passwordless TPM access — requires a relogin partway through),
-masking the systemd race, compiling and installing the PAM module, sealing
-your password (typed interactively, never touches disk unencrypted, never
-passed as a command-line argument), and finally — with an explicit
-confirmation and an automatic backup of the file it touches — inserting the
-one PAM line. See Requirements below before running it.
+Prints the full plan up front — every package to install, the `tss` group
+change, the exact PAM-file diff(s) it would apply (each backed up
+automatically) — and asks for approval exactly once before doing any of it.
+The one exception: if you need adding to the `tss` group (for passwordless
+TPM access), that step alone requires a relogin partway through, so the
+script stops there and asks you to re-run it once you're back. Your keyring
+password itself is typed interactively during sealing — never touches disk
+unencrypted, never passed as a command-line argument. See Requirements below
+before running it.
 
 ## The problem
 

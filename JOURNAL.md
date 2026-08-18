@@ -1493,3 +1493,76 @@ Re-running `bin/seal.sh` (same password as before, choosing "Overwrite"
 when it asks) is what actually adopts the fast path here - can't be done
 through a tool call, same as every other real-secret step in this
 project.
+
+## Installer: collapsed per-step y/N prompts into one upfront confirmation (2026-08-18)
+
+**Problem:** `install.sh` could ask up to ~4 separate `[y/N]` questions in
+one run — install missing packages, add to the `tss` group, re-seal
+(if a secret already existed), and one more *per* `/etc/pam.d/*` file
+that needed the helper line (can be more than one service on a system with
+both `gdm-password` and a fingerprint-capable stack). User asked for this
+collapsed to a single confirmation.
+
+**Why not just drop the confirmations to make it quieter:** `CLAUDE.md`'s
+"security of stored data comes first" rule explicitly calls out
+`/etc/pam.d/*` edits as needing backup + explicit confirmation "even when
+the change is well-understood" — removing that gate entirely to reduce
+prompt count would be exactly the kind of quiet security regression the
+rule exists to prevent. Silently editing PAM stacks (login-critical files)
+without the user ever seeing which files or what diff was also rejected
+for the same reason.
+
+**What was done instead:** restructured `install.sh` into two phases —
+1. **Plan** (read-only; no packages installed, no files touched, no sudo
+   run): detect missing deps + the exact package list per package manager,
+   whether the `tss` group needs joining, whether this is a fresh seal or
+   a re-seal, and which `/etc/pam.d/*` files actually need the helper line
+   (already-wired ones are excluded from the plan display, same
+   idempotency check as before).
+2. **One `confirm()` call** that prints the entire plan first — every
+   package, the group change, seal vs. re-seal, and for *every* PAM file
+   that will change, its literal path and the exact diff (the same
+   before/after block the old per-file prompt showed) — then asks
+   "Proceed with all of the above?" exactly once. A "no" changes nothing
+   and exits 0.
+3. **Execute**, only after a "yes", straight through with no further
+   prompts.
+
+This keeps the substance of the `/etc/pam.d/` rule (explicit, informed
+confirmation before any login-critical file is touched, backup still taken
+via `$TARGET.bak-<timestamp>` right before each edit) while satisfying the
+actual complaint, which was about *prompt count*, not about *informedness*.
+
+**One prompt that could NOT be collapsed away, and why:** if the user
+needs adding to the `tss` group, `usermod -aG tss` doesn't take effect in
+the current shell/session — the script must still stop and ask them to
+log out, back in, and re-run. This isn't a confirmation being reinstated;
+it's the same Linux group-membership constraint the original script also
+hit (it already `exit 0`'d there). A second run of the installer after
+relogin will again show one consolidated plan + one confirmation, not a
+new pile of prompts.
+
+**Incidental fix while restructuring:** the original script had a path
+where, if zero `/etc/pam.d/*` services had a `pam_gnome_keyring.so` auth
+line at all, it printed a message and `exit 0`'d immediately — skipping
+the final "Log out and back in to test" line at the very end of the
+script, even though the systemd-mask + seal steps earlier in that same run
+still made a real change worth testing. Restructured version falls
+through to that final message in all cases. Not part of the ask, but
+clearly a bug in the original control flow (early-exit forgot the
+otherwise-unconditional trailer), so fixed it alongside since the whole
+"wire PAM stacks" block was being rewritten anyway.
+
+**Verified:** `bash -n install.sh` clean; manually traced the control flow
+against the original step-by-step (dependency detection → package-name
+translation per distro → tss group → re-seal detection → PAM candidate
+detection minus already-wired ones) to confirm the plan-phase and
+execute-phase logic each still match what the original per-step code did,
+just reordered around a single confirmation gate. Did not run the
+installer end-to-end against this machine's real TPM/PAM stack — that
+would require sudo and touch login-critical files, which per `CLAUDE.md`
+needs to be run by the user themselves, not through a tool call. The VM
+test suite (`test/vm/run-vm-test.sh`) and Docker packaging tests
+(`test/distro/*`) don't invoke `install.sh` at all (they call
+`bin/seal.sh` / the PAM-dir-detection logic in `bin/lib.sh` directly), so
+they were unaffected by this change and required no update.
