@@ -79,6 +79,9 @@ script). Two scenarios:
   `tpm-keyring-unseal.sh` still unseals correctly. That's exactly the "integrity
   check failed" / "PCR have changed since checked" failure class documented
   in `JOURNAL.md`'s reboot-survival bugs, which no container can reproduce.
+  Before that reboot it also injects a deterministic `tpm2_create` failure
+  during re-sealing and proves that the previously working enrollment still
+  unseals, covering the transactional staging path in `bin/seal.sh`.
   It also fires two concurrent unseal calls at the real TPM to check the
   `flock` serialization fix for the second reboot regression in the journal.
 

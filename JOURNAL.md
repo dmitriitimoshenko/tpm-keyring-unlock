@@ -1566,3 +1566,36 @@ test suite (`test/vm/run-vm-test.sh`) and Docker packaging tests
 (`test/distro/*`) don't invoke `install.sh` at all (they call
 `bin/seal.sh` / the PAM-dir-detection logic in `bin/lib.sh` directly), so
 they were unaffected by this change and required no update.
+
+## Failed re-seal now preserves the previous enrollment (2026-08-22)
+
+**Problem:** `bin/seal.sh` deleted `pcr.policy`, `seal.pub`, and
+`seal.priv` immediately after the user accepted the overwrite prompt. Every
+fallible operation needed to build the replacement happened afterward. A TPM
+error, interruption, or full filesystem during `tpm2_create` therefore turned
+a working enrollment into no enrollment at all. The two-entry password prompt
+only detects entries that differ from each other; it does not prove the
+resulting TPM object is loadable and unseals to the supplied bytes.
+
+**Fix:** build the PCR policy, public/private blobs, and handle metadata in a
+mode-0700 staging directory under `DATA_DIR`, leaving the installed files
+untouched. Load the staged object, open a fresh PCR policy session, unseal it,
+and compare the exact result to the supplied password. Only after that complete
+round trip succeeds are the staged files mode-normalized to 0600 and moved into
+place. Cleanup also flushes any TPM sessions/objects left live by a failed
+command before deleting the staging and context directories.
+
+Keeping staging below `DATA_DIR` is deliberate: it keeps staged files on the
+destination filesystem and avoids a cross-filesystem `mv` silently becoming a
+copy. This is failure-transactional for every checked command path; the four
+separate destination names are still not a single power-loss-atomic filesystem
+transaction, which would require a versioned state-directory format and an
+atomic pointer swap. That larger format migration was not necessary to fix the
+actual early-deletion bug and was deliberately kept out of this focused change.
+
+**Regression coverage:** the real-TPM VM test now shadows only `tpm2_create`
+with a helper that exits 42 during an accepted re-seal. It asserts that the
+re-seal fails and then invokes the real root helper against swtpm to prove the
+original secret still unseals. This would fail against the previous code
+because its early `rm -f` removed the old blobs before reaching the injected
+failure.
