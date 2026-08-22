@@ -410,6 +410,26 @@ if wait_for_ssh "$B1_SSHPORT"; then
   echo "-- tpm-keyring-unseal.sh (same boot) took $(elapsed_ms "$UNSEAL1_START" "$UNSEAL1_END")ms --"
   check "tpm-keyring-unseal.sh returns the sealed secret (same boot)" "$GOT_SECRET" "$SECRET" "$WORK/unseal1.err"
 
+  # A failed re-seal must not destroy the enrollment that already proved it
+  # can unlock. Shadow only tpm2_create with a deterministic failure, accept
+  # the overwrite prompt, and confirm the original secret still unseals.
+  vm_ssh "$B1_SSHPORT" \
+    'mkdir -p ~/fail-bin && printf "#!/bin/sh\nexit 42\n" >~/fail-bin/tpm2_create && chmod 700 ~/fail-bin/tpm2_create'
+  if printf '%s\n%s\n%s\n' y replacement-secret replacement-secret | vm_ssh "$B1_SSHPORT" \
+       'PATH="$HOME/fail-bin:$PATH" bash ~/tpm-keyring-unlock/bin/seal.sh' \
+       >"$WORK/reseal-failure.out" 2>"$WORK/reseal-failure.err"; then
+    got=unexpected-success
+  else
+    got=failed-as-injected
+  fi
+  check "injected tpm2_create failure makes re-seal fail" "$got" "failed-as-injected" "$WORK/reseal-failure.err"
+
+  GOT_AFTER_FAILED_RESEAL="$(vm_ssh "$B1_SSHPORT" \
+    'sudo bash ~/tpm-keyring-unlock/pam/tpm-keyring-unseal.sh ubuntu' \
+    2>"$WORK/unseal-after-failed-reseal.err")"
+  check "failed re-seal preserves the previous working secret" \
+    "$GOT_AFTER_FAILED_RESEAL" "$SECRET" "$WORK/unseal-after-failed-reseal.err"
+
   # Two concurrent unseal calls against the same real TPM must both still
   # succeed - validates the flock serialization fix for the "PCR have
   # changed since checked" race (JOURNAL.md, second regression). Docker

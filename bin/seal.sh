@@ -31,7 +31,6 @@ chmod 700 "$DATA_DIR"
 if [ -f "$DATA_DIR/seal.priv" ]; then
   read -rp "A sealed secret already exists at $DATA_DIR. Overwrite? [y/N] " ans
   [[ "$ans" =~ ^[Yy]$ ]] || exit 0
-  rm -f "$DATA_DIR/pcr.policy" "$DATA_DIR/seal.pub" "$DATA_DIR/seal.priv"
 fi
 
 read -rsp "Password to seal (should match your GNOME login keyring password): " PASSWORD
@@ -46,7 +45,22 @@ if [ "$PASSWORD" != "$PASSWORD2" ]; then
 fi
 
 WORKDIR=$(mktemp -d)
-trap 'rm -rf "$WORKDIR"' EXIT
+# Keep the candidate enrollment on the same filesystem as DATA_DIR. The old
+# working files remain untouched until the new object has survived a complete
+# seal/load/unseal round trip.
+STAGE_DIR=$(mktemp -d "$DATA_DIR/.seal-stage.XXXXXX")
+chmod 700 "$STAGE_DIR"
+
+SESSION=""
+TEST_SESSION=""
+TEST_OBJECT=""
+cleanup() {
+  [ -z "$SESSION" ] || tpm2_flushcontext "$SESSION" >/dev/null 2>&1 || true
+  [ -z "$TEST_SESSION" ] || tpm2_flushcontext "$TEST_SESSION" >/dev/null 2>&1 || true
+  [ -z "$TEST_OBJECT" ] || tpm2_flushcontext "$TEST_OBJECT" >/dev/null 2>&1 || true
+  rm -rf -- "$WORKDIR" "$STAGE_DIR"
+}
+trap cleanup EXIT
 
 # The primary is persisted into the TPM's own NV storage at a fixed handle
 # instead of being recreated on every login. NOT the same thing as the
@@ -89,20 +103,53 @@ else
   echo "avoids recomputing it on every future login - see JOURNAL.md)."
   tpm2_evictcontrol -C o -c "$WORKDIR/primary.ctx" "$PRIMARY_HANDLE" >/dev/null
 fi
-echo "$PRIMARY_HANDLE" >"$DATA_DIR/primary.handle"
+printf '%s\n' "$PRIMARY_HANDLE" >"$STAGE_DIR/primary.handle"
 
 SESSION="$WORKDIR/session"
 tpm2_startauthsession -S "$SESSION" --policy-session >/dev/null
-tpm2_policypcr -S "$SESSION" -l "$PCR_BANK" -L "$DATA_DIR/pcr.policy" >/dev/null
+tpm2_policypcr -S "$SESSION" -l "$PCR_BANK" -L "$STAGE_DIR/pcr.policy" >/dev/null
 tpm2_flushcontext "$SESSION" >/dev/null
+SESSION=""
 
 printf '%s' "$PASSWORD" | tpm2_create -C "$PRIMARY_HANDLE" \
-  -u "$DATA_DIR/seal.pub" -r "$DATA_DIR/seal.priv" \
-  -L "$DATA_DIR/pcr.policy" -i- >/dev/null
+  -u "$STAGE_DIR/seal.pub" -r "$STAGE_DIR/seal.priv" \
+  -L "$STAGE_DIR/pcr.policy" -i- >/dev/null
+
+# Prove the complete candidate is usable before replacing a known-good
+# enrollment. This catches partial/corrupt tpm2_create output and policy or
+# TPM failures while rollback is still just deleting STAGE_DIR.
+TEST_OBJECT="$WORKDIR/test-seal.ctx"
+tpm2_load -C "$PRIMARY_HANDLE" \
+  -u "$STAGE_DIR/seal.pub" -r "$STAGE_DIR/seal.priv" \
+  -c "$TEST_OBJECT" >/dev/null
+
+TEST_SESSION="$WORKDIR/test-session"
+tpm2_startauthsession -S "$TEST_SESSION" --policy-session >/dev/null
+tpm2_policypcr -S "$TEST_SESSION" -l "$PCR_BANK" >/dev/null
+tpm2_unseal -c "$TEST_OBJECT" -p "session:$TEST_SESSION" \
+  >"$WORKDIR/unsealed"
+tpm2_flushcontext "$TEST_SESSION" >/dev/null
+TEST_SESSION=""
+tpm2_flushcontext "$TEST_OBJECT" >/dev/null
+TEST_OBJECT=""
+
+if ! printf '%s' "$PASSWORD" | cmp -s - "$WORKDIR/unsealed"; then
+  echo "TPM self-test returned a different secret; keeping the previous enrollment." >&2
+  exit 1
+fi
+
+chmod 600 "$STAGE_DIR/pcr.policy" "$STAGE_DIR/seal.pub" \
+  "$STAGE_DIR/seal.priv" "$STAGE_DIR/primary.handle"
 
 unset PASSWORD PASSWORD2
 
-echo "Sealed. Bound to this TPM and the current PCR7 (Secure Boot) state."
+# Each file is now complete, verified, and on the destination filesystem.
+# No earlier failure path modifies the previous enrollment.
+for name in pcr.policy seal.pub seal.priv primary.handle; do
+  mv -f "$STAGE_DIR/$name" "$DATA_DIR/$name"
+done
+
+echo "Sealed and self-tested. Bound to this TPM and the current PCR7 (Secure Boot) state."
 echo "Log out and back in to test the actual auto-unlock (via install.sh's"
 echo "PAM wiring), or check it directly with:"
 echo "  sudo /usr/local/sbin/tpm-keyring-unseal \$USER >/dev/null; echo \$?"
