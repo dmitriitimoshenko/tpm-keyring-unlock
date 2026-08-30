@@ -35,7 +35,17 @@ find_pam_module_dir() {
 # plain single-token control field (optional, required, ...) or a bracketed
 # control expression ([success=ok default=ignore]) - the latter contains
 # spaces, which a plain \S+ stops at and fails to match.
-PAM_GNOME_KEYRING_AUTH_RE='^\s*auth\s+(\S+|\[[^]]*\])\s+pam_gnome_keyring\.so'
+#
+# The leading '-' is the pam.conf(5) "don't log if this module is missing"
+# prefix, written as part of the type field: '-auth optional
+# pam_gnome_keyring.so'. Debian-family display-manager stacks use it
+# routinely (Ubuntu/Mint ship it in /etc/pam.d/lightdm and lightdm-greeter),
+# and without allowing it here those files silently fail detection - the
+# installer then patches whatever *other* service happens to match (e.g.
+# cinnamon-screensaver) and reports success while the actual login stack
+# stays unwired. It stays optional in the pattern, not mandatory, because
+# GDM-based stacks write the same line without it.
+PAM_GNOME_KEYRING_AUTH_RE='^\s*-?auth\s+(\S+|\[[^]]*\])\s+pam_gnome_keyring\.so'
 
 # Exits with an explanatory message unless Secure Boot is verifiably on.
 # This tool's entire security model rests on PCR7 (the Secure Boot state) -

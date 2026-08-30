@@ -24,7 +24,7 @@ check() {
 }
 
 # --- detection: which fixtures does the regex match? ----------------------
-for f in simple-control bracketed-control already-patched; do
+for f in simple-control bracketed-control already-patched dash-prefixed; do
   if grep -qE "$PAM_GNOME_KEYRING_AUTH_RE" "$FIXTURES/$f"; then got=match; else got=no-match; fi
   check "detects auth-phase pam_gnome_keyring.so in $f" "$got" "match"
 done
@@ -32,13 +32,25 @@ done
 if grep -qE "$PAM_GNOME_KEYRING_AUTH_RE" "$FIXTURES/no-match"; then got=match; else got=no-match; fi
 check "correctly ignores no-match (no pam_gnome_keyring.so at all)" "$got" "no-match"
 
+# Every fixture above has exactly one auth-phase pam_gnome_keyring.so line
+# plus a *session*-phase one. The count guards the half of the pattern the
+# grep -q checks can't see: that allowing the optional pam.conf(5) '-'
+# prefix (for '-auth', as Debian-family lightdm stacks write it) didn't
+# also start matching '-session optional pam_gnome_keyring.so auto_start'.
+# Patching a session line would insert our auth module into the session
+# phase, where it does nothing at best.
+for f in simple-control bracketed-control already-patched dash-prefixed; do
+  got=$(grep -cE "$PAM_GNOME_KEYRING_AUTH_RE" "$FIXTURES/$f")
+  check "matches the auth line only, not the session line, in $f" "$got" "1"
+done
+
 # --- install.sh's actual "needs patching" logic: matches regex AND doesn't
 # already have our module wired in --------------------------------------
 needs_patch() {
   grep -qE "$PAM_GNOME_KEYRING_AUTH_RE" "$1" && ! grep -q pam_tpm_keyring_authtok.so "$1"
 }
 
-for f in simple-control bracketed-control; do
+for f in simple-control bracketed-control dash-prefixed; do
   if needs_patch "$FIXTURES/$f"; then got=yes; else got=no; fi
   check "$f needs patching" "$got" "yes"
 done
@@ -47,11 +59,11 @@ if needs_patch "$FIXTURES/already-patched"; then got=yes; else got=no; fi
 check "already-patched is correctly skipped" "$got" "no"
 
 # --- insertion: sed actually inserts our line right before the matched
-# line, for both control-syntax styles -----------------------------------
+# line, for every control-syntax style -----------------------------------
 WORKDIR=$(mktemp -d)
 trap 'rm -rf "$WORKDIR"' EXIT
 
-for f in simple-control bracketed-control; do
+for f in simple-control bracketed-control dash-prefixed; do
   cp "$FIXTURES/$f" "$WORKDIR/$f"
   sed -E -i "/${PAM_GNOME_KEYRING_AUTH_RE}/i auth    optional        pam_tpm_keyring_authtok.so" "$WORKDIR/$f"
   if grep -q pam_tpm_keyring_authtok.so "$WORKDIR/$f"; then got=inserted; else got=missing; fi

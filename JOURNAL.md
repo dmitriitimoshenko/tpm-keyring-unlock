@@ -1566,3 +1566,86 @@ test suite (`test/vm/run-vm-test.sh`) and Docker packaging tests
 (`test/distro/*`) don't invoke `install.sh` at all (they call
 `bin/seal.sh` / the PAM-dir-detection logic in `bin/lib.sh` directly), so
 they were unaffected by this change and required no update.
+
+## Detection missed `-auth` lines, so Debian-family LightDM stacks went unpatched (2026-08-30)
+
+Reported from a Linux Mint 22.3 (Cinnamon, LightDM, Ubuntu 24.04 base)
+install, on a machine that otherwise meets every requirement: TPM 2.0 via
+`/dev/tpmrm0`, Secure Boot on, `gnome-keyring`, fingerprint login already
+working through `pam_fprintd`.
+
+`install.sh` ran to completion and reported success, but the login keyring
+still didn't unlock. Cause: `PAM_GNOME_KEYRING_AUTH_RE` in `bin/lib.sh`
+anchored on `^\s*auth`, and Debian-family display-manager stacks write the
+line with the `pam.conf(5)` "don't log if the module is missing" prefix:
+
+```
+/etc/pam.d/lightdm:5:-auth    optional        pam_gnome_keyring.so
+/etc/pam.d/lightdm-greeter:3:-auth    optional        pam_gnome_keyring.so
+/etc/pam.d/cinnamon-screensaver:2:auth optional pam_gnome_keyring.so
+```
+
+The leading `-` makes the first token `-auth`, which the pattern doesn't
+match. Running the installer's own detection command on that machine:
+
+```
+$ grep -lE "$PAM_GNOME_KEYRING_AUTH_RE" /etc/pam.d/*
+/etc/pam.d/cinnamon-screensaver
+```
+
+Only the screensaver matched. The installer patched that one file, printed
+"Wired: ...", and left the actual login stack untouched — the exact
+symptom in the README's "Still prompted after install" troubleshooting
+entry, except nothing in the run hinted at it. GDM-based distros were
+unaffected, which is why this hadn't shown up before: they write the same
+line without the dash.
+
+**Fix:** make the prefix optional in the pattern
+(`^\s*-?auth\s+...`). Optional rather than required, because both
+spellings have to keep matching. `install.sh` picks this up automatically
+— it uses the same variable for its `grep -l` detection and for the `sed`
+insertion address — and `uninstall.sh` is unaffected, since it greps for
+`pam_tpm_keyring_authtok.so` by name rather than by control field.
+
+**Test:** `test/fixtures/pam.d/dash-prefixed` is modelled on a real
+Ubuntu/Mint `/etc/pam.d/lightdm` (`@include common-auth`, then `-auth
+optional pam_gnome_keyring.so`, then the kwallet lines, then a `-session`
+gnome-keyring line) and runs through all three existing checks in
+`test/unit-regex-test.sh`: detection, "needs patching", and sed insertion
+with the adjacency assertion.
+
+Added alongside it: a match-*count* assertion on every matching fixture.
+All the pre-existing checks are `grep -q`, so none of them could catch the
+obvious way to get this change wrong — loosening the pattern until
+`-session optional pam_gnome_keyring.so auto_start` matches too, which
+would insert an auth module into the session phase. The count pins each
+fixture at exactly one matched line.
+
+**Verified** on the reporting machine: `./test/unit-regex-test.sh` passes
+19/19, and re-running the installer's detection against the real
+`/etc/pam.d/` now returns `cinnamon-screensaver`, `lightdm-greeter` and
+`lightdm`. The `sed` insertion was applied to *copies* of those three real
+files and diffed: in each one the new line lands immediately above the
+`pam_gnome_keyring.so` line and nothing else changes.
+
+Checked both newly-detected files for the ordering hazard that matters
+here — whether the injected `PAM_AUTHTOK` can reach a module that would
+*authenticate* on it:
+
+- `lightdm`: `@include common-auth` comes first, so `pam_unix.so ...
+  try_first_pass` has already run before our line. Only
+  `pam_gnome_keyring.so` and the `pam_kwallet*.so` lines follow. Safe.
+- `lightdm-greeter`: its entire auth phase is `auth required
+  pam_permit.so` — the greeter authenticates nobody, it runs as the
+  display manager's own user. The module calls the helper with that
+  username, finds no sealed secret, and returns `PAM_IGNORE`. Harmless,
+  but pointless: worth considering a later refinement that skips auth
+  stacks containing no real authenticating module, so this file isn't
+  patched at all.
+
+Docker- and VM-based test layers weren't run for this change (neither
+Docker nor swtpm/KVM was available on the reporting machine). They're
+unaffected in any case: the distro tests cover dependency install and
+PAM-directory detection, the VM layer calls `bin/seal.sh` and the unseal
+helper directly, and none of them exercise the auth-line regex — which is
+exactly what `test/unit-regex-test.sh` covers, with no container needed.
