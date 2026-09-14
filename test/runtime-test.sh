@@ -111,6 +111,79 @@ if [ "$elapsed" -le 5 ]; then got_timing=bounded; else got_timing=unbounded; fi
 check "timeout actually interrupted the hang (took ${elapsed}s, helper sleeps 10s)" "$got_timing" "bounded"
 
 echo
+echo
+echo "-- control flow of the fingerprint attempt stack (bin/lib.sh's"
+echo "   pam_fprintd_harden) --"
+# There is no fingerprint reader in a container, so pam_flow_stub.so stands in
+# for pam_fprintd.so and returns the three outcomes the real module produces.
+# What's actually under test is libpam's handling of the bracketed control
+# field: whether a success jump records a positive result for the stack (if it
+# doesn't, a matched finger would fail the login), whether
+# authinfo_unavail=ignore really falls through to the next attempt, and
+# whether default=die stops on a mismatch.
+FLOW_LOG=/tmp/pam-flow.log
+
+gcc -Wall -Wextra -fPIC -shared \
+  -o /tmp/pam_flow_stub.so \
+  "$REPO_DIR/test/fixtures/pam_flow_stub.c" -lpam
+install -o root -g root -m 0644 /tmp/pam_flow_stub.so \
+  "$PAM_MODULE_DIR/pam_flow_stub.so"
+
+# The service is built from what pam_fprintd_harden() actually generates, so
+# this tests the shipped transformation rather than a hand-copied lookalike.
+flow_service() {
+  printf 'auth\trequired\tpam_fprintd.so\n' \
+    | pam_fprintd_harden \
+    | awk -v r1="$1" -v r2="$2" -v r3="$3" '
+        {
+          n++
+          r = (n == 1 ? r1 : (n == 2 ? r2 : r3))
+          sub(/pam_fprintd\.so.*/, sprintf("pam_flow_stub.so mark=fp%d ret=%s", n, r))
+          print
+        }' >/etc/pam.d/flowtest
+  # the keyring lines the real gdm-fingerprint stack carries below fprintd
+  cat >>/etc/pam.d/flowtest <<'INNER'
+auth	optional	pam_flow_stub.so mark=tpm ret=success
+auth	optional	pam_flow_stub.so mark=keyring ret=success
+INNER
+}
+
+flow_case() {
+  flow_service "$1" "$2" "$3"
+  rm -f "$FLOW_LOG"
+  local r
+  if pamtester flowtest testsuccess authenticate >/dev/null 2>&1; then r=success; else r=failure; fi
+  printf '%s %s' "$r" "$(tr '\n' ',' <"$FLOW_LOG" 2>/dev/null || true)"
+}
+
+check "match on the 1st attempt: succeeds and still reaches the keyring lines" \
+  "$(flow_case success success success)" "success fp1,tpm,keyring,"
+check "bad scan then match: 2nd attempt runs, stack still succeeds" \
+  "$(flow_case authinfo_unavail success success)" "success fp1,fp2,tpm,keyring,"
+check "two bad scans then match: 3rd attempt runs, stack still succeeds" \
+  "$(flow_case authinfo_unavail authinfo_unavail success)" "success fp1,fp2,fp3,tpm,keyring,"
+check "three bad scans: stack fails (no unauthenticated success)" \
+  "$(flow_case authinfo_unavail authinfo_unavail authinfo_unavail)" \
+  "failure fp1,fp2,fp3,tpm,keyring,"
+
+# A mismatch has to cost exactly one attempt, same as a bad scan - that is the
+# whole point of max-tries=1 plus auth_err/maxtries=ignore. With max-tries=1 a
+# single no-match comes back as PAM_MAXTRIES, an unrecognised verify result as
+# PAM_AUTH_ERR, so both have to fall through.
+check "mismatch (PAM_MAXTRIES) then match: 2nd attempt runs, stack succeeds" \
+  "$(flow_case maxtries success success)" "success fp1,fp2,tpm,keyring,"
+check "unrecognised result (PAM_AUTH_ERR) then match: 2nd attempt runs" \
+  "$(flow_case auth_err success success)" "success fp1,fp2,tpm,keyring,"
+check "mixed failures still cost one attempt each, and the 3rd can match" \
+  "$(flow_case maxtries authinfo_unavail success)" "success fp1,fp2,fp3,tpm,keyring,"
+check "three mismatches: all three attempts run, then the stack fails" \
+  "$(flow_case maxtries maxtries maxtries)" "failure fp1,fp2,fp3,tpm,keyring,"
+
+# default=die: anything genuinely broken must stop at once rather than be
+# retried three times over.
+check "aborted conversation: dies on the spot, no further attempts" \
+  "$(flow_case abort success success)" "failure fp1,"
+
 if [ "$fail" -eq 0 ]; then
   echo "All runtime tests passed."
 else

@@ -12,6 +12,7 @@ WORKDIR /src
 COPY bin/lib.sh bin/lib.sh
 COPY pam/pam_tpm_keyring_authtok.c pam/pam_tpm_keyring_authtok.c
 COPY test/fixtures/pam_spy_authtok.c test/fixtures/pam_spy_authtok.c
+COPY test/fixtures/pam_flow_stub.c test/fixtures/pam_flow_stub.c
 COPY test/runtime-test.sh test/runtime-test.sh
 
 CMD ["bash", "test/runtime-test.sh"]

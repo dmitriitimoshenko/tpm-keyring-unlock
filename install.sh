@@ -3,10 +3,13 @@
 # keyring, working for both password and fingerprint logins, without
 # blanking the keyring password. See README.md for how/why this works.
 #
-# Safe by design at every step except one: the single line added to the
-# fingerprint PAM stack is "optional" and cannot itself grant or block
-# login - see README.md "How it works" before running this if you want to
-# understand exactly what it touches.
+# Safe by design at every step except the /etc/pam.d/ edits, of which there
+# are two, both backed up first: the line it adds to the fingerprint PAM
+# stack is "optional" and cannot itself grant or block login, and the one it
+# can optionally make to pam_fprintd.so (timeout=-1, only ever on a
+# fingerprint-only stack) changes how long the sensor is willing to wait,
+# never who gets in. See README.md "How it works" before running this if you
+# want to understand exactly what it touches.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,9 +23,32 @@ source "$REPO_DIR/bin/lib.sh"
 confirm() {
   local prompt="$1"
   local ans
-  read -rp "$prompt [y/N] " ans
-  [[ "$ans" =~ ^[Yy]$ ]]
+  # Defaults to yes: an empty answer accepts. A failed read (EOF, i.e. no
+  # terminal) is a "no", so nothing here can be auto-approved by a pipe.
+  read -rp "$prompt [Y/n] " ans || return 1
+  [[ ! "$ans" =~ ^[Nn][Oo]?$ ]]
 }
+
+# One timestamp for the whole run, so a file touched by two different steps
+# below gets exactly one backup, holding its pristine pre-run content -
+# rather than a second backup of the already-half-edited file.
+RUN_TS="$(date +%Y%m%d%H%M%S)"
+
+# Backs a PAM file up before its first modification in this run.
+backup_pam_file() {
+  local f="$1" bak="$1.bak-$RUN_TS"
+  [ -e "$bak" ] || sudo cp "$f" "$bak"
+}
+
+# Every prompt below defaults to yes, so a run with no terminal must not be
+# allowed to answer them by hitting EOF. read() failing counts as "no" in
+# confirm() for that reason, but bail out up front anyway rather than
+# half-running and then dying on "sudo: a terminal is required to
+# authenticate" partway through.
+if [ ! -t 0 ]; then
+  echo "This script is interactive - run it directly from a terminal." >&2
+  exit 1
+fi
 
 echo "== tpm-keyring-unlock installer =="
 echo
@@ -93,11 +119,64 @@ RESEAL=false
 [ -f "$DATA_DIR/seal.priv" ] && RESEAL=true
 
 # 1d. login PAM stacks that need the helper wired in
-mapfile -t candidates < <(grep -lE "$PAM_GNOME_KEYRING_AUTH_RE" /etc/pam.d/* 2>/dev/null)
+mapfile -t candidates < <(grep -lE "$PAM_GNOME_KEYRING_AUTH_RE" /etc/pam.d/* 2>/dev/null \
+  | grep -vE "$PAM_BACKUP_RE")
 targets=()
 for c in "${candidates[@]}"; do
   grep -q pam_tpm_keyring_authtok.so "$c" || targets+=("$c")
 done
+
+# 1e. fingerprint stacks that drop the reader after one unlucky scan or one
+# idle timeout. Both cases make pam_fprintd return PAM_AUTHINFO_UNAVAIL -
+# "there is no such auth method here" rather than "that did not match" - and
+# gnome-shell treats that as permanent: fingerprint is gone for the rest of
+# the unlock prompt and only the password is left, with the sensor sitting
+# right there working. pam_fprintd_harden() gives the stack extra attempts and
+# no idle deadline. Full chain, traced through gnome-shell's gdm/util.js and
+# pam_fprintd's disassembly, in JOURNAL.md (2026-09-14).
+UNLIMIT_FPRINTD=false
+fprintd_targets=()
+if pam_fprintd_supports_timeout_option; then
+  for f in /etc/pam.d/*; do
+    [ -f "$f" ] || continue
+    if [[ "$f" =~ $PAM_BACKUP_RE ]]; then continue; fi
+    if ! grep -qE "$PAM_FPRINTD_AUTH_RE" "$f"; then continue; fi
+    # already in the target state - hardening it again would change nothing
+    if pam_fprintd_harden <"$f" | cmp -s - "$f"; then continue; fi
+    if ! pam_fprintd_has_single_auth_line "$f"; then continue; fi
+    if ! pam_auth_is_fingerprint_only "$f"; then continue; fi
+    fprintd_targets+=("$f")
+  done
+fi
+
+if [ "${#fprintd_targets[@]}" -gt 0 ]; then
+  echo "Optional extra, independent of the TPM part of this tool:"
+  echo
+  echo "Your fingerprint PAM stack gives up for the rest of the lock screen -"
+  echo "password only, until you dismiss the prompt and bring it back - after"
+  echo "either a 30s idle timeout or a single badly angled scan. Both make the"
+  echo "module report the reader as *unavailable* rather than as a failed"
+  echo "attempt, and GNOME stops offering fingerprint for good. max-tries="
+  echo "does not cover the bad-scan case; only a mismatch decrements it."
+  echo
+  echo "This installer can give the reader $PAM_FPRINTD_ATTEMPTS attempts per prompt and no"
+  echo "idle deadline, by rewriting that one pam_fprintd.so line into a short"
+  echo "stack. Only fingerprint-only stacks are eligible, never a shared one"
+  echo "like common-auth: PAM is serialised, so an unlimited wait there would"
+  echo "mean sudo blocks on the sensor forever and never reaches its password"
+  echo "prompt. Eligible on this machine:"
+  echo
+  for f in "${fprintd_targets[@]}"; do
+    echo "  $f"
+  done
+  echo
+  if confirm "Give the reader $PAM_FPRINTD_ATTEMPTS attempts and no idle deadline?"; then
+    UNLIMIT_FPRINTD=true
+  else
+    echo "Leaving the fingerprint timeout alone."
+  fi
+  echo
+fi
 
 # --- 2. print the full plan and ask for approval exactly once ------------
 echo "This installer will make the following changes:"
@@ -109,8 +188,8 @@ if [ "${#PKGS[@]}" -gt 0 ]; then
 fi
 if [ "$NEED_TSS_ADD" = true ]; then
   echo "  $n. Add $USER to the 'tss' group (needs sudo), for passwordless TPM"
-  echo "     access. This requires logging out and back in before the install"
-  echo "     can continue - you'll need to re-run this script afterward."
+  echo "     access. The rest of the run continues inside 'sg tss', which"
+  echo "     picks the new group up without a logout."
   n=$((n + 1))
 fi
 if [ "$RESEAL" = true ]; then
@@ -124,6 +203,23 @@ echo "     (needs sudo)."
 n=$((n + 1))
 echo "  $n. Mask systemd's eager gnome-keyring-daemon startup, if present."
 n=$((n + 1))
+if [ "$UNLIMIT_FPRINTD" = true ]; then
+  echo "  $n. Rewrite the pam_fprintd.so auth line into $PAM_FPRINTD_ATTEMPTS attempts with no idle"
+  echo "     deadline (each file backed up first, as <file>.bak-<timestamp>):"
+  for t in "${fprintd_targets[@]}"; do
+    echo
+    echo "       $t"
+    pam_fprintd_harden <"$t" | grep -E "$PAM_FPRINTD_AUTH_RE" \
+      | sed 's/^/         /'
+  done
+  echo
+  echo "     One line is one scan: whatever goes wrong - a mismatch, a bad"
+  echo "     scan, a timeout - costs exactly one of the three attempts. The"
+  echo "     jumps only skip the remaining attempts, so a match still falls"
+  echo "     through to the keyring lines below. Three failures and the stack"
+  echo "     fails, same as one failure does today."
+  n=$((n + 1))
+fi
 if [ "${#targets[@]}" -gt 0 ]; then
   echo "  $n. Wire the TPM helper into these login PAM stacks (each backed up"
   echo "     first, as <file>.bak-<timestamp>):"
@@ -163,13 +259,40 @@ fi
 
 if [ "$NEED_TSS_ADD" = true ]; then
   sudo usermod -aG tss "$USER"
-  echo "Added $USER to the 'tss' group. Log out and back in (group membership"
-  echo "only applies to new sessions), then re-run this script to continue."
-  exit 0
+  echo "Added $USER to the 'tss' group."
+  echo
 fi
 
-if ! tpm2_pcrread "$PCR_BANK" >/dev/null 2>&1; then
-  if [ "$TSS_GROUP_PRESENT" = true ]; then
+# A new group only applies to new sessions, so the TPM steps below would fail
+# in this one - that's what used to make this script stop here and ask for a
+# logout and a second run. `sg` starts a shell that reads the group database
+# fresh, so the run can simply continue inside it. Verified: it keeps the
+# terminal (seal.sh still reads the password from the tty, never a pipe) and
+# every supplementary group (so the sudo calls further down still work); only
+# the primary group differs, which is why seal.sh sets explicit modes on the
+# files it writes rather than trusting the umask.
+USE_SG=false
+if ! tpm2_pcrread "$PCR_BANK" >/dev/null 2>&1 \
+  && command -v sg >/dev/null 2>&1 \
+  && id -nG "$USER" 2>/dev/null | tr ' ' '\n' | grep -qx tss; then
+  USE_SG=true
+fi
+
+tpm_run() {
+  if [ "$USE_SG" = true ]; then
+    sg tss -c "$(printf '%q ' "$@")"
+  else
+    "$@"
+  fi
+}
+
+if ! tpm_run tpm2_pcrread "$PCR_BANK" >/dev/null 2>&1; then
+  if [ "$NEED_TSS_ADD" = true ]; then
+    echo "Added you to the 'tss' group, but still can't read TPM PCRs in this" >&2
+    echo "session, and couldn't borrow the group with 'sg' either. Log out and" >&2
+    echo "back in (group membership only applies to new sessions), then re-run" >&2
+    echo "this script - everything else it would have done is still pending." >&2
+  elif [ "$TSS_GROUP_PRESENT" = true ]; then
     echo "Can't read TPM PCRs even though you're in the 'tss' group." >&2
     echo "Try logging out and back in (group membership needs a fresh" >&2
     echo "session), then re-run this script." >&2
@@ -178,6 +301,11 @@ if ! tpm2_pcrread "$PCR_BANK" >/dev/null 2>&1; then
     echo "add you to. Check how your distro grants /dev/tpmrm0 access." >&2
   fi
   exit 1
+fi
+
+if [ "$USE_SG" = true ]; then
+  echo "Running the TPM steps inside 'sg tss' (no logout needed)."
+  echo
 fi
 
 echo "-- Building PAM module --"
@@ -217,9 +345,35 @@ if [ "$RESEAL" = true ]; then
 else
   echo "-- Sealing your keyring password into the TPM --"
 fi
-"$REPO_DIR/bin/seal.sh"
+tpm_run "$REPO_DIR/bin/seal.sh"
 
 echo
+if [ "$UNLIMIT_FPRINTD" = true ]; then
+  echo "-- Fingerprint attempts + idle timeout --"
+  for TARGET in "${fprintd_targets[@]}"; do
+    REWRITTEN="$(mktemp)"
+    pam_fprintd_harden <"$TARGET" >"$REWRITTEN"
+    # Login-critical file, so refuse anything that isn't recognisably the same
+    # file with only the fprintd auth lines changed: every other line byte for
+    # byte identical, and exactly the expected number of attempt lines.
+    if ! diff -q <(grep -vE "$PAM_FPRINTD_AUTH_RE" "$TARGET") \
+        <(grep -vE "$PAM_FPRINTD_AUTH_RE" "$REWRITTEN") >/dev/null \
+      || [ "$(grep -cE "$PAM_FPRINTD_AUTH_RE" "$REWRITTEN")" != "$PAM_FPRINTD_ATTEMPTS" ] \
+      || [ "$(grep -cE "$PAM_FPRINTD_RETRY_LINE_RE" "$REWRITTEN")" != "$((PAM_FPRINTD_ATTEMPTS - 1))" ]; then
+      echo "Unexpected result rewriting $TARGET - left it untouched." >&2
+      rm -f "$REWRITTEN"
+      continue
+    fi
+    backup_pam_file "$TARGET"
+    # cp *onto* the existing file rather than replacing it, so its mode and
+    # ownership stay exactly as the distro shipped them.
+    sudo cp "$REWRITTEN" "$TARGET"
+    rm -f "$REWRITTEN"
+    echo "Rewritten: $TARGET"
+  done
+  echo
+fi
+
 echo "-- Login PAM stacks that feed the keyring --"
 if [ "${#candidates[@]}" -eq 0 ]; then
   echo "No /etc/pam.d/ service has an auth-phase pam_gnome_keyring.so line."
@@ -231,7 +385,7 @@ else
       echo "$TARGET already had the module wired in - left unchanged."
       continue
     fi
-    sudo cp "$TARGET" "$TARGET.bak-$(date +%Y%m%d%H%M%S)"
+    backup_pam_file "$TARGET"
     sudo sed -E -i "/${PAM_GNOME_KEYRING_AUTH_RE}/i auth    optional        pam_tpm_keyring_authtok.so" "$TARGET"
     echo "Wired: $TARGET"
   done

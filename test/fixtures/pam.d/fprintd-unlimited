@@ -1,0 +1,6 @@
+#%PAM-1.0
+# Already patched by a previous install.sh run - must be detected as
+# needing nothing, and rewriting it again must change nothing.
+auth	requisite	pam_nologin.so
+auth	required	pam_fprintd.so timeout=-1
+auth	optional	pam_gnome_keyring.so

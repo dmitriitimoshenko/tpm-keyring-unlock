@@ -23,6 +23,14 @@ actually runs there, never skips.
   against fixture files under `test/fixtures/pam.d/`: plain control syntax,
   bracketed control syntax, an already-patched file (must be skipped, not
   double-patched), and a file with no `pam_gnome_keyring.so` line at all.
+  Also the fingerprint attempt-stack rewrite `install.sh` applies
+  (`pam_auth_is_fingerprint_only`, `pam_fprintd_harden/unharden`): which
+  stacks are eligible, the jump distances, idempotence and the round trip
+  back, and — the one that actually matters — that a *shared* stack like
+  `common-auth` is refused, since PAM is serialised and an unlimited
+  fingerprint wait there would hang `sudo` before it ever reached the password
+  prompt. The PAM control flow of the generated stack is covered by
+  `runtime-test.sh` below, against real libpam.
 - **`test/runtime-test.sh`** (one container, distro doesn't matter) — the
   compiled PAM module's actual fork/exec/pipe/timeout/`PAM_AUTHTOK` logic,
   using `pamtester` + a fake helper script standing in for
@@ -33,6 +41,12 @@ actually runs there, never skips.
   the timeout (`-DHELPER_TIMEOUT_SECS=2` for the test, instead of waiting
   out the real 15s - asserts the process actually gets killed and the call
   returns promptly instead of hanging).
+  Plus the control flow of the fingerprint attempt stack `install.sh`
+  writes, with `pam_flow_stub.so` standing in for `pam_fprintd.so`: that a
+  match on any attempt still reaches the keyring lines (a jump that failed
+  to record success would break fingerprint login outright), that a bad
+  scan falls through to the next attempt, that three bad scans fail, and
+  that a mismatch dies on the spot.
 - **`test/distro/Dockerfile.{ubuntu,debian,fedora,arch,opensuse}`** +
   **`test/distro/test-packaging.sh`** — on each distro's own real base
   image: install the declared dependencies via that distro's real package
@@ -45,6 +59,13 @@ actually runs there, never skips.
   `apt` codepath in `install.sh`: same package manager, different base
   image and default package versions, so "works on Ubuntu" isn't proof it
   works on Debian proper too.
+  Also the `sg` mechanic `install.sh` leans on to finish in one run: a
+  session is held open across a `usermod`, and the test asserts that the
+  session itself does *not* see the new group while `sg` does, with the
+  session's other groups intact. Distro-specific because `sg` comes from
+  shadow-utils; an image without `sg` (or without `su` to build the setup)
+  prints a note and skips rather than failing, since `install.sh` falls
+  back to asking for a logout and a second run there.
 - **arm64 cross-build** of the Ubuntu packaging test, via `docker buildx
   --platform linux/arm64` (needs `qemu-user-static`/binfmt registered on
   the host - see your distro's docs for `docker buildx` + QEMU

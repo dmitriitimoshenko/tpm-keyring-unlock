@@ -1,0 +1,15 @@
+#%PAM-1.0
+# What install.sh writes: the same stack after
+# pam_fprintd_harden(). Must be detected as needing nothing further,
+# and hardening it again must change nothing.
+auth	requisite	pam_nologin.so
+auth	required	pam_succeed_if.so user != root quiet_success
+auth	[success=2 authinfo_unavail=ignore auth_err=ignore maxtries=ignore default=die]	pam_fprintd.so timeout=-1 max-tries=1
+auth	[success=1 authinfo_unavail=ignore auth_err=ignore maxtries=ignore default=die]	pam_fprintd.so timeout=-1 max-tries=1
+auth	required	pam_fprintd.so timeout=-1 max-tries=1
+auth	optional	pam_tpm_keyring_authtok.so
+auth	optional	pam_gnome_keyring.so
+@include common-account
+@include common-session
+session	optional	pam_gnome_keyring.so auto_start
+password	required	pam_fprintd.so

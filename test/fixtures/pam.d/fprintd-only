@@ -1,0 +1,13 @@
+#%PAM-1.0
+# Shape of Ubuntu/Debian gdm-fingerprint: the auth phase offers the
+# fingerprint reader and nothing else, so an unlimited wait here cannot
+# stall any other way in - the password lives in a separate stack.
+auth	requisite	pam_nologin.so
+auth	required	pam_succeed_if.so user != root quiet_success
+auth	required	pam_fprintd.so
+auth	optional	pam_tpm_keyring_authtok.so
+auth	optional	pam_gnome_keyring.so
+@include common-account
+@include common-session
+session	optional	pam_gnome_keyring.so auto_start
+password	required	pam_fprintd.so

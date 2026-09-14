@@ -11,9 +11,21 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bin/lib.sh"
 confirm() {
   local prompt="$1"
   local ans
-  read -rp "$prompt [y/N] " ans
-  [[ "$ans" =~ ^[Yy]$ ]]
+  # Defaults to yes: an empty answer accepts. A failed read (EOF, i.e. no
+  # terminal) is a "no", so nothing here can be auto-approved by a pipe.
+  read -rp "$prompt [Y/n] " ans || return 1
+  [[ ! "$ans" =~ ^[Nn][Oo]?$ ]]
 }
+
+# Every prompt below defaults to yes, so a run with no terminal must not be
+# allowed to answer them by hitting EOF. read() failing counts as "no" in
+# confirm() for that reason, but bail out up front anyway rather than
+# half-running and then dying on "sudo: a terminal is required to
+# authenticate" partway through.
+if [ ! -t 0 ]; then
+  echo "This script is interactive - run it directly from a terminal." >&2
+  exit 1
+fi
 
 echo "== tpm-keyring-unlock uninstaller =="
 echo
@@ -24,12 +36,44 @@ echo
 # line (gdm-password included, once system-wide fingerprint auth is on).
 for f in /etc/pam.d/*; do
   [ -f "$f" ] || continue
+  if [[ "$f" =~ $PAM_BACKUP_RE ]]; then continue; fi
   if grep -q pam_tpm_keyring_authtok.so "$f"; then
     echo "Found the injected line in $f"
     if confirm "Remove it?"; then
       sudo sed -i '/pam_tpm_keyring_authtok\.so/d' "$f"
       echo "Removed."
     fi
+  fi
+done
+
+# --- 1b. undo the fingerprint attempt-stack edit -------------------------
+# Drops the attempt lines install.sh generated and the timeout=-1 it set,
+# putting the service back on a single pam_fprintd.so line with the module's
+# own defaults (30s idle, and one bad scan ends fingerprint for that prompt -
+# see JOURNAL.md, 2026-09-14). If the line carried some other explicit timeout
+# before install.sh replaced it, the exact original is in the .bak-<timestamp>
+# copy install.sh left beside the file.
+for f in /etc/pam.d/*; do
+  [ -f "$f" ] || continue
+  if [[ "$f" =~ $PAM_BACKUP_RE ]]; then continue; fi
+  if pam_fprintd_unharden <"$f" | cmp -s - "$f"; then continue; fi
+  echo "Found install.sh's fingerprint attempt stack in $f"
+  if confirm "Put it back to a single pam_fprintd.so line with module defaults?"; then
+    REWRITTEN="$(mktemp)"
+    pam_fprintd_unharden <"$f" >"$REWRITTEN"
+    # same invariant install.sh writes under: every non-fprintd line identical,
+    # exactly one fprintd auth line left, no generated lines, no timeout=-1
+    if diff -q <(grep -vE "$PAM_FPRINTD_AUTH_RE" "$f") \
+        <(grep -vE "$PAM_FPRINTD_AUTH_RE" "$REWRITTEN") >/dev/null \
+      && [ "$(grep -cE "$PAM_FPRINTD_AUTH_RE" "$REWRITTEN")" = 1 ] \
+      && ! grep -qE "$PAM_FPRINTD_RETRY_LINE_RE" "$REWRITTEN" \
+      && ! grep -qE "${PAM_FPRINTD_AUTH_RE}.*timeout=-1" "$REWRITTEN"; then
+      sudo cp "$REWRITTEN" "$f"
+      echo "Restored."
+    else
+      echo "Unexpected result rewriting $f - left it untouched." >&2
+    fi
+    rm -f "$REWRITTEN"
   fi
 done
 

@@ -1,0 +1,11 @@
+#%PAM-1.0
+# Shape of Debian common-auth with pam-auth-update --enable fprintd: the
+# fingerprint line is followed by a password one in the SAME serialised
+# stack, so timeout=-1 here would hang sudo on the sensor forever. Must be
+# refused. Also carries the trailing "# debug" comment Debian ships, which
+# an appended option must never end up behind.
+auth	[success=3 default=ignore]	pam_fprintd.so max-tries=1 timeout=10 # debug
+auth	[success=2 default=ignore]	pam_unix.so nullok try_first_pass
+auth	[success=1 default=ignore]	pam_sss.so use_first_pass
+auth	requisite			pam_deny.so
+auth	required			pam_permit.so
