@@ -1,0 +1,10 @@
+#%PAM-1.0
+# The hand-rolled fingerprint-only shape PAM's own documentation teaches:
+# the reader is "sufficient" and a deny catches everything else. Every
+# module here is on the passive whitelist, so nothing else refuses it - but
+# "sufficient" means success=done, and the attempt lines use success=N, a
+# jump that carries on. Rewritten, a matched finger would land on
+# pam_deny.so. Must be refused. See JOURNAL.md, 2026-09-15.
+auth	requisite	pam_nologin.so
+auth	sufficient	pam_fprintd.so
+auth	required	pam_deny.so

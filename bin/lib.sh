@@ -37,15 +37,26 @@ find_pam_module_dir() {
 # spaces, which a plain \S+ stops at and fails to match.
 PAM_GNOME_KEYRING_AUTH_RE='^\s*auth\s+(\S+|\[[^]]*\])\s+pam_gnome_keyring\.so'
 
-# install.sh's own backups sit right next to the files they back up, so a
-# /etc/pam.d/* glob picks them up like any other file. They are not services
-# - PAM only ever reads the file whose name matches the service being
-# authenticated - but they carry the same auth lines, so every detection loop
-# here has to skip them. Without this, install.sh wires the module into its
-# own backups and then backs *those* up on the next run
+# /etc/pam.d/ holds more than services, and a /etc/pam.d/* glob picks all of
+# it up like any other file: this tool's own .bak-<timestamp> copies sit right
+# next to the files they back up, and the package managers leave .pacnew
+# (Arch, routinely), .rpmnew/.rpmsave (Fedora, openSUSE) and
+# .dpkg-old/.dpkg-dist/.ucf-old (Debian, Ubuntu) behind. None of them is a
+# service - PAM only ever reads the file whose name matches the service being
+# authenticated - but they all carry the same auth lines, so every detection
+# loop here has to skip them. Without this, install.sh wires the module into
+# its own backups and then backs *those* up on the next run
 # (gdm-password.bak-1.bak-2), which is exactly how this was spotted. See
-# JOURNAL.md, 2026-09-14.
-PAM_BACKUP_RE='\.bak-[0-9]+$'
+# JOURNAL.md, 2026-09-14 and 2026-09-15.
+#
+# Matched on "the basename contains a dot" rather than on a list of known
+# suffixes: a real PAM service name has no dot in it - true for every service
+# shipped by gdm, systemd, sudo, util-linux, shadow and the pam-configs
+# machinery on all five distros the test suite covers - so this is both the
+# simpler rule and the one that doesn't need extending for the next package
+# manager's suffix. Anchored to the last path segment so the "pam.d" in the
+# directory part can't match.
+PAM_NON_SERVICE_RE='(^|/)[^/]*\.[^/]*$'
 
 # Exits with an explanatory message unless Secure Boot is verifiably on.
 # This tool's entire security model rests on PCR7 (the Secure Boot state) -
@@ -106,7 +117,7 @@ require_secure_boot() {
 # auth phase on purpose: gdm-fingerprint also carries a *password*-phase
 # pam_fprintd.so line (that one is fingerprint enrollment, not verification),
 # and a verification timeout on it would mean nothing.
-PAM_FPRINTD_AUTH_RE='^\s*auth\s+(\S+|\[[^]]*\])\s+pam_fprintd\.so'
+PAM_FPRINTD_AUTH_RE='^\s*-?auth\s+(\S+|\[[^]]*\])\s+pam_fprintd\.so'
 
 # Auth-phase modules that can never, by themselves, let anyone in: pure
 # gating/bookkeeping (nologin, succeed_if, faillock), secret-stashing that
@@ -121,6 +132,47 @@ PAM_AUTH_PASSIVE_MODULE_RE='^pam_(fprintd|nologin|succeed_if|faillock|tally2?|de
 # file is unknown territory, and pam_auth_is_fingerprint_only() refuses it
 # rather than trying to follow the include.
 PAM_AUTHLESS_INCLUDE_RE='^common-(account|session|session-noninteractive|password)$'
+
+# Prints $1 with PAM's backslash line continuations joined, so every output
+# line is one logical config line. Every predicate below reads through this
+# rather than the file directly.
+#
+# Without it a second auth-phase module split across two physical lines is
+# invisible to them - `auth \` on one line has no module token to look at, and
+# the `    required  pam_unix.so` that follows does not start with "auth", so
+# both are skipped and a shared stack reads as fingerprint-only. Exactly the
+# hole the leading-dash form had. See JOURNAL.md, 2026-09-15.
+#
+# The trailing backslash is dropped and the next physical line appended as-is,
+# which is what libpam's own parser does.
+_pam_logical_lines() {
+  local f="$1" line acc=""
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [[ "$line" =~ ^(.*)\\$ ]]; then
+      acc="$acc${BASH_REMATCH[1]}"
+      continue
+    fi
+    printf '%s%s\n' "$acc" "$line"
+    acc=""
+  done <"$f"
+  [ -z "$acc" ] || printf '%s\n' "$acc"
+}
+
+# Succeeds if no line in $1 ends in a backslash continuation.
+#
+# The rewriter in _pam_fprintd_rewrite_stack() works on physical lines: it
+# appends "timeout=-1 max-tries=1" to the end of the pam_fprintd.so line,
+# which on a continued line lands *after* the trailing backslash - turning the
+# continuation into a module argument and orphaning the line below it. The
+# write-time invariant does not catch it either (the orphan is a non-fprintd
+# line, identical on both sides). Rather than teach the awk to fold and unfold
+# continuations, refuse the file: no distro ships one, and this is a login
+# path. See JOURNAL.md, 2026-09-15.
+pam_config_has_no_line_continuations() {
+  local f="$1"
+  [ -f "$f" ] || return 1
+  ! grep -qE '\\$' "$f"
+}
 
 # Succeeds if $1 is a PAM service whose auth phase offers fingerprint and no
 # other way in - i.e. a stack where making pam_fprintd wait forever cannot
@@ -159,11 +211,18 @@ pam_auth_is_fingerprint_only() {
     # system-auth` / `auth substack ...` line lands here too, with
     # "system-auth" as the module - which is not on the passive whitelist, so
     # it gets refused, which is what we want for a stack we can't see into.
-    if [[ "$line" =~ ^[[:space:]]*auth[[:space:]]+(\[[^]]*\]|[^[:space:]]+)[[:space:]]+([^[:space:]]+) ]]; then
+    #
+    # `-?auth`: PAM also accepts a leading dash ("skip silently if the module
+    # isn't installed"), used in the wild for pam_systemd_home.so and
+    # pam_fscrypt.so. Those are real auth-phase modules, and missing them here
+    # would mean calling a stack that has a second way in fingerprint-only -
+    # exactly the misclassification this predicate exists to prevent. See
+    # JOURNAL.md, 2026-09-15.
+    if [[ "$line" =~ ^[[:space:]]*-?auth[[:space:]]+(\[[^]]*\]|[^[:space:]]+)[[:space:]]+([^[:space:]]+) ]]; then
       module="${BASH_REMATCH[2]}"
       [[ "$module" =~ $PAM_AUTH_PASSIVE_MODULE_RE ]] || return 1
     fi
-  done <"$f"
+  done < <(_pam_logical_lines "$f")
 
   return 0
 }
@@ -207,7 +266,7 @@ PAM_FPRINTD_ATTEMPTS=3
 # "authinfo_unavail=ignore" control is the marker - deliberately a real part
 # of the line's meaning rather than a trailing comment, so nothing here has to
 # depend on whether libpam strips trailing comments.
-PAM_FPRINTD_RETRY_LINE_RE='^\s*auth\s+\[[^]]*authinfo_unavail=ignore[^]]*\]\s+pam_fprintd\.so'
+PAM_FPRINTD_RETRY_LINE_RE='^\s*-?auth\s+\[[^]]*authinfo_unavail=ignore[^]]*\]\s+pam_fprintd\.so'
 
 # Filters for stdin -> stdout.
 #
@@ -217,9 +276,9 @@ PAM_FPRINTD_RETRY_LINE_RE='^\s*auth\s+\[[^]]*authinfo_unavail=ignore[^]]*\]\s+pa
 #
 # The generated stack looks like:
 #
-#   auth  [success=2 <fallthrough>]  pam_fprintd.so max-tries=1 timeout=-1
-#   auth  [success=1 <fallthrough>]  pam_fprintd.so max-tries=1 timeout=-1
-#   auth  required                   pam_fprintd.so max-tries=1 timeout=-1
+#   auth  [success=2 <fallthrough>]  pam_fprintd.so timeout=-1 max-tries=1
+#   auth  [success=1 <fallthrough>]  pam_fprintd.so timeout=-1 max-tries=1
+#   auth  required                   pam_fprintd.so timeout=-1 max-tries=1
 #
 # where <fallthrough> is "authinfo_unavail=ignore auth_err=ignore
 # maxtries=ignore default=die".
@@ -255,8 +314,10 @@ PAM_FPRINTD_RETRY_LINE_RE='^\s*auth\s+\[[^]]*authinfo_unavail=ignore[^]]*\]\s+pa
 #
 # unharden removes exactly the options harden sets (timeout=-1, max-tries=1).
 # That restores the module defaults, which is the original state for the bare
-# line gdm ships, but not for a stack that had its own explicit values -
-# install.sh's .bak-<timestamp> copy is the exact-restore path for that case.
+# line gdm ships, but not for a stack that had its own explicit values. For
+# those, uninstall.sh restores install.sh's .bak-<timestamp> copy instead -
+# see pam_fprintd_exact_original() at the bottom of this file, which is what
+# decides whether such a copy can be trusted.
 pam_fprintd_harden() {
   _pam_fprintd_rewrite_stack "$PAM_FPRINTD_ATTEMPTS"
 }
@@ -290,8 +351,8 @@ _pam_fprintd_rewrite_stack() {
     }
 
     BEGIN {
-      auth_re  = "^[[:space:]]*auth[[:space:]]+(\\[[^]]*\\]|[^[:space:]]+)[[:space:]]+pam_fprintd\\.so"
-      retry_re = "^[[:space:]]*auth[[:space:]]+\\[[^]]*authinfo_unavail=ignore[^]]*\\][[:space:]]+pam_fprintd\\.so"
+      auth_re  = "^[[:space:]]*-?auth[[:space:]]+(\\[[^]]*\\]|[^[:space:]]+)[[:space:]]+pam_fprintd\\.so"
+      retry_re = "^[[:space:]]*-?auth[[:space:]]+\\[[^]]*authinfo_unavail=ignore[^]]*\\][[:space:]]+pam_fprintd\\.so"
       fallthrough = "authinfo_unavail=ignore auth_err=ignore maxtries=ignore default=die"
     }
 
@@ -316,8 +377,12 @@ _pam_fprintd_rewrite_stack() {
       if (!emitted) {
         tail = code
         sub(/^.*pam_fprintd\.so/, "", tail)
+        # a leading "-" means "skip silently if the module is not installed";
+        # the generated attempts have to carry that too, or a missing
+        # pam_fprintd.so would start erroring where the original was quiet
+        phase = (code ~ /^[[:space:]]*-/) ? "-auth" : "auth"
         for (i = attempts - 1; i >= 1; i--)
-          printf "auth\t[success=%d %s]\tpam_fprintd.so%s\n", i, fallthrough, tail
+          printf "%s\t[success=%d %s]\tpam_fprintd.so%s\n", phase, i, fallthrough, tail
         emitted = 1
       }
 
@@ -338,4 +403,183 @@ pam_fprintd_has_single_auth_line() {
   total="$(grep -cE "$PAM_FPRINTD_AUTH_RE" "$1" || true)"
   generated="$(grep -cE "$PAM_FPRINTD_RETRY_LINE_RE" "$1" || true)"
   [ "$total" = "$((generated + 1))" ]
+}
+
+# Succeeds if the service's own pam_fprintd.so auth line - the one that isn't
+# a generated attempt line - hands control on to the next module when the
+# finger matches, rather than ending the stack there.
+#
+# The generated attempt lines use `success=N`, a *relative jump* that records
+# success and carries on. That is the same thing the original line did only
+# when the original was a fall-through control. Two shapes where it isn't:
+#
+#   auth sufficient pam_fprintd.so      <- success=done: return, stack over
+#   auth required   pam_deny.so
+#
+# Rewritten, a match on attempt 1 jumps over attempts 2 and 3 and lands on
+# pam_deny.so, so a *correct* finger now fails the login - and both modules
+# are on PAM_AUTH_PASSIVE_MODULE_RE, so nothing else here would have caught
+# it. A bracketed `success=<number>` is the other shape: its jump distance was
+# measured from where that line sits, and there is no way to reproduce it on
+# three lines in three different places.
+#
+# Refused rather than translated, on purpose: gdm-fingerprint (the service
+# this feature exists for) ships `auth required`, so the shapes this turns
+# away cost nothing, and guessing at someone else's control field on a login
+# path is not worth the little it would buy. See JOURNAL.md, 2026-09-15.
+pam_fprintd_control_falls_through() {
+  local f="$1" line control inner found=false
+  [ -f "$f" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%%#*}"
+    [[ "$line" =~ ^[[:space:]]*-?auth[[:space:]]+(\[[^]]*\]|[^[:space:]]+)[[:space:]]+pam_fprintd\.so ]] || continue
+    control="${BASH_REMATCH[1]}"
+    # lines pam_fprintd_harden() generated are ours, and known to fall through
+    if [[ "$control" =~ authinfo_unavail=ignore ]]; then continue; fi
+    found=true
+    case "$control" in
+      required | requisite | optional) ;;
+      \[*\])
+        inner="${control:1:${#control}-2}"
+        inner="${inner//$'\t'/ }"
+        [[ " $inner " == *" success=ok "* ]] || return 1
+        ;;
+      *) return 1 ;;
+    esac
+  done < <(_pam_logical_lines "$f")
+  [ "$found" = true ]
+}
+
+# Succeeds if no auth-phase line *above* the pam_fprintd.so line uses a
+# numeric jump in its control field.
+#
+# A jump counts modules from where the line sits, so inserting the attempt
+# lines above pam_fprintd.so silently re-aims every jump that was meant to
+# land past it - `auth [success=1 default=ignore] pam_succeed_if.so user
+# ingroup nopasswdlogin`, the standard "this group skips the reader" idiom,
+# ends up landing on attempt 2 instead of past the reader entirely.
+#
+# install.sh's write invariant (every non-fprintd line byte-for-byte
+# identical) reads like it rules this out and does not: a jump's meaning is
+# positional, so identical bytes are not identical semantics. Lines *below*
+# pam_fprintd.so are fine - nothing is inserted between them and whatever
+# they aim at - which is why this stops at the fprintd line. See JOURNAL.md,
+# 2026-09-15.
+pam_auth_has_no_relative_jumps() {
+  local f="$1" line control
+  [ -f "$f" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%%#*}"
+    if [[ "$line" =~ ^[[:space:]]*-?auth[[:space:]]+(\[[^]]*\]|[^[:space:]]+)[[:space:]]+pam_fprintd\.so ]]; then
+      return 0
+    fi
+    if [[ "$line" =~ ^[[:space:]]*-?auth[[:space:]]+\[([^]]*)\] ]]; then
+      control="${BASH_REMATCH[1]}"
+      if [[ "$control" =~ =[0-9]+ ]]; then return 1; fi
+    fi
+  done < <(_pam_logical_lines "$f")
+  return 0
+}
+
+# Succeeds if $1's fingerprint stack is one pam_fprintd_harden() wrote and
+# nothing has edited since - proved by round trip: strip it back down, build
+# it up again, and require the result to be the file byte for byte.
+#
+# This is what uninstall.sh keys off, and it has to be this strict. Keying off
+# "unharden would change something" instead reaches far too wide: unharden
+# strips max-tries=1, and Debian's own pam-auth-update writes exactly that
+# into common-auth ("auth [success=3 default=ignore] pam_fprintd.so
+# max-tries=1 timeout=10"), so uninstall.sh would offer to "restore" - and
+# silently rewrite - a shared stack install.sh refuses to touch by design.
+# The same wide net deletes a hand-written retry line that happens to carry
+# authinfo_unavail=ignore, because unharden reads it as one of ours.
+#
+# The attempt count is read off the file rather than taken from
+# PAM_FPRINTD_ATTEMPTS, so a stack written by a version of this tool with a
+# different count still round-trips and can still be uninstalled.
+# See JOURNAL.md, 2026-09-15.
+pam_fprintd_stack_is_generated() {
+  local f="$1" n
+  [ -f "$f" ] || return 1
+  grep -qE "$PAM_FPRINTD_RETRY_LINE_RE" "$f" || return 1
+  n="$(grep -cE "$PAM_FPRINTD_AUTH_RE" "$f" 2>/dev/null || true)"
+  [ -n "$n" ] && [ "$n" -gt 1 ] || return 1
+  pam_fprintd_unharden <"$f" | _pam_fprintd_rewrite_stack "$n" | cmp -s - "$f"
+}
+
+# Prints the newest .bak-<timestamp> copy of $1 that is provably the file
+# install.sh hardened into what's on disk now, if there is one. This is the
+# only path that brings back an explicit timeout=/max-tries= the distro had
+# set on its pam_fprintd.so line: pam_fprintd_unharden() removes exactly the
+# options this tool adds, and has no way to know what was there before.
+#
+# "Provably" is two conditions. The backup holds a single, un-hardened
+# pam_fprintd.so auth line - so it is a pre-edit original, not another
+# hardened copy. And hardening it reproduces the current file byte for byte -
+# which can only happen if every other line in the backup is already identical
+# to what's on disk, so a stale backup (a gdm upgrade since, someone's own
+# edit to an unrelated line) can never be restored over newer content. That is
+# what makes copying the whole backup back safe, rather than having to splice
+# single lines out of it.
+#
+# Newest first, because a re-run of install.sh on an already-hardened file
+# takes no new backup: every copy that satisfies both conditions holds the
+# same original line, and the newest is the one closest to the current file.
+# See JOURNAL.md, 2026-09-15.
+pam_fprintd_exact_original() {
+  local f="$1" bak baks=()
+  mapfile -t baks < <(printf '%s\n' "$f".bak-* | sort -r)
+  for bak in "${baks[@]}"; do
+    [ -f "$bak" ] || continue
+    if [ "$(grep -cE "$PAM_FPRINTD_AUTH_RE" "$bak" 2>/dev/null || true)" != 1 ]; then continue; fi
+    if grep -qE "$PAM_FPRINTD_RETRY_LINE_RE" "$bak"; then continue; fi
+    if ! pam_fprintd_harden <"$bak" | cmp -s - "$f"; then continue; fi
+    echo "$bak"
+    return 0
+  done
+  return 1
+}
+
+# Succeeds if $1 is a PAM service install.sh may rewrite into an attempt
+# stack. The whole eligibility rule in one place, because it has to be applied
+# twice: once when the plan is printed, and again immediately before the file
+# is written.
+#
+# Those two moments are not the same moment. Between them install.sh installs
+# packages, and on a Debian/Ubuntu machine that can regenerate files under
+# /etc/pam.d on its own - pam-auth-update runs from libpam-runtime's postinst,
+# a gdm upgrade ships its own gdm-fingerprint. The invariant install.sh checks
+# before writing ("every non-fprintd line byte for byte identical, exactly N
+# attempt lines") only proves the rewrite is faithful to whatever is on disk
+# now; it says nothing about whether that content is still something this tool
+# may touch. A file that was fingerprint-only at plan time and has since
+# gained an `auth required pam_unix.so` passes every one of those checks -
+# and writing it would put timeout=-1 into a shared, serialised stack, which
+# is the one outcome all of this exists to prevent. See JOURNAL.md,
+# 2026-09-15.
+#
+# Deliberately does NOT include "hardening would change something": that is a
+# separate question (is a rewrite needed at all), answered separately at both
+# call sites, so that "already in the target state" can be reported
+# differently from "not eligible".
+pam_fprintd_stack_is_eligible() {
+  local f="$1"
+  [ -f "$f" ] || return 1
+  grep -qE "$PAM_FPRINTD_AUTH_RE" "$f" || return 1
+  pam_config_has_no_line_continuations "$f" || return 1
+  pam_fprintd_has_single_auth_line "$f" || return 1
+  # Attempt lines that carry our marker but are not, byte for byte, a stack
+  # this tool wrote are somebody else's hand-rolled retry stack:
+  # pam_fprintd_has_single_auth_line() counts any authinfo_unavail=ignore line
+  # as one of ours, which is right for our own output and wrong for a config
+  # that predates the tool. uninstall.sh already refuses to claim those; the
+  # install side has to agree, or it silently rewrites a stranger's fingerprint
+  # config. See JOURNAL.md, 2026-09-15.
+  if grep -qE "$PAM_FPRINTD_RETRY_LINE_RE" "$f"; then
+    pam_fprintd_stack_is_generated "$f" || return 1
+  fi
+  pam_auth_is_fingerprint_only "$f" || return 1
+  pam_fprintd_control_falls_through "$f" || return 1
+  pam_auth_has_no_relative_jumps "$f" || return 1
+  return 0
 }

@@ -1,0 +1,9 @@
+#%PAM-1.0
+# A second way in, written with PAM's leading-dash syntax ("skip silently if
+# the module isn't installed") - real configs use it for pam_systemd_home.so
+# and pam_fscrypt.so. It is still an auth-phase module in the same
+# serialised stack, so this is NOT fingerprint-only and an unlimited wait
+# here could keep it from ever being reached. See JOURNAL.md, 2026-09-15.
+-auth	[success=1 default=ignore]	pam_systemd_home.so
+auth	required	pam_fprintd.so
+auth	optional	pam_gnome_keyring.so

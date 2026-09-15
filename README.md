@@ -17,9 +17,10 @@ cd tpm-keyring-unlock
 Prints the full plan up front — every package to install, the `tss` group
 change, the exact PAM-file diff(s) it would apply (each backed up
 automatically) — and asks for approval exactly once before doing any of it.
-The one exception: if you need adding to the `tss` group (for passwordless
-TPM access), that step alone requires a relogin partway through, so the
-script stops there and asks you to re-run it once you're back. Your keyring
+If you need adding to the `tss` group (for passwordless TPM access), the run
+carries on inside `sg tss` and still finishes in one go; only on a distro
+whose `shadow` package ships no `sg` (Arch — see Requirements) does it stop
+there and ask you to log out, log back in and re-run. Your keyring
 password itself is typed interactively during sealing — never touches disk
 unencrypted, never passed as a command-line argument. See Requirements below
 before running it. Every prompt defaults to yes, so Enter accepts; the
@@ -164,9 +165,9 @@ rewrites the one `pam_fprintd.so` auth line into three attempts with no idle
 deadline:
 
 ```
-auth  [success=2 <fall through>]  pam_fprintd.so max-tries=1 timeout=-1
-auth  [success=1 <fall through>]  pam_fprintd.so max-tries=1 timeout=-1
-auth  required                    pam_fprintd.so max-tries=1 timeout=-1
+auth  [success=2 <fall through>]  pam_fprintd.so timeout=-1 max-tries=1
+auth  [success=1 <fall through>]  pam_fprintd.so timeout=-1 max-tries=1
+auth  required                    pam_fprintd.so timeout=-1 max-tries=1
 ```
 
 where `<fall through>` is `authinfo_unavail=ignore auth_err=ignore
@@ -204,7 +205,19 @@ for the option rather than guessing from a version string.
 
 This is applied **only** to a PAM service whose auth phase offers fingerprint
 and nothing else — `gdm-fingerprint` on Ubuntu/Debian — and the file is backed
-up first.
+up first. Three further shapes are refused rather than guessed at, because the
+rewrite can't reproduce them faithfully:
+
+- a stack whose fingerprint line is `sufficient` (or `[…success=done…]`).
+  `sufficient` *ends* the stack on a match; the attempt lines jump and carry
+  on, so on a stack like `auth sufficient pam_fprintd.so` / `auth required
+  pam_deny.so` a matched finger would land on the deny.
+- a stack with a numeric jump (`[success=1 …]`) on a line above the
+  fingerprint one — `pam_succeed_if.so user ingroup nopasswdlogin`, typically.
+  A jump counts modules from where it sits, so inserting lines above its
+  target silently re-aims it.
+- anything with a second auth-phase module that isn't pure gating, including
+  one written with PAM's leading-dash syntax (`-auth … pam_systemd_home.so`).
 
 It deliberately refuses to touch a *shared* stack such as `common-auth`, even
 though that's where Ubuntu puts its own `timeout=10`. PAM is strictly
@@ -223,7 +236,22 @@ Two things worth knowing:
   separately.
 - `/etc/pam.d/gdm-fingerprint` belongs to the `gdm` package, so a gdm upgrade
   can restore its version of the file. Re-run `install.sh` if the reader
-  starts dropping out again. `uninstall.sh` reverses the edit.
+  starts dropping out again.
+
+`uninstall.sh` reverses the edit, and is deliberately narrow about it:
+
+- it only touches a file it can prove it wrote itself — strip the stack back
+  down, build it up again, require the result to match the file byte for byte
+  — and it backs the file up first, same as the install side;
+- it puts back the distro's **exact original line**, from the
+  `.bak-<timestamp>` copy `install.sh` took, whenever that copy is provably
+  the file that was hardened into what's on disk now. That is the only way an
+  explicit `timeout=`/`max-tries=` the distro had set comes back; without such
+  a copy the line returns on the module's defaults instead, and the uninstaller
+  says so;
+- if a file carries the attempt lines but has been edited since, it says so
+  and leaves it alone, rather than silently skipping it and letting you think
+  everything was reverted.
 
 ## Requirements
 

@@ -120,7 +120,7 @@ RESEAL=false
 
 # 1d. login PAM stacks that need the helper wired in
 mapfile -t candidates < <(grep -lE "$PAM_GNOME_KEYRING_AUTH_RE" /etc/pam.d/* 2>/dev/null \
-  | grep -vE "$PAM_BACKUP_RE")
+  | grep -vE "$PAM_NON_SERVICE_RE")
 targets=()
 for c in "${candidates[@]}"; do
   grep -q pam_tpm_keyring_authtok.so "$c" || targets+=("$c")
@@ -139,12 +139,13 @@ fprintd_targets=()
 if pam_fprintd_supports_timeout_option; then
   for f in /etc/pam.d/*; do
     [ -f "$f" ] || continue
-    if [[ "$f" =~ $PAM_BACKUP_RE ]]; then continue; fi
+    if [[ "$f" =~ $PAM_NON_SERVICE_RE ]]; then continue; fi
     if ! grep -qE "$PAM_FPRINTD_AUTH_RE" "$f"; then continue; fi
     # already in the target state - hardening it again would change nothing
     if pam_fprintd_harden <"$f" | cmp -s - "$f"; then continue; fi
-    if ! pam_fprintd_has_single_auth_line "$f"; then continue; fi
-    if ! pam_auth_is_fingerprint_only "$f"; then continue; fi
+    # the whole eligibility rule lives in bin/lib.sh, because step 3 below has
+    # to apply the exact same one again just before it writes
+    if ! pam_fprintd_stack_is_eligible "$f"; then continue; fi
     fprintd_targets+=("$f")
   done
 fi
@@ -351,6 +352,27 @@ echo
 if [ "$UNLIMIT_FPRINTD" = true ]; then
   echo "-- Fingerprint attempts + idle timeout --"
   for TARGET in "${fprintd_targets[@]}"; do
+    # The plan was made before the package install above, and on some distros
+    # that step regenerates /etc/pam.d files on its own (pam-auth-update out of
+    # libpam-runtime's postinst, a gdm upgrade shipping its own
+    # gdm-fingerprint). So prove eligibility again against what is on disk
+    # right now: the invariant check below only proves the rewrite is faithful
+    # to the current content, never that the current content is still a file
+    # this tool may touch. A stack that has gained an `auth required
+    # pam_unix.so` since passes every one of those checks, and writing it
+    # would put timeout=-1 into a shared stack. See JOURNAL.md, 2026-09-15.
+    if pam_fprintd_harden <"$TARGET" | cmp -s - "$TARGET"; then
+      echo "$TARGET is already in the target state - left unchanged."
+      continue
+    fi
+    if ! pam_fprintd_stack_is_eligible "$TARGET"; then
+      echo "$TARGET has changed since the plan above was printed and no" >&2
+      echo "longer qualifies (it has to offer fingerprint and nothing else," >&2
+      echo "on a single fall-through pam_fprintd.so line with no relative" >&2
+      echo "jump above it). Left untouched - re-run this script to reconsider" >&2
+      echo "it against the file as it stands now." >&2
+      continue
+    fi
     REWRITTEN="$(mktemp)"
     pam_fprintd_harden <"$TARGET" >"$REWRITTEN"
     # Login-critical file, so refuse anything that isn't recognisably the same
@@ -381,6 +403,17 @@ if [ "${#candidates[@]}" -eq 0 ]; then
   echo "in manually if you find the right file - see README.md 'How it works'."
 else
   for TARGET in "${candidates[@]}"; do
+    # Same race the fprintd step above guards against: this list was built
+    # before the package install, which can remove, rename or regenerate a
+    # file under /etc/pam.d. Without the re-check a vanished target falls
+    # straight through to backup_pam_file -> sudo cp on a missing path, which
+    # under `set -e` aborts the run with nothing but cp's error, after the
+    # fprintd edits are already written. See JOURNAL.md, 2026-09-15.
+    if [ ! -f "$TARGET" ] || ! grep -qE "$PAM_GNOME_KEYRING_AUTH_RE" "$TARGET"; then
+      echo "$TARGET changed since the plan above was printed (gone, or no" >&2
+      echo "auth-phase pam_gnome_keyring.so line any more) - left untouched." >&2
+      continue
+    fi
     if grep -q pam_tpm_keyring_authtok.so "$TARGET"; then
       echo "$TARGET already had the module wired in - left unchanged."
       continue

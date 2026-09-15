@@ -66,7 +66,7 @@ for f in simple-control bracketed-control; do
 done
 
 # --- pam_fprintd idle-timeout logic (bin/lib.sh's PAM_FPRINTD_AUTH_RE,
-# pam_auth_is_fingerprint_only, pam_fprintd_set/clear_unlimited_timeout) ---
+# pam_auth_is_fingerprint_only, pam_fprintd_harden/unharden) ---
 # The dangerous mistake this section exists to catch is applying timeout=-1
 # to a *shared* auth stack: PAM is serialised, so an unlimited fingerprint
 # wait in something like common-auth would mean sudo never reaches its
@@ -77,18 +77,80 @@ for f in fprintd-only simple-control already-patched fprintd-unlimited; do
   check "$f is recognised as a fingerprint-only auth stack" "$got" "yes"
 done
 
-for f in fprintd-shared bracketed-control no-match; do
+for f in fprintd-shared bracketed-control no-match fprintd-dash-auth \
+  fprintd-continuation; do
   if pam_auth_is_fingerprint_only "$FIXTURES/$f"; then got=yes; else got=no; fi
   check "$f is refused (shared stack, or no fingerprint at all)" "$got" "no"
 done
 
-# install.sh's actual eligibility test: hardening would change something, there
-# is exactly one real fprintd auth line to build on, and the stack is
-# fingerprint-only.
+# PAM joins a line ending in a backslash with the next one. Read physically,
+# the pam_unix.so in fprintd-continuation is invisible and the stack reads as
+# fingerprint-only - the same blind spot the leading-dash form had.
+if pam_auth_is_fingerprint_only "$FIXTURES/fprintd-continuation"; then got=yes; else got=no; fi
+check "a module hidden behind a backslash continuation is still seen" "$got" "no"
+
+got="$(_pam_logical_lines "$FIXTURES/fprintd-continuation" | grep -c '^auth.*pam_unix\.so')"
+check "...because the scanners read logical lines, not physical ones" "$got" "1"
+
+for f in fprintd-continuation fprintd-continued-line; do
+  if pam_config_has_no_line_continuations "$FIXTURES/$f"; then got=yes; else got=no; fi
+  check "$f is flagged as carrying line continuations" "$got" "no"
+done
+
+for f in fprintd-only fprintd-shared fprintd-hardened; do
+  if pam_config_has_no_line_continuations "$FIXTURES/$f"; then got=yes; else got=no; fi
+  check "$f has no line continuations" "$got" "yes"
+done
+
+# A second auth path written as "-auth" is still a second auth path. Called
+# out separately from the loop above because it is the one shape that reads
+# as fingerprint-only at a glance.
+if pam_auth_is_fingerprint_only "$FIXTURES/fprintd-dash-auth"; then got=yes; else got=no; fi
+check "a leading-dash '-auth' module counts as another way in" "$got" "no"
+
+# Control field of the service's own fprintd line: the generated attempt lines
+# jump and carry on, so an original that ended the stack on success
+# (sufficient / success=done) or jumped a distance of its own can't be
+# reproduced and has to be refused.
+for f in fprintd-only simple-control fprintd-unlimited fprintd-hardened; do
+  if pam_fprintd_control_falls_through "$FIXTURES/$f"; then got=yes; else got=no; fi
+  check "$f: the fprintd control falls through on success" "$got" "yes"
+done
+
+for f in fprintd-sufficient fprintd-shared; do
+  if pam_fprintd_control_falls_through "$FIXTURES/$f"; then got=yes; else got=no; fi
+  check "$f: control ends the stack or jumps its own distance - refused" "$got" "no"
+done
+
+# the bracketed spelling of "fall through": success=ok records the result and
+# carries on, exactly what success=N does, so it is the one bracketed control
+# that is safe to rebuild as an attempt stack
+printf '#%%PAM-1.0\nauth\t[success=ok default=ignore]\tpam_fprintd.so\nauth\toptional\tpam_gnome_keyring.so\n' \
+  >"$WORKDIR/fprintd-success-ok"
+if pam_fprintd_control_falls_through "$WORKDIR/fprintd-success-ok"; then got=yes; else got=no; fi
+check "a bracketed [success=ok ...] fprintd control falls through" "$got" "yes"
+
+printf '#%%PAM-1.0\nauth\t[default=ignore]\tpam_fprintd.so\nauth\toptional\tpam_gnome_keyring.so\n' \
+  >"$WORKDIR/fprintd-no-success"
+if pam_fprintd_control_falls_through "$WORKDIR/fprintd-no-success"; then got=yes; else got=no; fi
+check "a bracketed control that never says what success does is refused" "$got" "no"
+
+# Numeric jumps above the fprintd line: inserting attempt lines re-aims them.
+for f in fprintd-only simple-control fprintd-hardened; do
+  if pam_auth_has_no_relative_jumps "$FIXTURES/$f"; then got=yes; else got=no; fi
+  check "$f has no relative jump above the fprintd line" "$got" "yes"
+done
+
+if pam_auth_has_no_relative_jumps "$FIXTURES/fprintd-jump"; then got=yes; else got=no; fi
+check "fprintd-jump's success=1 above the reader is spotted" "$got" "no"
+
+# install.sh's actual test, calling the same predicate install.sh does rather
+# than a hand-copied list of its parts: hardening would change something, and
+# the file is eligible (exactly one real fprintd auth line, fingerprint-only
+# stack, a control that falls through, no relative jump above it).
 fprintd_eligible() {
   ! pam_fprintd_harden <"$1" | cmp -s - "$1" \
-    && pam_fprintd_has_single_auth_line "$1" \
-    && pam_auth_is_fingerprint_only "$1"
+    && pam_fprintd_stack_is_eligible "$1"
 }
 
 for f in fprintd-only simple-control fprintd-unlimited; do
@@ -96,10 +158,56 @@ for f in fprintd-only simple-control fprintd-unlimited; do
   check "$f is eligible for the attempt-stack rewrite" "$got" "yes"
 done
 
-for f in fprintd-hardened fprintd-shared no-match; do
+for f in fprintd-hardened fprintd-shared no-match \
+  fprintd-sufficient fprintd-dash-auth fprintd-jump \
+  fprintd-continuation fprintd-continued-line fprintd-dash-second \
+  fprintd-handrolled; do
   if fprintd_eligible "$FIXTURES/$f"; then got=yes; else got=no; fi
   check "$f is correctly skipped (already done, shared stack, or no reader)" "$got" "no"
 done
+
+# The install and uninstall sides have to agree about whose stack a file is.
+# pam_fprintd_has_single_auth_line() counts any authinfo_unavail=ignore line as
+# one this tool generated, which is right for our own output and wrong for a
+# hand-written retry stack that predates it - so eligibility asks
+# pam_fprintd_stack_is_generated() whenever such lines are present.
+if pam_fprintd_stack_is_eligible "$FIXTURES/fprintd-handrolled"; then got=yes; else got=no; fi
+check "a hand-written retry stack is not install.sh's to rewrite" "$got" "no"
+
+if pam_fprintd_stack_is_generated "$FIXTURES/fprintd-handrolled"; then got=yes; else got=no; fi
+check "...and uninstall.sh agrees it is not ours to revert" "$got" "no"
+
+# The second fingerprint line written with a dash has to be counted, or the
+# rewrite leaves it sitting below the generated stack where a jump lands on it.
+got="$(grep -cE "$PAM_FPRINTD_AUTH_RE" "$FIXTURES/fprintd-dash-second")"
+check "both fprintd auth lines are counted, dash form included" "$got" "2"
+
+# a rewritten -auth line keeps its dash on the generated attempts, or a missing
+# pam_fprintd.so would start erroring where the original was silent
+got="$(printf -- '-auth\trequired\tpam_fprintd.so\n' | pam_fprintd_harden | grep -c '^-auth')"
+check "generated attempts keep the leading dash of the line they copy" \
+  "$got" "$PAM_FPRINTD_ATTEMPTS"
+
+# The eligibility check is not a formality install.sh could drop once it has
+# the rewrite in hand: the invariants it checks immediately before writing
+# ("every non-fprintd line identical, N attempt lines, N-1 generated") only
+# compare the rewrite against whatever is on disk, and a *shared* stack
+# satisfies all three of them. That is the shape a package update can leave
+# behind between the plan and the write - hence the re-check at both moments.
+SHARED_REWRITE="$WORKDIR/shared-rewrite"
+pam_fprintd_harden <"$FIXTURES/fprintd-shared" >"$SHARED_REWRITE"
+if diff -q <(grep -vE "$PAM_FPRINTD_AUTH_RE" "$FIXTURES/fprintd-shared") \
+    <(grep -vE "$PAM_FPRINTD_AUTH_RE" "$SHARED_REWRITE") >/dev/null \
+  && [ "$(grep -cE "$PAM_FPRINTD_AUTH_RE" "$SHARED_REWRITE")" = "$PAM_FPRINTD_ATTEMPTS" ] \
+  && [ "$(grep -cE "$PAM_FPRINTD_RETRY_LINE_RE" "$SHARED_REWRITE")" = "$((PAM_FPRINTD_ATTEMPTS - 1))" ]; then
+  got=accepted
+else
+  got=refused
+fi
+check "the write-time invariants alone would accept a shared stack" "$got" "accepted"
+
+if pam_fprintd_stack_is_eligible "$FIXTURES/fprintd-shared"; then got=yes; else got=no; fi
+check "...and only the eligibility check stops it" "$got" "no"
 
 # --- the rewrite itself --------------------------------------------------
 pam_fprintd_harden <"$FIXTURES/fprintd-only" >"$WORKDIR/fprintd-only"
@@ -184,6 +292,92 @@ got="$(pam_fprintd_unharden <"$FIXTURES/fprintd-hardened" \
   | grep -E "$PAM_FPRINTD_AUTH_RE")"
 check "...and that line is the distro's original, options and all" \
   "$got" "$(printf 'auth\trequired\tpam_fprintd.so')"
+
+# --- what uninstall.sh keys off ------------------------------------------
+# The gate has to be "this is a stack we generated", proved by round trip -
+# not "unharden would change something". unharden strips max-tries=1, and
+# Debian's pam-auth-update writes exactly that into common-auth (the
+# fprintd-shared fixture *is* that line), so the loose test offered to
+# "restore" - and would have rewritten - a shared stack install.sh refuses to
+# touch by design. See JOURNAL.md, 2026-09-15.
+if pam_fprintd_stack_is_generated "$FIXTURES/fprintd-hardened"; then got=yes; else got=no; fi
+check "fprintd-hardened is recognised as a stack install.sh wrote" "$got" "yes"
+
+for f in fprintd-shared fprintd-only fprintd-unlimited fprintd-handrolled simple-control; do
+  if pam_fprintd_stack_is_generated "$FIXTURES/$f"; then got=yes; else got=no; fi
+  check "$f is not ours to revert" "$got" "no"
+done
+
+# the regression itself: unharden alone still changes Debian's common-auth,
+# which is why the gate above can't be that
+if pam_fprintd_unharden <"$FIXTURES/fprintd-shared" | cmp -s - "$FIXTURES/fprintd-shared"; then
+  got=unchanged
+else
+  got=changed
+fi
+check "unharden alone does still rewrite common-auth (hence the strict gate)" \
+  "$got" "changed"
+
+# a stack written with some other attempt count has to round-trip too, or
+# changing PAM_FPRINTD_ATTEMPTS later would strand every existing install
+_pam_fprintd_rewrite_stack 5 <"$FIXTURES/fprintd-only" >"$WORKDIR/five-attempts"
+if pam_fprintd_stack_is_generated "$WORKDIR/five-attempts"; then got=yes; else got=no; fi
+check "a stack written with a different attempt count is still recognised" "$got" "yes"
+
+# --- restoring the distro's exact original line --------------------------
+# unharden only removes what install.sh adds, so a distro that had set its own
+# timeout= gets the module default back, not its value. The .bak-<timestamp>
+# copy is the only place that value still exists, hence
+# pam_fprintd_exact_original().
+EX="$WORKDIR/exact"
+mkdir -p "$EX"
+sed -E 's/^(auth\trequired\tpam_fprintd\.so)$/\1 timeout=45 max-tries=2/' \
+  "$FIXTURES/fprintd-only" >"$EX/svc.bak-20260101010101"
+pam_fprintd_harden <"$EX/svc.bak-20260101010101" >"$EX/svc"
+
+got="$(pam_fprintd_exact_original "$EX/svc" || echo none)"
+check "the pre-install backup is found as the exact original" \
+  "$got" "$EX/svc.bak-20260101010101"
+
+got="$(pam_fprintd_unharden <"$EX/svc" | grep -cE "${PAM_FPRINTD_AUTH_RE}.*timeout=45" || true)"
+check "unharden alone cannot bring the distro's own timeout=45 back" "$got" "0"
+
+got="$(grep -cE "${PAM_FPRINTD_AUTH_RE}.*timeout=45" "$EX/svc.bak-20260101010101")"
+check "...but restoring that backup does" "$got" "1"
+
+# newest wins, and a backup that is itself a hardened stack is not an original
+cp "$EX/svc" "$EX/svc.bak-20270101010101"
+got="$(pam_fprintd_exact_original "$EX/svc" || echo none)"
+check "a backup that is itself hardened is not mistaken for the original" \
+  "$got" "$EX/svc.bak-20260101010101"
+
+# a backup that isn't the direct ancestor (something edited the file since)
+# must not be restored over newer content
+printf 'session\toptional\tpam_gnome_keyring.so auto_start\n' >>"$EX/svc"
+got="$(pam_fprintd_exact_original "$EX/svc" || echo none)"
+check "a stale backup is refused once the file has moved on" "$got" "none"
+
+# and with no backup beside it at all, there is nothing to restore
+cp "$FIXTURES/fprintd-hardened" "$EX/lonely"
+got="$(pam_fprintd_exact_original "$EX/lonely" || echo none)"
+check "no backup beside the file means no exact restore" "$got" "none"
+
+# --- /etc/pam.d/ entries that aren't services ----------------------------
+# .bak-<ts> is this tool's own, the rest is what the package managers leave
+# behind. They all carry real auth lines and PAM never reads any of them.
+for f in gdm-password.bak-20260914231615 gdm-password.bak-1.bak-2 \
+  gdm-fingerprint.pacnew common-auth.rpmnew common-auth.rpmsave \
+  gdm-password.dpkg-old gdm-password.dpkg-dist common-auth.ucf-old; do
+  if [[ "/etc/pam.d/$f" =~ $PAM_NON_SERVICE_RE ]]; then got=skipped; else got=scanned; fi
+  check "/etc/pam.d/$f is skipped as a non-service file" "$got" "skipped"
+done
+
+# ...while the directory's own dot must not take real services with it
+for f in gdm-fingerprint gdm-password common-auth common-session-noninteractive \
+  sudo-i runuser-l sssd-shadowutils; do
+  if [[ "/etc/pam.d/$f" =~ $PAM_NON_SERVICE_RE ]]; then got=skipped; else got=scanned; fi
+  check "/etc/pam.d/$f is still scanned" "$got" "scanned"
+done
 
 echo
 if [ "$fail" -eq 0 ]; then

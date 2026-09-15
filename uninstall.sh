@@ -17,6 +17,19 @@ confirm() {
   [[ ! "$ans" =~ ^[Nn][Oo]?$ ]]
 }
 
+# One timestamp for the whole run, so a file touched by two different steps
+# below gets exactly one backup, holding its pristine pre-run content - same
+# rule install.sh follows.
+RUN_TS="$(date +%Y%m%d%H%M%S)"
+
+# Backs a PAM file up before its first modification in this run. Undoing an
+# edit to a login-critical file is still an edit to a login-critical file, so
+# it gets the same .bak-<timestamp> copy the install side takes.
+backup_pam_file() {
+  local f="$1" bak="$1.bak-$RUN_TS"
+  [ -e "$bak" ] || sudo cp "$f" "$bak"
+}
+
 # Every prompt below defaults to yes, so a run with no terminal must not be
 # allowed to answer them by hitting EOF. read() failing counts as "no" in
 # confirm() for that reason, but bail out up front anyway rather than
@@ -36,29 +49,93 @@ echo
 # line (gdm-password included, once system-wide fingerprint auth is on).
 for f in /etc/pam.d/*; do
   [ -f "$f" ] || continue
-  if [[ "$f" =~ $PAM_BACKUP_RE ]]; then continue; fi
+  if [[ "$f" =~ $PAM_NON_SERVICE_RE ]]; then continue; fi
   if grep -q pam_tpm_keyring_authtok.so "$f"; then
     echo "Found the injected line in $f"
     if confirm "Remove it?"; then
+      backup_pam_file "$f"
       sudo sed -i '/pam_tpm_keyring_authtok\.so/d' "$f"
-      echo "Removed."
+      echo "Removed (previous content backed up as $f.bak-$RUN_TS)."
     fi
   fi
 done
 
 # --- 1b. undo the fingerprint attempt-stack edit -------------------------
-# Drops the attempt lines install.sh generated and the timeout=-1 it set,
-# putting the service back on a single pam_fprintd.so line with the module's
-# own defaults (30s idle, and one bad scan ends fingerprint for that prompt -
-# see JOURNAL.md, 2026-09-14). If the line carried some other explicit timeout
-# before install.sh replaced it, the exact original is in the .bak-<timestamp>
-# copy install.sh left beside the file.
+# Two ways back, best first:
+#
+#   exact     restore the .bak-<timestamp> copy install.sh took before it
+#             edited the file - but only one that is provably the direct
+#             ancestor of what's on disk now (see pam_fprintd_exact_original
+#             below). This is the only path that brings back an explicit
+#             timeout=/max-tries= the distro had set, since unharden has no
+#             way to know what was there before.
+#   defaults  failing that, strip the attempt lines and the options install.sh
+#             set, leaving one pam_fprintd.so line on the module's own
+#             defaults (30s idle, and one bad scan ends fingerprint for that
+#             prompt - see JOURNAL.md, 2026-09-14).
+#
+# pam_fprintd_stack_is_generated() is the gate, not "unharden would change
+# something": unharden strips max-tries=1, which Debian's pam-auth-update
+# writes into common-auth itself, so the looser test offered to "restore" a
+# shared stack install.sh refuses to touch by design. A file that carries our
+# attempt lines but fails that gate has been edited since, so it gets a
+# warning rather than a silent skip - it is the one case where the user walks
+# away thinking everything is reverted when it isn't. See JOURNAL.md,
+# 2026-09-15.
+
 for f in /etc/pam.d/*; do
   [ -f "$f" ] || continue
-  if [[ "$f" =~ $PAM_BACKUP_RE ]]; then continue; fi
-  if pam_fprintd_unharden <"$f" | cmp -s - "$f"; then continue; fi
-  echo "Found install.sh's fingerprint attempt stack in $f"
-  if confirm "Put it back to a single pam_fprintd.so line with module defaults?"; then
+  if [[ "$f" =~ $PAM_NON_SERVICE_RE ]]; then continue; fi
+
+  HAS_ATTEMPTS=false
+  if grep -qE "$PAM_FPRINTD_RETRY_LINE_RE" "$f"; then HAS_ATTEMPTS=true; fi
+  # timeout=-1 is this tool's signature on its own: no distro ships it, and
+  # unlike max-tries=1 (which Debian's own pam-auth-update writes into
+  # common-auth) it cannot be confused with somebody else's config. Checked
+  # separately so a file whose attempt lines are gone but whose options are
+  # still ours - a partial hand edit - is still offered, instead of being
+  # skipped in silence with this tool's settings left on a login path.
+  HAS_OUR_OPTS=false
+  if grep -qE "${PAM_FPRINTD_AUTH_RE}.*timeout=-1" "$f"; then HAS_OUR_OPTS=true; fi
+  if [ "$HAS_ATTEMPTS" = false ] && [ "$HAS_OUR_OPTS" = false ]; then continue; fi
+
+  if [ "$HAS_ATTEMPTS" = true ] && ! pam_fprintd_stack_is_generated "$f"; then
+    echo "$f carries fingerprint attempt lines with this tool's marker" >&2
+    echo "(authinfo_unavail=ignore), but the file is not what install.sh" >&2
+    echo "would have written - either something edited it since, or it was" >&2
+    echo "somebody's own retry stack all along. Left untouched rather than" >&2
+    echo "guessed at." >&2
+    if compgen -G "$f.bak-*" >/dev/null; then
+      echo "There is a pre-install copy beside it, if it was ours:" >&2
+      # shellcheck disable=SC2012
+      ls -1 "$f".bak-* >&2
+    fi
+    echo >&2
+    continue
+  fi
+
+  if [ "$HAS_ATTEMPTS" = true ]; then
+    echo "Found install.sh's fingerprint attempt stack in $f"
+  else
+    echo "Found install.sh's timeout=-1 on the pam_fprintd.so line in $f"
+    echo "(its attempt lines are already gone - only the options are left)"
+  fi
+  ORIGINAL="$(pam_fprintd_exact_original "$f" || true)"
+  if [ -n "$ORIGINAL" ]; then
+    PROMPT="Restore the original line exactly, from $(basename "$ORIGINAL")?"
+  else
+    PROMPT="Put it back to a single pam_fprintd.so line with module defaults?"
+  fi
+  if confirm "$PROMPT"; then
+    if [ -n "$ORIGINAL" ]; then
+      backup_pam_file "$f"
+      # cp *onto* the existing file rather than replacing it, so its mode and
+      # ownership stay exactly as the distro shipped them.
+      sudo cp "$ORIGINAL" "$f"
+      echo "Restored exactly, from $ORIGINAL"
+      echo "(previous content backed up as $f.bak-$RUN_TS)."
+      continue
+    fi
     REWRITTEN="$(mktemp)"
     pam_fprintd_unharden <"$f" >"$REWRITTEN"
     # same invariant install.sh writes under: every non-fprintd line identical,
@@ -68,8 +145,11 @@ for f in /etc/pam.d/*; do
       && [ "$(grep -cE "$PAM_FPRINTD_AUTH_RE" "$REWRITTEN")" = 1 ] \
       && ! grep -qE "$PAM_FPRINTD_RETRY_LINE_RE" "$REWRITTEN" \
       && ! grep -qE "${PAM_FPRINTD_AUTH_RE}.*timeout=-1" "$REWRITTEN"; then
+      backup_pam_file "$f"
       sudo cp "$REWRITTEN" "$f"
-      echo "Restored."
+      echo "Restored to the module's defaults (no pre-install copy of this file"
+      echo "was found, so an explicit timeout= it may have had is not back)."
+      echo "Previous content backed up as $f.bak-$RUN_TS."
     else
       echo "Unexpected result rewriting $f - left it untouched." >&2
     fi

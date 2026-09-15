@@ -29,8 +29,15 @@ actually runs there, never skips.
   back, and — the one that actually matters — that a *shared* stack like
   `common-auth` is refused, since PAM is serialised and an unlimited
   fingerprint wait there would hang `sudo` before it ever reached the password
-  prompt. The PAM control flow of the generated stack is covered by
-  `runtime-test.sh` below, against real libpam.
+  prompt. The other refusals have a fixture each: a `sufficient` fingerprint
+  line (`fprintd-sufficient`), a relative jump above the reader
+  (`fprintd-jump`), a second auth path written with a leading dash
+  (`fprintd-dash-auth`), and someone's hand-written retry stack
+  (`fprintd-handrolled`, which `uninstall.sh` must not claim as its own).
+  Plus which `/etc/pam.d/` entries count as services at all — `.bak-<ts>`,
+  `.pacnew`, `.rpmsave`, `.dpkg-old` and friends are not. The PAM control flow
+  of the generated stack is covered by `runtime-test.sh` below, against real
+  libpam.
 - **`test/runtime-test.sh`** (one container, distro doesn't matter) — the
   compiled PAM module's actual fork/exec/pipe/timeout/`PAM_AUTHTOK` logic,
   using `pamtester` + a fake helper script standing in for

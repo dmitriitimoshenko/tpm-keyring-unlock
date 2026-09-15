@@ -1,0 +1,10 @@
+#%PAM-1.0
+# Somebody's own two-attempt stack, written by hand before this tool existed.
+# It carries authinfo_unavail=ignore, which is the marker pam_fprintd_harden()
+# uses for lines it generated itself, so unharden reads that first line as
+# ours and drops it. uninstall.sh must not offer to "restore" this file - the
+# round-trip check in pam_fprintd_stack_is_generated() is what stops it.
+# See JOURNAL.md, 2026-09-15.
+auth	[success=1 authinfo_unavail=ignore default=ignore]	pam_fprintd.so
+auth	required	pam_fprintd.so
+auth	optional	pam_gnome_keyring.so

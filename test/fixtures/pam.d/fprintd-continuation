@@ -1,0 +1,10 @@
+#%PAM-1.0
+# A second way in, hidden by PAM's backslash line continuation: "auth \" has
+# no module token on it, and the line that completes it does not start with
+# "auth". Read physically, the pam_unix.so is invisible and this looks
+# fingerprint-only; read as PAM reads it, it is a shared stack. Must be
+# refused. See JOURNAL.md, 2026-09-15.
+auth	required	pam_fprintd.so
+auth \
+	required	pam_unix.so
+auth	optional	pam_gnome_keyring.so

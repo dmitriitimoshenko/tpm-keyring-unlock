@@ -1,0 +1,11 @@
+#%PAM-1.0
+# The standard "this group skips the reader" idiom: success=1 is counted in
+# modules from where that line sits, and it was aimed just past the single
+# pam_fprintd.so line. Inserting two attempt lines above that line re-aims
+# it at the second attempt instead, silently - and the "every other line is
+# byte-for-byte identical" invariant can't see it, because a jump's meaning
+# is positional. Must be refused. See JOURNAL.md, 2026-09-15.
+auth	requisite	pam_nologin.so
+auth	[success=1 default=ignore]	pam_succeed_if.so user ingroup nopasswdlogin
+auth	required	pam_fprintd.so
+auth	optional	pam_gnome_keyring.so

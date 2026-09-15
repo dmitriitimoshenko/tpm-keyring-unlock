@@ -1,0 +1,9 @@
+#%PAM-1.0
+# Two fingerprint auth lines, the second written with a leading dash. If the
+# counting regex ignores the dash form, this reads as "exactly one line to
+# build on" while the rewrite leaves the second one below the generated stack
+# - and a matched finger, having jumped over the remaining attempts, lands on
+# it and is asked to scan again. Must be refused. See JOURNAL.md, 2026-09-15.
+auth	required	pam_fprintd.so
+-auth	required	pam_fprintd.so
+auth	optional	pam_gnome_keyring.so

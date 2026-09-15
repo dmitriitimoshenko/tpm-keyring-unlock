@@ -2417,3 +2417,530 @@ and because bolting a second group-borrowing mechanism on right before
 shipping trades a clean graceful fallback for fresh untested risk. Worth
 revisiting if Arch support matters later; the fallback path is correct today,
 just costs a second run.
+
+## Review of the `feat/fingerprint-attempt-stack` branch (2026-09-15)
+
+Security-focused read of 1bb0d7e against `main`, with every claim below
+reproduced by running `bin/lib.sh`'s functions against throwaway fixtures
+(nothing under `/etc/pam.d/` was touched). Recording the findings here
+because three of them are in the *safety* predicates, which is exactly the
+kind of thing a diff doesn't show and a re-read six months from now would
+have to re-derive.
+
+### 1. `uninstall.sh` edits `/etc/pam.d/` files this tool never touched, without a backup
+
+`uninstall.sh`'s new loop (1b, lines 49-77) runs `pam_fprintd_unharden`
+over *every* file in `/etc/pam.d/` and rewrites any file whose content
+changes. But `unharden` strips `max-tries=1` unconditionally, and Debian's
+own `pam-auth-update` writes exactly that into `common-auth`:
+
+    auth [success=3 default=ignore] pam_fprintd.so max-tries=1 timeout=10
+
+Reproduced against `test/fixtures/pam.d/fprintd-shared` (that fixture *is*
+the Debian shape) and against a full hand-written `common-auth`:
+
+    $ source bin/lib.sh
+    $ diff <(pam_fprintd_unharden <test/fixtures/pam.d/fprintd-shared) \
+           test/fixtures/pam.d/fprintd-shared
+    < auth [success=3 default=ignore] pam_fprintd.so timeout=10 # debug
+    > auth [success=3 default=ignore] pam_fprintd.so max-tries=1 timeout=10 # debug
+
+All four of the invariants the loop checks before writing pass on that
+result (every non-fprintd line identical, exactly one fprintd auth line, no
+generated lines, no `timeout=-1`), so it gets written. The prompt claims
+"Found install.sh's fingerprint attempt stack in /etc/pam.d/common-auth",
+which is false - `install.sh` refuses `common-auth` by design, and
+`pam_auth_is_fingerprint_only` correctly says no for it. Worse, that loop
+has no `backup_pam_file` equivalent: `install.sh` backs every PAM file up,
+`uninstall.sh` does not, and the prompt now defaults to yes.
+
+Root cause: `install.sh` gates on three predicates (single real fprintd
+line, fingerprint-only stack, hardening would change something);
+`uninstall.sh` gates only on "unharden changes something", which is a much
+weaker and *differently shaped* condition. The un-install side has to be at
+least as narrow as the install side, and the cheapest way to make it so is
+to key off the generated attempt lines (`PAM_FPRINTD_RETRY_LINE_RE`) rather
+than off "any diff", plus reuse `backup_pam_file`.
+
+Same root cause, second symptom: a hand-written stack that happens to carry
+its own `authinfo_unavail=ignore` on an fprintd auth line has that line
+*deleted* by the same loop, because `unharden` treats it as generated.
+
+### 2. The attempt stack changes the meaning of a `sufficient` fprintd line
+
+`_pam_fprintd_rewrite_stack` gives every generated line `success=N`, a
+relative jump that continues the stack. That is equivalent to the original
+control only when the original was fall-through (`required`, `optional`).
+For `sufficient` (i.e. `success=done`) it is not, and the difference is not
+academic - the classic hand-rolled fingerprint-only stack is:
+
+    auth sufficient pam_fprintd.so
+    auth required   pam_deny.so
+
+Both modules are on `PAM_AUTH_PASSIVE_MODULE_RE`, so
+`pam_auth_is_fingerprint_only` accepts the file and `install.sh` rewrites
+it. After the rewrite a match on attempt 1 jumps over attempts 2-3 and
+lands on `pam_deny.so`: a good finger now *fails* the login. Only a match
+on the third line (which keeps the distro's `sufficient`) still works.
+Fails closed, so it is not an auth bypass - but it silently breaks
+fingerprint login on a shape the eligibility check explicitly admits.
+`test/runtime-test.sh`'s flow cases all use `required`, so nothing catches
+it.
+
+### 3. `-auth` lines are invisible to the fingerprint-only predicate
+
+`pam_auth_is_fingerprint_only` matches `^[[:space:]]*auth[[:space:]]`. PAM
+also accepts a leading `-` ("skip silently if the module is missing"), used
+in the wild for `pam_systemd_home.so`, `pam_fscrypt.so` and friends. A
+stack containing
+
+    -auth [success=1 default=ignore] pam_systemd_home.so
+    auth  required                   pam_fprintd.so
+
+is reported fingerprint-only, which is exactly the misclassification the
+predicate exists to prevent: there *is* another auth path in the same
+serialised stack, and `timeout=-1` can keep it from ever being reached.
+
+### 4. Relative jumps above the fprintd line silently change meaning
+
+Hardening inserts two lines above the original, so any numeric jump on a
+line *above* it (`auth [success=1 default=ignore] pam_succeed_if.so ...`,
+the standard "this group skips fingerprint" idiom) now lands two modules
+short of where it was aimed. `install.sh`'s invariant - every non-fprintd
+line byte-for-byte identical - reads like it guarantees nothing else
+changed, but a jump's meaning is positional, so identical bytes are not
+identical semantics. In the plausible shapes this fails closed (someone who
+was meant to skip the reader is now asked for a finger), but the predicate
+should refuse files carrying numeric jumps above the fprintd line rather
+than rely on that.
+
+### 5. Prompts now default to yes on irreversible / login-critical steps
+
+`confirm()` in both scripts became `[Y/n]`, and `bin/seal.sh`'s overwrite
+prompt with it, so Enter now *destroys an existing seal* where it used to
+decline. The answer test is `[[ ! "$ans" =~ ^[Nn][Oo]?$ ]]`, so anything
+that isn't exactly n/N/no/No - "nope", "nah", a stray space - counts as
+yes. Deliberate UX choice (see b6d19c7), and EOF correctly declines, but it
+sits against this repo's own "default to whichever option is more careful
+with data" rule for the two cases that are hard to reverse: overwriting a
+working seal, and editing a PAM file.
+
+### 6. The backup-file filter is narrower than the file zoo in `/etc/pam.d/`
+
+`PAM_BACKUP_RE='\.bak-[0-9]+$'` covers this tool's own backups only.
+`.pacnew` (Arch, routine), `.rpmnew` / `.rpmsave` (Fedora/openSUSE),
+`.dpkg-old` / `.dpkg-dist` / `.ucf-old` (Debian) all sit in `/etc/pam.d/`,
+all carry real auth lines, and all still get picked up by both the
+gnome-keyring wiring loop and the new fprintd loops - the same bug class
+the branch just fixed for `.bak-<ts>`. PAM only reads the file whose name
+matches the service, so this is noise rather than danger, but it is the
+same fix: skip anything that is not a plausible service name.
+
+No change was made to the code as part of this review.
+
+## Fixes for the branch review (2026-09-15, later)
+
+Applied 1, 2, 3, 4 and 6 from the review entry above. 5 (prompts defaulting
+to yes) was left as it is - deliberate UX call, see b6d19c7.
+
+### `uninstall.sh` now reverts only stacks it can prove it wrote (fix 1)
+
+New `pam_fprintd_stack_is_generated()` in `bin/lib.sh`, and that is what the
+1b loop gates on instead of "unharden would change something". It proves
+authorship by round trip: strip the file back down with `unharden`, build it
+up again with the attempt count *read off the file*, require the result to
+equal the file byte for byte. Reading the count off the file rather than
+using `PAM_FPRINTD_ATTEMPTS` means changing that constant later doesn't
+strand existing installs - there's a test for exactly that.
+
+Evidence the loose gate was wrong, from this machine:
+
+    $ grep fprintd /etc/pam.d/common-auth /usr/share/pam-configs/fprintd
+    /etc/pam.d/common-auth:auth [success=3 default=ignore] pam_fprintd.so timeout=10 # debug
+    /usr/share/pam-configs/fprintd: [success=end default=ignore] pam_fprintd.so max-tries=1 timeout=10 # debug
+
+The shipped `pam-configs` snippet carries `max-tries=1`, so the next
+`pam-auth-update` (any gdm/fprintd package update runs one) writes that into
+`common-auth` - and `unharden` strips `max-tries=1` unconditionally, so from
+that moment the old loop would have offered to "restore" `common-auth`, and
+written it. All four of its invariants pass on that rewrite, so nothing
+downstream would have stopped it. The `fprintd-shared` fixture is that exact
+line; `test/unit-regex-test.sh` now asserts both halves (unharden alone still
+changes it; the new gate refuses it).
+
+Both PAM-editing loops in `uninstall.sh` also take a `.bak-<timestamp>` copy
+now, via the same `backup_pam_file` helper `install.sh` has. Undoing an edit
+to a login-critical file is still an edit to a login-critical file, and
+CLAUDE.md asks for a backup before every one of those - the install side had
+it, the uninstall side didn't.
+
+### The rewrite refuses control fields it can't reproduce (fix 2)
+
+`pam_fprintd_control_falls_through()`. The generated attempt lines use
+`success=N` - a jump that records success and carries on. That matches
+`required` / `requisite` / `optional` / `[…success=ok…]` and nothing else.
+`sufficient` is `success=done`: it *ends* the stack. So on
+
+    auth sufficient pam_fprintd.so
+    auth required   pam_deny.so
+
+- every module of which is on `PAM_AUTH_PASSIVE_MODULE_RE`, so it sailed
+through `pam_auth_is_fingerprint_only()` - a match on attempt 1 or 2 would
+jump over the remaining attempts and land on `pam_deny.so`: a *correct*
+finger fails the login. Fails closed, so not a bypass, but it breaks
+fingerprint login on a shape the eligibility check admitted. A bracketed
+`success=<number>` is refused for the related reason: its jump distance was
+measured from where that one line sat and can't be reproduced on three lines
+in three places.
+
+Refused rather than translated. Generating `success=done` for a `sufficient`
+original would be faithful, but it is a login path, the runtime test only
+covers `required`, and `gdm-fingerprint` - the service this feature exists
+for - ships `auth required`. Not worth the risk for the little it buys. Worth
+knowing this shape is real: `/etc/pam.d/sudo` on this machine is
+`auth sufficient pam_fprintd.so` (it's refused earlier anyway, as a shared
+stack).
+
+### `-auth` lines are no longer invisible (fix 3)
+
+`pam_auth_is_fingerprint_only()` matched `^\s*auth\s`, and PAM also accepts a
+leading `-` ("skip silently if the module isn't installed"), used in the wild
+for `pam_systemd_home.so` and `pam_fscrypt.so`. A stack with
+`-auth [success=1 default=ignore] pam_systemd_home.so` above the reader was
+reported fingerprint-only - the exact misclassification the predicate exists
+to prevent, since that *is* a second auth path in the same serialised stack.
+Now `-?auth`.
+
+### Relative jumps above the reader are refused (fix 4)
+
+`pam_auth_has_no_relative_jumps()`. Hardening inserts two lines above the
+fprintd line, so a jump on any line above it - `auth [success=1
+default=ignore] pam_succeed_if.so user ingroup nopasswdlogin`, the standard
+"this group skips the reader" idiom - ends up aimed at attempt 2 instead of
+past the reader.
+
+The uncomfortable part is that `install.sh`'s write invariant (every
+non-fprintd line byte-for-byte identical) *reads* like it rules this out. It
+doesn't: a jump's meaning is positional, so identical bytes are not identical
+semantics. Lines below the fprintd line are fine - nothing is inserted
+between them and what they aim at - which is why the predicate stops at the
+fprintd line rather than scanning the whole file.
+
+### The non-service filter covers the whole zoo (fix 6)
+
+`PAM_BACKUP_RE` (`\.bak-[0-9]+$`, this tool's own backups) became
+`PAM_NON_SERVICE_RE` (`(^|/)[^/]*\.[^/]*$`, "the basename has a dot").
+`.pacnew` is routine on Arch, `.rpmnew`/`.rpmsave` on Fedora and openSUSE,
+`.dpkg-old`/`.dpkg-dist`/`.ucf-old` on Debian - all sit in `/etc/pam.d/`, all
+carry real auth lines, all were still being scanned and patched. Same bug
+class the branch had just fixed for its own backups. Matched on the basename
+because the directory part contains a dot itself (`pam.d`) - there is a test
+for that, and one asserting real service names with hyphens
+(`common-session-noninteractive`, `sudo-i`, `runuser-l`) still get scanned.
+
+Checked the dot rule against every service on this machine and every one the
+five packaging containers install: none has a dot in its name.
+
+### Also
+
+- README's intro still said the installer stops after the `tss` group add and
+  asks for a re-run. `sg` removed that a commit earlier; the plan text in
+  `install.sh` already said so. Fixed, with the Arch (no `sg`) exception.
+- New fixtures: `fprintd-sufficient`, `fprintd-jump`, `fprintd-dash-auth`,
+  `fprintd-handrolled`. The last one is somebody's hand-written two-attempt
+  stack carrying `authinfo_unavail=ignore` - `unharden` reads that line as one
+  of ours and deletes it, which is the second symptom of the fix-1 root cause
+  and is what the round-trip gate now refuses.
+- `test/unit-regex-test.sh`: 26 new checks, whole suite green (55 checks).
+
+## Uninstall completeness: exact restore, and no more silent skips (2026-09-15, later still)
+
+Prompted by asking the plain question - "does uninstall.sh actually undo
+everything?" - and walking install.sh's steps against it one by one. Two gaps
+worth fixing came out of that; a third (packages are never removed, backups
+are never cleaned) was left alone deliberately.
+
+### The fingerprint line came back on module defaults, not as it was
+
+`pam_fprintd_unharden` removes exactly the options `harden` adds. That is the
+right inverse for the bare `auth required pam_fprintd.so` gdm ships, and the
+wrong one for a stack that had its own explicit `timeout=`/`max-tries=`: those
+values are simply gone, and nothing in the file records what they were. The
+only place they still exist is the `.bak-<timestamp>` copy install.sh took.
+
+New `pam_fprintd_exact_original()` in `bin/lib.sh` picks that copy, and
+uninstall.sh restores it wholesale when it exists. The interesting part is
+when a backup may be trusted, since restoring a stale one over newer content
+would be its own bug:
+
+- the backup holds exactly one pam_fprintd.so auth line and no generated
+  attempt lines, so it is a pre-edit original rather than another hardened
+  copy (install.sh re-runs can leave those around);
+- `pam_fprintd_harden <backup>` reproduces the current file **byte for byte**.
+
+The second condition is the load-bearing one. It can only hold if every
+non-fprintd line in the backup already matches what is on disk, so a gdm
+upgrade or an unrelated hand edit since the install makes the backup
+un-restorable automatically - no need to reason about which lines changed.
+That is also what makes copying the *whole* backup back safe rather than
+having to splice the fprintd lines out of it.
+
+Newest backup first. A re-run of install.sh on an already-hardened file takes
+no new backup (it isn't a target), so every copy that passes both conditions
+carries the same original line anyway.
+
+Ordering detail that makes this work in practice: uninstall.sh's step 1
+removes the `pam_tpm_keyring_authtok.so` line *before* step 1b runs, and
+install.sh's single-backup-per-run rule means the backup predates both edits.
+So by the time 1b looks, the file is exactly `harden(backup)` again. If the
+user declines step 1, the round trip won't match and 1b falls back to module
+defaults - correct, and it says which of the two it did.
+
+Verified against this machine's real `/etc/pam.d/gdm-fingerprint` and its
+three `.bak-*` copies, on throwaway duplicates: all three qualify, the newest
+is picked, and the restored file is byte-identical to the pre-install backup.
+
+### A file edited since the install was skipped without a word
+
+The stricter gate added earlier today (`pam_fprintd_stack_is_generated`) is
+right, but its failure mode was a silent `continue`: a `gdm-fingerprint` that
+somebody had touched since - or that a gdm upgrade half-replaced - would carry
+three fprintd lines forever while the uninstaller printed nothing and the user
+concluded it had all been undone. Now the file is checked for our attempt
+lines *first*, and a file that has them but fails the round trip gets an
+explicit warning naming the file and pointing at the `.bak-<timestamp>` copy.
+
+Silence is the worst option for that case specifically: not reverting is a
+defensible choice, not *saying* so is not.
+
+### Left alone on purpose
+
+- **Packages.** `install.sh` may install `tpm2-tools`, `gcc`, `libpam0g-dev`
+  and friends; `uninstall.sh` removes none of them. Uninstalling a compiler
+  or `tpm2-tools` that may well have predated this tool is exactly the kind
+  of irreversible-in-the-wrong-direction step this repo's rules say to avoid.
+- **`.bak-<timestamp>` copies.** They accumulate (28 in `/etc/pam.d/` on this
+  machine already), and now the uninstall side adds its own. Deleting a
+  login-critical file's only backup to tidy up is a bad trade; leaving them is
+  the safe default. Worth revisiting as a *listing* at the end of a run rather
+  than a deletion.
+
+Tests: 6 new checks for `pam_fprintd_exact_original` (found, newest wins, a
+hardened backup isn't an original, a stale backup is refused, no backup at
+all, and that unharden alone genuinely cannot bring a `timeout=45` back).
+Whole regex suite green at 84 checks.
+
+## Eligibility is now re-proved immediately before the write (2026-09-15, still later)
+
+Found on a second, deliberately cold read of the branch. `install.sh` decides
+which `/etc/pam.d/` files may be rewritten in section 1e, prints that plan,
+and writes in section 3 - and section 3 begins with `apt install` /
+`dnf install` / `pacman -Sy` / `zypper install`. On Debian and Ubuntu that
+step can regenerate files under `/etc/pam.d/` all by itself:
+`libpam-runtime`'s postinst runs `pam-auth-update`, and a `gdm` upgrade ships
+its own `gdm-fingerprint`. Nothing in the branch is unusual here - it is the
+ordinary shape of "plan, then act" - but the two moments are not the same
+moment, and the gap contains a package manager.
+
+The checks section 3 already did before writing are about *faithfulness*:
+every non-fprintd line byte for byte identical, exactly N attempt lines, N-1
+generated. They compare the rewrite against whatever is on disk at that
+instant. They say nothing about whether that content is still a file this tool
+may touch. Demonstrated on a copy of `test/fixtures/pam.d/fprintd-only` with
+one line added:
+
+    eligible before: yes
+    eligible after:  no          # gained "auth required pam_unix.so"
+    >>> write-time invariants ACCEPT this file
+
+So the failure mode was: a target that turned into a shared stack between the
+plan and the write gets `timeout=-1` anyway - the one outcome the whole
+predicate apparatus exists to prevent (PAM is serialised; an unlimited
+fingerprint wait in a stack that also holds `pam_unix` means `sudo` never
+reaches its password prompt).
+
+Fix: the eligibility rule moved into one function, `pam_fprintd_stack_is_eligible()`
+in `bin/lib.sh`, and `install.sh` applies it twice - at plan time, and again
+immediately before `sudo cp`. A file that no longer qualifies is named, with
+the reason, and skipped rather than written. "Hardening would change
+something" is deliberately left out of that function and asked separately at
+both call sites, so "already in the target state" stays distinguishable from
+"not eligible".
+
+Verified end to end on throwaway copies, with the package update simulated
+between the two phases:
+
+    == plan: both files eligible ==
+    == (file mutated) ==
+    REFUSED: gdm-fingerprint - changed since the plan, left alone
+    Rewritten: untouched
+    gdm-fingerprint: 0 lines with timeout=-1
+    untouched:       3 lines with timeout=-1
+
+Second thing this fixed, quieter but worth recording: `test/unit-regex-test.sh`
+had its own hand-copied list of the eligibility predicates. A test that
+re-implements the rule it is testing cannot catch the rule changing in one
+place and not the other - exactly the drift `bin/lib.sh` exists to prevent.
+It now calls `pam_fprintd_stack_is_eligible()` itself, and there are two new
+checks asserting the split: the write-time invariants alone *do* accept
+`fprintd-shared`, and only the eligibility check refuses it. 86 checks green.
+
+### Noted in the same pass, not fixed
+
+- `pam/tpm-keyring-unseal.sh:26` opens `/run/lock/tpm-keyring-unseal.lock`,
+  and `/run/lock` is world-writable + sticky (1777). Root creating a fixed
+  name there is only safe because of `fs.protected_symlinks=1` /
+  `fs.protected_regular=2` (both confirmed on in this machine's sysctls).
+  Without them an unprivileged local user can plant a symlink and have root
+  truncate an arbitrary file. `/run/tpm-keyring-unlock.lock` (the directory is
+  root-owned 755) removes the dependency on a kernel default. Predates this
+  branch.
+- `pam/pam_tpm_keyring_authtok.c:179,188,198` - `memset()` on the password
+  buffer is a dead store the compiler may legally remove; `explicit_bzero()`
+  is the guaranteed form. Predates this branch.
+- `install.sh:260` - `pacman -Sy --needed` without `-u` is the classic Arch
+  partial-upgrade footgun. Predates this branch.
+
+## Fixes from the multi-agent code review (2026-09-15, last pass)
+
+A `/code-review max` pass over the branch turned up thirteen items. Nine were
+real once reproduced by hand; the rest are recorded at the bottom with why
+they were not acted on. Everything below was verified on fixtures before and
+after the change.
+
+### Backslash line continuations were a blind spot (bin/lib.sh)
+
+PAM joins a line ending in `\` with the next one. Every scanning predicate
+here read physical lines, so:
+
+    auth \
+    	required	pam_unix.so
+
+was invisible to `pam_auth_is_fingerprint_only()` - the first physical line
+has no module token to check, the second does not start with `auth` - and a
+shared stack came back as fingerprint-only, `eligible=YES`. Exactly the hole
+the leading-dash `-auth` form had a few hours earlier, from exactly the same
+cause: treating a PAM config as if one line were one directive.
+
+Fixed by reading through a new `_pam_logical_lines()` that folds continuations
+the way libpam does; all three scanning predicates now iterate that instead of
+the file.
+
+### ...and the rewriter corrupted a continued fprintd line
+
+Same feature, other half. `_pam_fprintd_rewrite_stack()` appends
+`timeout=-1 max-tries=1` to the end of the physical `pam_fprintd.so` line. If
+that line ends in a continuation, the options land *after* the backslash:
+
+    auth	[success=2 ...]	pam_fprintd.so \ timeout=-1 max-tries=1
+    	timeout=10          <- orphaned, unparseable
+
+The backslash becomes a module argument and the line below becomes a stray
+directive. install.sh's write invariant does not catch it: the orphan is a
+non-fprintd line and is identical on both sides, so the count checks pass and
+a login-critical file gets written broken, silently.
+
+Rather than teach the awk to fold and unfold continuations, files carrying any
+continuation are refused outright (`pam_config_has_no_line_continuations()`).
+No distro ships one, and this is a login path - the reason not to guess here
+is the same reason the `sufficient` control is refused rather than translated.
+
+### `-auth` was half-recognised, which is worse than not at all
+
+`pam_auth_is_fingerprint_only()` learned about `-auth` earlier today, but
+`PAM_FPRINTD_AUTH_RE` - the regex that *counts* fingerprint lines and drives
+the awk - did not. So a file with
+
+    auth	required	pam_fprintd.so
+    -auth	required	pam_fprintd.so
+
+counted as "exactly one line to build on", passed eligibility, and was
+rewritten into a three-attempt stack with the dash line left sitting directly
+below it. A matched finger on attempt 1 jumps over attempts 2 and 3 - and
+lands on that un-hardened line, so a *successful* scan is immediately asked to
+scan again, with the module's 30s default, and a failure there fails the
+login.
+
+`PAM_FPRINTD_AUTH_RE` and `PAM_FPRINTD_RETRY_LINE_RE` now both accept `-?auth`
+(and so do the awk's two copies of them), which makes the count 2 and the file
+refused. While in there: the generated attempt lines now carry the same
+`auth`/`-auth` prefix as the line they copy, since a dash means "skip silently
+if the module is missing" and generating bare `auth` lines would start
+erroring where the original was quiet.
+
+### install claimed stacks uninstall refuses to claim
+
+`pam_fprintd_has_single_auth_line()` counts any `authinfo_unavail=ignore` line
+as one this tool generated. Right for our own output, wrong for a hand-written
+retry stack that predates the tool - the repo even ships a fixture of one
+(`fprintd-handrolled`). Result: `pam_fprintd_stack_is_generated()` said "not
+ours, do not revert" while `pam_fprintd_stack_is_eligible()` said "fine,
+rewrite it". The install side now defers to the same test: if marker lines are
+present at all, they have to be provably ours.
+
+### The uninstall gate had a silent hole of its own
+
+Keying the revert loop on "has attempt lines" - yesterday's fix - skipped a
+file whose attempt lines were gone but whose `timeout=-1 max-tries=1` were
+still on the fprintd line. Silently, which is the exact failure the warning
+beside it was added to prevent, and a regression against the committed gate,
+which would have cleaned it.
+
+`timeout=-1` is this tool's signature on its own (no distro ships it, and
+unlike `max-tries=1` it cannot be confused with Debian's `common-auth`), so
+the loop now enters on either signal and says which one it found.
+
+### The warning itself was asserting things it could not know
+
+For `fprintd-handrolled` the old text claimed "something has edited it since"
+and pointed at a `.bak-<timestamp>` copy that was never created. Now it says
+the marker matched but the file is not what install.sh would have written -
+"either something edited it since, or it was somebody's own retry stack all
+along" - and it lists backup copies only if any actually exist.
+
+### The keyring-wiring loop never got the re-check the fprintd loop did
+
+`install.sh`'s second write loop still walked the plan-time `candidates` list
+with no existence check. A file removed or renamed by the package step (the
+very race documented three lines above it) falls through `grep -q` into
+`backup_pam_file` -> `sudo cp` on a missing path -> `set -e` aborts the whole
+run, after the fprintd edits are already written, with nothing but cp's error
+to explain it. Now re-checked, named, and skipped.
+
+### Documentation that disagreed with the code
+
+The doc block in `bin/lib.sh` and the block in `README.md` both showed
+`pam_fprintd.so max-tries=1 timeout=-1`; the code emits `timeout=-1
+max-tries=1`. Byte order matters here - `pam_fprintd_stack_is_generated()`
+proves ancestry with `cmp`, and the tests assert literal strings - so the one
+place a reader would trust to reconstruct the format by hand was the one place
+that was wrong. Also: the test file's section header still named
+`pam_fprintd_set/clear_unlimited_timeout`, renamed to `harden`/`unharden` in
+this branch.
+
+### Reported, not acted on
+
+- **`bin/seal.sh`'s `[Y/n]` overwrite prompt.** Deliberate, and explicitly
+  excluded when this was discussed. Not reopened.
+- **`PAM_NON_SERVICE_RE` skipping a service whose name contains a dot.** True,
+  and the trade is deliberate: no such service exists on any of the five
+  distros the suite covers, while `.pacnew`/`.rpmsave`/`.dpkg-old` are
+  everyday. A list of known suffixes fails in the dangerous direction (the
+  next suffix gets scanned and patched); this rule fails in the safe one.
+- **`confirm()`/`RUN_TS`/`backup_pam_file` duplicated between install.sh and
+  uninstall.sh, and the write-time invariant hand-copied in three places.**
+  Both fair, both the kind of drift `bin/lib.sh` exists to prevent, neither a
+  defect today. Worth a cleanup pass of its own rather than being smuggled
+  into this one.
+
+Tests: 102 checks in the regex suite (was 86), including three new fixtures -
+`fprintd-continuation`, `fprintd-continued-line`, `fprintd-dash-second` - and
+assertions that the dash form is counted, that generated lines keep the dash,
+and that install and uninstall now agree about `fprintd-handrolled`.
+
+### Worth noting about the review itself
+
+Two of its thirteen findings were wrong on the facts, and one of my own new
+test assertions was wrong too (it counted a fixture's comment line and blamed
+the code). Reproducing each claim by hand before believing it cost a few
+minutes and changed the outcome three times. Worth doing that every time.

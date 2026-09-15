@@ -1,0 +1,8 @@
+#%PAM-1.0
+# The fprintd line itself is continued. The rewriter works on physical lines,
+# so it would append its options after the trailing backslash - making the
+# backslash a module argument and orphaning the line below. Refused outright
+# rather than taught to fold. See JOURNAL.md, 2026-09-15.
+auth	required	pam_fprintd.so \
+	timeout=10
+auth	optional	pam_gnome_keyring.so
