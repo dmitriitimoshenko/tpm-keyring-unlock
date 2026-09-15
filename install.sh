@@ -6,9 +6,9 @@
 # Safe by design at every step except the /etc/pam.d/ edits, of which there
 # are two, both backed up first: the line it adds to the fingerprint PAM
 # stack is "optional" and cannot itself grant or block login, and the one it
-# can optionally make to pam_fprintd.so (timeout=-1, only ever on a
-# fingerprint-only stack) changes how long the sensor is willing to wait,
-# never who gets in. See README.md "How it works" before running this if you
+# can optionally make to pam_fprintd.so (an attempt stack, only ever on a
+# fingerprint-only stack) changes how many times the sensor is re-armed
+# before the prompt gives up, never who gets in. See README.md "How it works" before running this if you
 # want to understand exactly what it touches.
 set -euo pipefail
 
@@ -136,7 +136,7 @@ done
 # pam_fprintd's disassembly, in JOURNAL.md (2026-09-14).
 UNLIMIT_FPRINTD=false
 fprintd_targets=()
-if pam_fprintd_supports_timeout_option; then
+if pam_fprintd_supports_attempt_options; then
   for f in /etc/pam.d/*; do
     [ -f "$f" ] || continue
     if [[ "$f" =~ $PAM_NON_SERVICE_RE ]]; then continue; fi
@@ -160,12 +160,13 @@ if [ "${#fprintd_targets[@]}" -gt 0 ]; then
   echo "attempt, and GNOME stops offering fingerprint for good. max-tries="
   echo "does not cover the bad-scan case; only a mismatch decrements it."
   echo
-  echo "This installer can give the reader $PAM_FPRINTD_ATTEMPTS attempts per prompt and no"
-  echo "idle deadline, by rewriting that one pam_fprintd.so line into a short"
-  echo "stack. Only fingerprint-only stacks are eligible, never a shared one"
-  echo "like common-auth: PAM is serialised, so an unlimited wait there would"
-  echo "mean sudo blocks on the sensor forever and never reaches its password"
-  echo "prompt. Eligible on this machine:"
+  echo "This installer can give the reader $PAM_FPRINTD_ATTEMPTS attempts per prompt, by"
+  echo "rewriting that one pam_fprintd.so line into a short stack. Each attempt"
+  echo "keeps the module's own idle deadline, so the prompt still ends and"
+  echo "falls back to the password. Only fingerprint-only stacks are eligible,"
+  echo "never a shared one like common-auth: PAM is serialised, so $PAM_FPRINTD_ATTEMPTS waits on"
+  echo "the sensor there would delay sudo's password prompt that much longer."
+  echo "Eligible on this machine:"
   echo
   for f in "${fprintd_targets[@]}"; do
     echo "  $f"
@@ -360,7 +361,8 @@ if [ "$UNLIMIT_FPRINTD" = true ]; then
     # to the current content, never that the current content is still a file
     # this tool may touch. A stack that has gained an `auth required
     # pam_unix.so` since passes every one of those checks, and writing it
-    # would put timeout=-1 into a shared stack. See JOURNAL.md, 2026-09-15.
+    # would put an attempt stack into a shared stack. See JOURNAL.md,
+    # 2026-09-15.
     if pam_fprintd_harden <"$TARGET" | cmp -s - "$TARGET"; then
       echo "$TARGET is already in the target state - left unchanged."
       continue

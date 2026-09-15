@@ -1,0 +1,16 @@
+#%PAM-1.0
+# What install.sh wrote BEFORE timeout=-1 was dropped (see JOURNAL.md,
+# 2026-09-15). Still has to be recognised as this tool's own stack, so an
+# older install can be upgraded and uninstalled; hardening it again must
+# migrate it to the current shape by stripping timeout=-1.
+auth	requisite	pam_nologin.so
+auth	required	pam_succeed_if.so user != root quiet_success
+auth	[success=2 authinfo_unavail=ignore auth_err=ignore maxtries=ignore default=die]	pam_fprintd.so timeout=-1 max-tries=1
+auth	[success=1 authinfo_unavail=ignore auth_err=ignore maxtries=ignore default=die]	pam_fprintd.so timeout=-1 max-tries=1
+auth	required	pam_fprintd.so timeout=-1 max-tries=1
+auth	optional	pam_tpm_keyring_authtok.so
+auth	optional	pam_gnome_keyring.so
+@include common-account
+@include common-session
+session	optional	pam_gnome_keyring.so auto_start
+password	required	pam_fprintd.so

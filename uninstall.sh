@@ -89,12 +89,21 @@ for f in /etc/pam.d/*; do
 
   HAS_ATTEMPTS=false
   if grep -qE "$PAM_FPRINTD_RETRY_LINE_RE" "$f"; then HAS_ATTEMPTS=true; fi
-  # timeout=-1 is this tool's signature on its own: no distro ships it, and
-  # unlike max-tries=1 (which Debian's own pam-auth-update writes into
-  # common-auth) it cannot be confused with somebody else's config. Checked
-  # separately so a file whose attempt lines are gone but whose options are
-  # still ours - a partial hand edit - is still offered, instead of being
-  # skipped in silence with this tool's settings left on a login path.
+  # timeout=-1 is a *legacy* signature: versions of this tool before
+  # 2026-09-15 put it on every attempt, and no distro ships it, so unlike
+  # max-tries=1 (which Debian's own pam-auth-update writes into common-auth)
+  # it cannot be confused with somebody else's config. Checked separately so
+  # an older install whose attempt lines are gone but whose options are still
+  # ours - a partial hand edit - is still offered, instead of being skipped in
+  # silence with this tool's settings left on a login path.
+  #
+  # Current installs leave no such single-line signature, because max-tries=1
+  # is all they set and that is genuinely ambiguous. Stated rather than
+  # papered over: a current stack whose attempt lines someone deleted by hand
+  # is not detected here. That leftover is also far milder than timeout=-1 was
+  # - one scan per prompt, which is what the distro's own line does on a bad
+  # scan anyway - and the attempt lines remain the reliable marker for every
+  # file this tool actually wrote.
   HAS_OUR_OPTS=false
   if grep -qE "${PAM_FPRINTD_AUTH_RE}.*timeout=-1" "$f"; then HAS_OUR_OPTS=true; fi
   if [ "$HAS_ATTEMPTS" = false ] && [ "$HAS_OUR_OPTS" = false ]; then continue; fi
@@ -117,7 +126,7 @@ for f in /etc/pam.d/*; do
   if [ "$HAS_ATTEMPTS" = true ]; then
     echo "Found install.sh's fingerprint attempt stack in $f"
   else
-    echo "Found install.sh's timeout=-1 on the pam_fprintd.so line in $f"
+    echo "Found an older install.sh's timeout=-1 on the pam_fprintd.so line in $f"
     echo "(its attempt lines are already gone - only the options are left)"
   fi
   ORIGINAL="$(pam_fprintd_exact_original "$f" || true)"

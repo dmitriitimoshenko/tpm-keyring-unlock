@@ -161,13 +161,12 @@ bad scan turns into on some readers, jump straight to returning
 
 PAM has no loop construct, so the only fix at this level is to invoke the
 module again — each call re-claims and re-arms the device. `install.sh`
-rewrites the one `pam_fprintd.so` auth line into three attempts with no idle
-deadline:
+rewrites the one `pam_fprintd.so` auth line into three attempts:
 
 ```
-auth  [success=2 <fall through>]  pam_fprintd.so timeout=-1 max-tries=1
-auth  [success=1 <fall through>]  pam_fprintd.so timeout=-1 max-tries=1
-auth  required                    pam_fprintd.so timeout=-1 max-tries=1
+auth  [success=2 <fall through>]  pam_fprintd.so max-tries=1
+auth  [success=1 <fall through>]  pam_fprintd.so max-tries=1
+auth  required                    pam_fprintd.so max-tries=1
 ```
 
 where `<fall through>` is `authinfo_unavail=ignore auth_err=ignore
@@ -190,8 +189,15 @@ all the same.
   a match still falls through to the keyring lines below. Verified in a
   container against real libpam, not just read off the manual — see
   `test/runtime-test.sh`.
-- `timeout=-1` means no idle limit (see `man 8 pam_fprintd`). A negative value
-  is stored verbatim; only `0` gets clamped up to one second.
+- **No `timeout=` is set**, and an earlier version's `timeout=-1` is stripped
+  on upgrade. `timeout=-1` (no idle limit) cannot coexist with an attempt
+  stack: an attempt ends only when the module returns, so with no deadline the
+  *first* attempt never returns, the stack never reaches the second, and the
+  whole prompt hangs instead of falling back to the password. Each attempt
+  keeps the module's own 30s default instead, which gives the sensor three
+  times as long as the single line it replaces — 90s in total — and still
+  ends. Measured against real libpam; see `JOURNAL.md`, 2026-09-15.
+- A `timeout=` the distro set itself is left alone, and survives an uninstall.
 - The service's own line stays in place as the last attempt, keeping its
   control field, so the distro keeps the final verdict.
 
@@ -200,8 +206,8 @@ this (`max-tries=3`), so the number of tries per prompt is unchanged — only
 which failures count toward it.
 
 It is skipped entirely if the installed `pam_fprintd.so` doesn't understand
-`timeout=` (fprintd older than 1.94) — the installer probes the module binary
-for the option rather than guessing from a version string.
+`max-tries=` (fprintd older than 1.94) — the installer probes the module
+binary for the option rather than guessing from a version string.
 
 This is applied **only** to a PAM service whose auth phase offers fingerprint
 and nothing else — `gdm-fingerprint` on Ubuntu/Debian — and the file is backed
@@ -221,9 +227,9 @@ rewrite can't reproduce them faithfully:
 
 It deliberately refuses to touch a *shared* stack such as `common-auth`, even
 though that's where Ubuntu puts its own `timeout=10`. PAM is strictly
-serialised: `common-auth` runs `pam_fprintd` and then `pam_unix`, so an
-unlimited wait there would mean `sudo` blocks on the sensor forever and never
-reaches its password prompt. If you want a longer (but finite) window for
+serialised: `common-auth` runs `pam_fprintd` and then `pam_unix`, so three
+waits on the sensor there would delay `sudo`'s password prompt by three times
+the idle timeout on every invocation. If you want a longer window for
 `sudo`, edit `/usr/share/pam-configs/fprintd` and re-run
 `sudo pam-auth-update` — editing `/etc/pam.d/common-auth` directly gets
 reverted, since `pam-auth-update` regenerates that file.
@@ -246,9 +252,10 @@ Two things worth knowing:
 - it puts back the distro's **exact original line**, from the
   `.bak-<timestamp>` copy `install.sh` took, whenever that copy is provably
   the file that was hardened into what's on disk now. That is the only way an
-  explicit `timeout=`/`max-tries=` the distro had set comes back; without such
-  a copy the line returns on the module's defaults instead, and the uninstaller
-  says so;
+  explicit `max-tries=` the distro had set comes back — a distro's `timeout=`
+  is never overwritten in the first place, so that one survives regardless;
+  without such a copy the line returns on the module's defaults instead, and
+  the uninstaller says so;
 - if a file carries the attempt lines but has been edited since, it says so
   and leaves it alone, rather than silently skipping it and letting you think
   everything was reverted.

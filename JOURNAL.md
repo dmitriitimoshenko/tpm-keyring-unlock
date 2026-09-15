@@ -3159,3 +3159,314 @@ Confirmed by running `test/unit-regex-test.sh` on the merged tree: 110
 checks pass, and `main`'s `dash-prefixed` fixture is exercised by the
 branch's expanded suite (detection, count-of-one, needs-patching, sed
 insertion, and insertion position).
+
+## The attempt stack gives one scan, not three: the re-claim premise is false on this reader (2026-09-15, after the reinstall)
+
+**Reported from actual use:** after one bad finger at the GDM greeter, login
+offers nothing but the password - the exact symptom the attempt stack was
+built to fix. Reported as "after your fixes multi-retries stopped working",
+so the first job was to establish whether the recent work caused it.
+
+**It did not, and that is worth recording precisely rather than asserting.**
+Two independent checks:
+
+- `git diff --stat 8207833..HEAD` (the commit installed on 2026-09-14 23:16
+  vs what was installed at 10:42 today) touches `JOURNAL.md`,
+  `test/unit-regex-test.sh`, `test/vm/run-vm-test.sh`,
+  `test/fixtures/pam.d/dash-prefixed`, and `bin/lib.sh`. The only functional
+  line among them is `PAM_GNOME_KEYRING_AUTH_RE` gaining main's optional `-`
+  prefix. Nothing matching `fprintd` changed at all.
+- `/etc/pam.d/gdm-fingerprint` is **byte-identical** to the backup
+  `gdm-fingerprint.bak-20260915104224` that `uninstall.sh` took immediately
+  before removing anything. The uninstall/install round trip reproduced the
+  same stack it replaced, so the behaviour cannot have changed with it.
+
+So the bug has been on this machine since the 2026-09-14 install; today's
+reinstall is simply when a bad scan happened to be tried.
+
+### What the log shows
+
+Greeter login at 10:43:38, current boot:
+
+    fprintd[3900]: Authorization denied to :1.90 to call method 'Claim' for device 'Goodix MOC Fingerprint Sensor': Device was already claimed
+    fprintd[3900]: Authorization denied to :1.91 to call method 'Claim' for device 'Goodix MOC Fingerprint Sensor': Device was already claimed
+    gdm-fingerprint][4339]: pam_tpm_keyring_authtok(...): TPM keyring unseal succeeded for user dmitrii, PAM_AUTHTOK set
+    gdm-fingerprint][4339]: gkr-pam: stashed password to try later in open session
+    [17 seconds later]
+    gdm-password][4338]: gkr-pam: stashed password to try later in open session
+
+Two `Claim` denials, one per retry line, then the stack runs on to the
+keyring modules and ends; seventeen seconds later `gdm-password` succeeds,
+i.e. the password was typed. The retry lines never reached a scan.
+
+### Root cause
+
+The design rests on one sentence from the 2026-09-14 entry above:
+
+> PAM has no loop construct, so the only way to get another attempt is to
+> invoke the module again - each `pam_sm_authenticate()` re-claims and
+> re-arms the device.
+
+**The second half of that is false on this reader.** The re-claim is refused
+with "Device was already claimed", so attempts 2 and 3 return
+`PAM_AUTHINFO_UNAVAIL` without ever arming the sensor - and
+`authinfo_unavail=ignore`, which exists to let a bad scan fall through to
+the next attempt, now also silently swallows two attempts that never
+happened. Three lines, one usable scan.
+
+That is *worse than the distro default it replaced*: a single
+`auth required pam_fprintd.so` retries `verify-no-match` three times inside
+one claim (the `max-tries--` branch at `0x34f6` in the disassembly above),
+and `max-tries=1` explicitly gives that up in exchange for re-invocation
+that does not work here.
+
+**Sharpened by counting the denials per event** (three `pam_fprintd`
+invocations per attempt, so the count says how many of them were refused):
+
+| event | context | denials | meaning |
+|---|---|---|---|
+| 10:43:38 | GDM greeter, fresh boot | 2 (`:1.90`, `:1.91`) | attempt 1 claimed fine and its *scan* failed; attempts 2-3 refused |
+| 10:21:42 | unlock inside the session | 3 (`:1.266`-`:1.268`) | all three refused - no scan at all |
+| 10:06:13 | unlock inside the session | 3 (`:1.208`-`:1.210`) | same |
+
+Two conclusions the logs already support without any new measurement.
+The greeter's gnome-shell does **not** hold the claim permanently - if it
+did, attempt 1 at 10:43:38 would have been refused too - which leaves the
+previous invocation's in-flight D-Bus release as the leading explanation
+there, and that is the case spacing the attempts out could plausibly fix.
+But at the **lock screen** the picture is worse and different: all three
+attempts are refused, so fingerprint unlock in a live session is dead on
+arrival, and a claimant other than our own stack (the session's own
+gnome-shell) is the only thing that explains it. A fix that only spaces
+attempts would address the greeter and not the lock screen.
+
+**Still not established:** which client holds the claim - the first
+`pam_fprintd` invocation whose release is still in flight (release is
+asynchronous over D-Bus), or the greeter's own gnome-shell fingerprint UI,
+which claims the device too (it is what activates `fprintd.service` at
+10:43:36, via `:1.50`). The distinction decides whether the design is
+salvageable by spacing the attempts out or not salvageable in this shape at
+all, so it needs to be measured, not guessed. `fprintd-verify` from a
+terminal, run twice back to back, needs no sudo and no config change and
+would settle it. Note the same message appears in this journal as far back
+as 2026-08-14, long before the attempt stack, which is consistent with the
+greeter being one of the claimants in at least some of those cases.
+
+**Consequence for PR #9:** the attempt stack does not deliver attempts on
+this hardware, so the branch should not be merged on the strength of "it
+works" until the claim question above is answered. The VM and Docker test
+layers cannot catch this: neither has a fingerprint reader, and
+`pam_flow_stub.so` models the PAM control flow, not fprintd's device
+claiming - the stub returns its scripted code immediately, so a stack whose
+retry lines can never claim looks identical to one whose retries work.
+
+### Rollback, if login matters more than the open question
+
+Restoring the distro's single line while keeping the TPM keyring unseal:
+
+    sudo sed -i -E '/^auth[[:space:]]+\[[^]]*authinfo_unavail=ignore[^]]*\][[:space:]]+pam_fprintd\.so/d; s/^(auth[[:space:]]+required[[:space:]]+pam_fprintd\.so)[[:space:]]+timeout=-1[[:space:]]+max-tries=1$/\1/' /etc/pam.d/gdm-fingerprint
+
+Verified on a copy before being offered: the result is byte-identical to
+`gdm-fingerprint.bak-20260915104243` (what `install.sh` backed up before
+hardening) with `auth optional pam_tpm_keyring_authtok.so` re-inserted - so
+fingerprint behaviour returns to the distro default and the keyring unseal
+is untouched. This reinstates the original "one bad scan, then password
+only" complaint; it trades a known annoyance for a worse one.
+
+### Correction to the entry above, from the historical denial counts (2026-09-15, same day)
+
+The entry above named the attempt stack's false re-claim premise as the
+**root cause**. Counting every "Device was already claimed" in this
+machine's journal (90 of them, back to 2026-08-14) does not support that
+claim as stated, and the overstatement is worth recording rather than
+quietly rewriting:
+
+    1 per event   2026-09-08 .. 2026-09-14 21:40   (17 events)
+    2 per event   2026-09-14 22:53 .. 22:54        (3 events)
+    3 per event   2026-09-15 09:47, 10:06, 10:21
+    2             2026-09-15 10:43:38              (the greeter login)
+
+The single-line era - before the attempt stack existed at all - already
+produced **one denial per authentication event**. So the denials are not
+something this branch introduced; the count simply tracks the number of
+`pam_fprintd` lines, with 10:43:38 (three lines, two denials) the one event
+where a scan demonstrably happened.
+
+**What this breaks in the diagnosis above:** the log names the denied D-Bus
+client (`:1.90`) but not the process behind it, so "attempts 2 and 3 were
+refused" was an inference from the count, not an observation. The same
+counts fit an innocent reading just as well: gnome-shell's own fingerprint
+UI tries to claim the device once per `pam_fprintd` line while PAM legitimately
+holds it, gets refused, and the refusals are harmless noise - in which case
+the attempt stack may be failing for some other reason entirely, and the
+single-line era's lone denial was never a problem.
+
+Both readings survive the evidence available, and they imply opposite fixes.
+The consequence for the rollback offered above is direct: if the denials are
+gnome-shell being refused, the distro's single line was *also* being denied
+once per event throughout the era the user remembers as working, so rolling
+back would not fix the reported complaint either.
+
+Resolving this needs the claim holder identified, not inferred - which is
+what the next step measures. Recorded here because the earlier entry would
+otherwise read as settled when it is not, and because "the counts matched my
+hypothesis" is exactly the kind of reasoning this journal exists to catch.
+
+## Root cause found, and it was `timeout=-1`, not the claim denials (2026-09-15, final)
+
+The two entries above are now both superseded on the central point. The first
+blamed the attempt stack's re-claim premise; the second walked that back to
+"two readings survive the evidence". Neither was right, and the way the real
+answer was reached matters more than the answer: every step above reasoned
+from log *correlations*, and the thing that settled it was running the code.
+
+### What was actually measured
+
+Three experiments, none of which needed sudo or any change to `/etc/pam.d`.
+
+**1. Does a claim survive its holder?** A Python probe over raw D-Bus
+(`Gio.DBusConnection`, one connection per simulated client):
+
+    A.Claim                                OK
+    B.Claim (while A holds)                FAIL   already claimed
+    A.Release -> B.Claim                   OK
+    holder's connection dies, no Release:
+      re-Claim after 0ms                   OK
+      ... 5ms / 25ms / 100ms / 250ms       OK
+
+So "already claimed" needs a **live** holder, and there is no release race at
+any delay - the in-flight-release hypothesis is dead. One more result, from a
+second probe: a second `Claim` on the *same* connection is refused with
+exactly the same message, which is the trap that made the correlation
+reading look plausible.
+
+**2. Does the attempt stack actually get three scans?** `pam_start_confdir(3)`
+(Linux-PAM >= 1.4) lets an unprivileged process run a PAM stack from a
+directory it owns, so the real `pam_fprintd.so` could be driven through the
+real stack with no root and no `/etc/pam.d` edit. A 24-line C driver plus a
+config dir was the whole apparatus. With `timeout=1` to make each attempt end
+quickly:
+
+    [INFO] Place your finger on the fingerprint reader
+    [INFO] Verification timed out          (x3)
+    pam_authenticate -> 9   in 4.23s
+    claim denials logged during the run: 0
+
+**Three attempts, zero claim conflicts.** The attempt stack works exactly as
+designed. Every claim-denial theory above was wrong, and the denials in the
+login journal came from something else (gnome-shell's own fingerprint UI
+being refused while PAM legitimately held the device - harmless noise that
+has appeared in this machine's logs since 2026-08-14).
+
+**3. Then what breaks?** The same stack with the config actually deployed:
+
+    # timeout=-1 max-tries=1, three lines
+    [INFO] Place your finger on the fingerprint reader
+    <killed after 15s - pam_authenticate never returned>
+
+One prompt. No second attempt. No return, ever.
+
+### The root cause
+
+`timeout=-1` and the attempt stack are mutually exclusive by construction.
+An attempt only ends when `pam_sm_authenticate()` returns; `timeout=-1`
+removes the only thing that makes it return on its own. So the first attempt
+parks on the sensor forever, attempts two and three are unreachable, and the
+whole PAM conversation hangs instead of failing over to the password. That is
+the reported symptom exactly: *one bad finger and login is stuck*.
+
+The irony is that the two changes were made on the same day to fix the same
+complaint, and each is sound alone. `timeout=-1` (2026-09-14) removed the 30s
+idle deadline; the attempt stack (later that day) replaced the *need* for
+that by re-arming the reader N times. The second change made the first
+redundant - and, left in place, harmful.
+
+### The fix
+
+`pam_fprintd_harden()` no longer writes `timeout=` at all, and actively
+strips a `timeout=-1` an older version left behind. Each attempt keeps the
+module's own 30s default, so the sensor is available for `3 x 30s = 90s` -
+three times what the single line it replaces gave - and the prompt still
+ends. Verified on the generated stack, again through real libpam:
+
+    [INFO] Place your finger on the fingerprint reader
+    [INFO] Verification timed out          (x3)
+    pam_authenticate -> 9   in 91.30s
+
+Three prompts, terminates, hands back to the password. Compare with the
+deployed config's "one prompt, never returns".
+
+Consequences handled rather than left to rot:
+
+- **Migration.** `harden` strips `timeout=-1`, so re-running `install.sh`
+  upgrades an existing machine in place. `pam_fprintd_stack_is_generated()`
+  and `pam_fprintd_exact_original()` now accept *either* shape via a
+  `pam_fprintd_harden_legacy()` recogniser, so an older install is still
+  identified as this tool's own work and still comes apart on uninstall.
+  Without that, every machine running the previous version would have had its
+  stack reported as "somebody's hand-rolled retry stack" and left in place.
+- **A distro's own `timeout=` is no longer clobbered.** `harden` used to
+  overwrite it with `-1`; it now leaves it alone, so that value survives a
+  full install/uninstall cycle. Only `max-tries=` still needs the
+  `.bak-<timestamp>` copy to come back.
+- **The capability probe** now tests `max-tries=` instead of `timeout=`,
+  because that is the only option still written. Both landed in fprintd 1.94,
+  so no module changes side.
+- **The eligibility rule is unchanged and stays.** Its justification shifts
+  from "an unlimited wait in a serialised stack blocks sudo forever" to
+  "three waits delay sudo's password prompt threefold", which is weaker but
+  still disqualifying - and weakening a safety check on the strength of a
+  fix elsewhere is exactly what `CLAUDE.md` warns against.
+- **`uninstall.sh`'s single-line signature** was `timeout=-1`, which current
+  installs no longer write. Kept for legacy cleanup, and the gap is written
+  down rather than papered over: a current stack whose attempt lines were
+  hand-deleted leaves only `max-tries=1`, which Debian ships itself, so it
+  cannot be claimed as ours. That leftover is also far milder than
+  `timeout=-1` was.
+
+Tests: `test/unit-regex-test.sh` is at 116 checks (was 110). The inverted
+assertion (`no attempt carries timeout=-1`) plus four new migration checks -
+a legacy stack migrates to the current shape, migration strips `timeout=-1`,
+a legacy stack is still recognised as ours, and both shapes unharden to the
+same file. `test/fixtures/pam.d/fprintd-hardened` moved to the new shape and
+`fprintd-hardened-legacy` was added holding the old one. `test/runtime-test.sh`
+needed no change: it builds its stack through `pam_fprintd_harden` and
+substitutes `pam_flow_stub.so` for the module, so it tests control flow,
+which did not change.
+
+A trap worth recording for whoever edits the regex suite next: `grep -c`
+exits 1 when the count is 0, and the suite runs under `set -e`, so a new
+"this must not appear" assertion silently truncates the run - 70 checks, zero
+failures, and a green-looking tail. Caught by the check count dropping, not
+by any failure. Every such assertion needs `|| true`.
+
+### What is still not fixed, stated plainly
+
+A single bad scan still ends *that* attempt: `pam_fprintd` returns
+`PAM_AUTHINFO_UNAVAIL` for `verify-unknown-error` (the disassembly entry
+above), and nothing at the PAM layer changes what the module returns. The
+stack's contribution is that the prompt now gets two more scans instead of
+falling straight to the password. Three bad scans in a row still end in the
+password prompt, as they should.
+
+### Confirmed on the reporting machine (2026-09-15, same day)
+
+`install.sh` re-run by the user migrated `/etc/pam.d/gdm-fingerprint` in
+place - three lines changed, `timeout=-1` stripped, nothing else - and the
+user confirms fingerprint login behaves correctly again. `grep -c timeout=-1`
+over the file: 0.
+
+One last piece of evidence, worth recording because it closes the argument
+the two superseded entries above spent their length on. The greeter login at
+11:08:17, *after* the fix, still logs:
+
+    fprintd[3892]: Authorization denied to :1.91 ... Device was already claimed
+    fprintd[3892]: Authorization denied to :1.92 ... Device was already claimed
+
+Same two denials, same shape, with a stack that now demonstrably works. So
+the denials never had anything to do with this tool's attempt lines - they
+are the greeter's own fingerprint UI being refused while PAM legitimately
+holds the device, exactly as the `pam_start_confdir` run predicted, and they
+were a red herring from the first entry onward. The lesson is the one already
+written above: log correlation produced three different confident diagnoses
+here, and running the code produced one correct one.
