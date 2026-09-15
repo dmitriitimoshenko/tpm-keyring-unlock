@@ -40,6 +40,94 @@ backup_pam_file() {
   [ -e "$bak" ] || sudo cp "$f" "$bak"
 }
 
+# Removes pam_fprintd from the shared auth stack, the only supported way.
+# A function because it is called from two places: the planned step below, and
+# the final check at the end of the run, which offers it again if the machine
+# still has the conflict. Duplicating this guarded write would be a way for
+# the two copies to drift, and it is the one write in this script that can
+# lock the machine out.
+disable_fprintd_profile() {
+  local f RC
+  local common_files=()
+  echo "-- Fixing the lock screen --"
+  # Re-checked here for the same reason the fprintd step above re-checks
+  # eligibility: the plan was printed before the package install, and on this
+  # family of distros that step can run pam-auth-update itself.
+  if ! pam_fprintd_in_shared_stack; then
+    echo "Already gone from $PAM_SHARED_AUTH_STACK - nothing to do."
+  elif ! pam_auth_update_owns_fprintd; then
+    echo "The pam_fprintd.so line in $PAM_SHARED_AUTH_STACK is no longer one" >&2
+    echo "pam-auth-update manages - left untouched. The extra tries will not" >&2
+    echo "reach the reader at the lock screen while that line is there." >&2
+  else
+    # Derived from the shared stack's own location rather than hard-coded, so
+    # the restore path below is reachable from the tests.
+    for f in "$(dirname "$PAM_SHARED_AUTH_STACK")"/common-*; do
+      [ -f "$f" ] || continue
+      if [[ "$f" =~ $PAM_NON_SERVICE_RE ]]; then continue; fi
+      common_files+=("$f")
+      # pam-auth-update regenerates every common-* file, not just common-auth,
+      # so every one of them gets the same pre-edit copy install.sh takes
+      # before any other login-critical write.
+      backup_pam_file "$f"
+    done
+
+    # DEBIAN_FRONTEND=noninteractive on purpose. pam-auth-update refuses to
+    # rewrite common-* files carrying local modifications it cannot reconcile
+    # against /var/lib/pam, and asks about overriding at debconf's *high*
+    # priority - i.e. it would stop this script with a whiptail dialog. With
+    # the noninteractive frontend that question takes its default, which is
+    # "don't override", so the refusal is a printed no-op instead. Caught
+    # below and reported. --force is deliberately not used: it discards local
+    # modifications to all four common-* files, which is not this installer's
+    # call to make.
+    RC=0
+    sudo env DEBIAN_FRONTEND=noninteractive pam-auth-update --disable fprintd || RC=$?
+    [ "$RC" = 0 ] || echo "pam-auth-update exited $RC." >&2
+
+    if pam_shared_stack_is_sane_without_fprintd; then
+      mkdir -p "$DATA_DIR"
+      # Records that *this tool* disabled a profile that was enabled before.
+      # uninstall.sh re-enables only on the strength of this file, so a user
+      # who had fprintd disabled themselves never gets it switched back on.
+      {
+        echo "# written by install.sh at $RUN_TS"
+        echo "# The 'fprintd' pam-auth-update profile was enabled before this"
+        echo "# run and was disabled so the fingerprint attempt stack could"
+        echo "# actually get the sensor. uninstall.sh offers to re-enable it."
+      } >"$DATA_DIR/$PAM_FPRINTD_PROFILE_MARKER"
+      chmod 0644 "$DATA_DIR/$PAM_FPRINTD_PROFILE_MARKER"
+      echo "Done. Nothing else reaches for the reader first now, so the"
+      echo "login and lock screen get it and the extra tries work."
+      echo "Previous content backed up as <file>.bak-$RUN_TS."
+      echo "(undo any time: sudo pam-auth-update --enable fprintd)"
+    elif pam_fprintd_in_shared_stack; then
+      # Refused, nothing written: the line is still there and the file is
+      # otherwise untouched. Nothing to restore, but say what to do next.
+      echo "pam-auth-update left the line in place - it will not rewrite" >&2
+      echo "common-* files that carry local modifications it can't reconcile." >&2
+      echo "Nothing was changed. Run 'sudo pam-auth-update' yourself and" >&2
+      echo "untick 'Fingerprint authentication', or re-run it with --force if" >&2
+      echo "you are happy to lose local edits to the common-* files." >&2
+    else
+      # It wrote something, and what came out has no fingerprint line *and* no
+      # primary auth module - i.e. a stack nobody can log in through. Put the
+      # pre-run copies straight back; this is the one step in this script that
+      # could lock the machine out.
+      echo "pam-auth-update produced a $PAM_SHARED_AUTH_STACK with no usable" >&2
+      echo "auth module - restoring the pre-run copies of every common-* file." >&2
+      for f in "${common_files[@]}"; do
+        [ -f "$f.bak-$RUN_TS" ] || continue
+        sudo cp "$f.bak-$RUN_TS" "$f"
+        echo "Restored $f" >&2
+      done
+      echo "Nothing else was changed. Please check $PAM_SHARED_AUTH_STACK" >&2
+      echo "before logging out." >&2
+    fi
+  fi
+}
+
+
 # Every prompt below defaults to yes, so a run with no terminal must not be
 # allowed to answer them by hitting EOF. read() failing counts as "no" in
 # confirm() for that reason, but bail out up front anyway rather than
@@ -131,18 +219,25 @@ done
 # "there is no such auth method here" rather than "that did not match" - and
 # gnome-shell treats that as permanent: fingerprint is gone for the rest of
 # the unlock prompt and only the password is left, with the sensor sitting
-# right there working. pam_fprintd_harden() gives the stack extra attempts and
-# no idle deadline. Full chain, traced through gnome-shell's gdm/util.js and
+# right there working. pam_fprintd_harden() gives the stack extra attempts,
+# each keeping the module's own idle deadline. Full chain, traced through
+# gnome-shell's gdm/util.js and
 # pam_fprintd's disassembly, in JOURNAL.md (2026-09-14).
 UNLIMIT_FPRINTD=false
+FPRINTD_STACK_PRESENT=false
 fprintd_targets=()
 if pam_fprintd_supports_attempt_options; then
   for f in /etc/pam.d/*; do
     [ -f "$f" ] || continue
     if [[ "$f" =~ $PAM_NON_SERVICE_RE ]]; then continue; fi
     if ! grep -qE "$PAM_FPRINTD_AUTH_RE" "$f"; then continue; fi
-    # already in the target state - hardening it again would change nothing
-    if pam_fprintd_harden <"$f" | cmp -s - "$f"; then continue; fi
+    # already in the target state - hardening it again would change nothing,
+    # but it still means an attempt stack is in place, which is what decides
+    # whether the shared-stack conflict in 1f below is worth raising at all
+    if pam_fprintd_harden <"$f" | cmp -s - "$f"; then
+      FPRINTD_STACK_PRESENT=true
+      continue
+    fi
     # the whole eligibility rule lives in bin/lib.sh, because step 3 below has
     # to apply the exact same one again just before it writes
     if ! pam_fprintd_stack_is_eligible "$f"; then continue; fi
@@ -172,10 +267,88 @@ if [ "${#fprintd_targets[@]}" -gt 0 ]; then
     echo "  $f"
   done
   echo
-  if confirm "Give the reader $PAM_FPRINTD_ATTEMPTS attempts and no idle deadline?"; then
+  if confirm "Let the reader try $PAM_FPRINTD_ATTEMPTS times per prompt instead of once?"; then
     UNLIMIT_FPRINTD=true
   else
-    echo "Leaving the fingerprint timeout alone."
+    echo "Leaving the fingerprint stack as it is."
+  fi
+  echo
+fi
+
+# 1f. the shared auth stack racing the hardened one for the sensor. The
+# attempt stack above is dead code while pam_fprintd is also in common-auth:
+# gnome-shell opens gdm-password and gdm-fingerprint as two PAM conversations
+# at once, both reach for the same reader, and gdm-password wins. Full
+# measurement and reasoning in bin/lib.sh next to the predicates, and in
+# JOURNAL.md, 2026-09-15.
+FPRINTD_CONFLICT_FIX=false
+conflict_losers=()
+if { [ "$UNLIMIT_FPRINTD" = true ] || [ "$FPRINTD_STACK_PRESENT" = true ]; } \
+  && pam_fprintd_in_shared_stack; then
+  mapfile -t conflict_losers < <(pam_fprintd_services_losing_fingerprint)
+
+  echo "One more thing - without it the attempt stack above does nothing:"
+  echo
+  echo "pam_fprintd.so is also in $PAM_SHARED_AUTH_STACK, which other"
+  echo "services @include. At the GDM greeter and at the lock screen"
+  echo "gnome-shell runs two PAM conversations at once (gdm-password and"
+  echo "gdm-fingerprint), so both stacks reach for the one sensor. Only one"
+  echo "can claim it; the loser is told the reader is *unavailable*, which is"
+  echo "exactly what makes GNOME drop fingerprint for the rest of the prompt."
+  echo
+  echo "gdm-password wins that race every time - it starts first, while the"
+  echo "fingerprint service waits on a D-Bus round trip to fprintd. So the"
+  echo "scan you actually get is the shared stack's single attempt on its own"
+  echo "short timeout, never the $PAM_FPRINTD_ATTEMPTS attempts above."
+  echo
+  echo "Fingerprint has to live in exactly one of the two stacks, and it"
+  echo "cannot be the shared one: that stack is serialised ahead of"
+  echo "pam_unix.so, so extra waits there delay sudo's password prompt just"
+  echo "as long."
+  echo
+
+  if pam_auth_update_owns_fprintd; then
+    echo "This installer can disable the 'fprintd' pam-auth-update profile,"
+    echo "which takes that line out the supported way - reversible with"
+    echo "'sudo pam-auth-update --enable fprintd', and offered by uninstall.sh."
+    echo
+    if [ "${#conflict_losers[@]}" -gt 0 ]; then
+      # The reassurance goes *before* the list on purpose. The list is long
+      # and mostly made of services that never prompt for a finger anyway
+      # (cron, cups, ppp), so leading with it makes the change look far
+      # bigger than it is - which is how a machine ends up declining and then
+      # still timing out at ten seconds. See JOURNAL.md, 2026-09-15.
+      echo "Nothing stops working. Every service below still authenticates"
+      echo "with the password it already accepts - they just stop offering"
+      echo "the finger as a shortcut, and most of them never prompted for"
+      echo "one in the first place. The one people actually notice is polkit"
+      echo "(the \"Authentication required\" dialogs)."
+      echo
+      echo "Affected (${#conflict_losers[@]}):"
+      for s in "${conflict_losers[@]}"; do
+        echo "  $s"
+      done
+      echo
+      echo "Not affected: sudo, which has its own pam_fprintd.so line; and"
+      echo "GDM login plus the lock screen, which keep fingerprint through"
+      echo "the hardened stack - gdm-password appearing above is the fix"
+      echo "itself, not a loss."
+      echo
+    fi
+    if confirm "Fix the lock screen? Fingerprint stops being offered in polkit prompts."; then
+      FPRINTD_CONFLICT_FIX=true
+    else
+      echo "Left as it is. The extra tries above will not reach the reader at"
+      echo "the lock screen while that line stays where it is."
+    fi
+  else
+    # Not pam-auth-update's line, so this tool has no supported way to remove
+    # it and will not hand-edit a login-critical file it did not write. Say so
+    # plainly rather than hardening a stack that then silently does nothing.
+    echo "That line is not one pam-auth-update manages here, so this installer"
+    echo "will not touch it - editing $PAM_SHARED_AUTH_STACK by hand is not"
+    echo "something it does. Remove the pam_fprintd.so auth line there"
+    echo "yourself if you want the attempt stack above to take effect."
   fi
   echo
 fi
@@ -206,8 +379,9 @@ n=$((n + 1))
 echo "  $n. Mask systemd's eager gnome-keyring-daemon startup, if present."
 n=$((n + 1))
 if [ "$UNLIMIT_FPRINTD" = true ]; then
-  echo "  $n. Rewrite the pam_fprintd.so auth line into $PAM_FPRINTD_ATTEMPTS attempts with no idle"
-  echo "     deadline (each file backed up first, as <file>.bak-<timestamp>):"
+  echo "  $n. Rewrite the pam_fprintd.so auth line into $PAM_FPRINTD_ATTEMPTS attempts, each"
+  echo "     keeping the module's own idle deadline (every file backed up"
+  echo "     first, as <file>.bak-<timestamp>):"
   for t in "${fprintd_targets[@]}"; do
     echo
     echo "       $t"
@@ -220,6 +394,14 @@ if [ "$UNLIMIT_FPRINTD" = true ]; then
   echo "     jumps only skip the remaining attempts, so a match still falls"
   echo "     through to the keyring lines below. Three failures and the stack"
   echo "     fails, same as one failure does today."
+  n=$((n + 1))
+fi
+if [ "$FPRINTD_CONFLICT_FIX" = true ]; then
+  echo "  $n. Disable the 'fprintd' pam-auth-update profile, which removes the"
+  echo "     pam_fprintd.so auth line from $PAM_SHARED_AUTH_STACK (every"
+  echo "     common-* file backed up first, as <file>.bak-<timestamp>)."
+  echo "     Without this the attempt stack never gets the sensor - see the"
+  echo "     explanation printed above."
   n=$((n + 1))
 fi
 if [ "${#targets[@]}" -gt 0 ]; then
@@ -398,6 +580,11 @@ if [ "$UNLIMIT_FPRINTD" = true ]; then
   echo
 fi
 
+if [ "$FPRINTD_CONFLICT_FIX" = true ]; then
+  disable_fprintd_profile
+  echo
+fi
+
 echo "-- Login PAM stacks that feed the keyring --"
 if [ "${#candidates[@]}" -eq 0 ]; then
   echo "No /etc/pam.d/ service has an auth-phase pam_gnome_keyring.so line."
@@ -428,3 +615,87 @@ fi
 
 echo
 echo "Log out and back in (however you normally authenticate) to test."
+
+# --- 4. did the fingerprint side actually end up able to work? -----------
+# The attempt stack fails silently when it loses the sensor: it returns
+# "reader unavailable" in under a second, GNOME falls back to the password,
+# and what the user sees is indistinguishable from the bug it was installed to
+# fix. That happened on the reporting machine - the installer asked, the answer
+# was no, and the run still ended with "log out and back in to test", which
+# reads as success. So the state on disk is checked here and said plainly. See
+# JOURNAL.md, 2026-09-15.
+fprintd_stack_installed=false
+for f in /etc/pam.d/*; do
+  [ -f "$f" ] || continue
+  if [[ "$f" =~ $PAM_NON_SERVICE_RE ]]; then continue; fi
+  if grep -qE "$PAM_FPRINTD_RETRY_LINE_RE" "$f"; then
+    fprintd_stack_installed=true
+    break
+  fi
+done
+
+if [ "$fprintd_stack_installed" = true ] && pam_fprintd_in_shared_stack; then
+  echo
+  echo "=============================================================="
+  echo "The fingerprint attempt stack is installed but CANNOT take effect."
+  echo "=============================================================="
+  echo
+  echo "pam_fprintd.so is still in $PAM_SHARED_AUTH_STACK, so"
+  echo "gdm-password still races gdm-fingerprint for the sensor at the lock"
+  echo "screen - and still wins. What you will see is exactly the old"
+  echo "behaviour: one prompt, a timeout message after about ten seconds,"
+  echo "then password only. The three attempts never get the reader."
+  echo
+  if [ "$FPRINTD_CONFLICT_FIX" = true ]; then
+    # Already attempted this run and the line is still there, so the step
+    # above printed why. Repeating the offer would just repeat the failure.
+    echo "The step earlier in this run tried to remove it and could not -"
+    echo "see the message it printed above for what to do."
+  elif pam_auth_update_owns_fprintd; then
+    echo "It is one command, and it is reversible:"
+    echo
+    echo "    sudo pam-auth-update --disable fprintd"
+    echo
+    echo "Cost: services that reach fingerprint only through the shared stack"
+    echo "- polkit prompts above all - fall back to the password they already"
+    echo "accept. sudo keeps fingerprint; it has its own pam_fprintd.so line."
+    echo "GDM login and the lock screen keep it through the stack just"
+    echo "installed. Undo any time with 'sudo pam-auth-update --enable fprintd',"
+    echo "and uninstall.sh offers to undo it too."
+    echo
+    if confirm "Fix the lock screen? Fingerprint stops being offered in polkit prompts."; then
+      echo
+      disable_fprintd_profile
+      echo
+      if pam_fprintd_in_shared_stack; then
+        echo "Still there - see the message above. The lock screen will keep"
+        echo "timing out after ten seconds until it is gone."
+      else
+        echo "Fixed. Lock the screen and try a deliberately bad scan: you"
+        echo "should get another prompt rather than password-only."
+      fi
+    else
+      echo "Left alone. The lock screen will keep dropping fingerprint after"
+      echo "about ten seconds until that line is gone - run the command above"
+      echo "whenever you want it fixed."
+    fi
+  else
+    echo "That line is not one pam-auth-update manages here, so this installer"
+    echo "will not touch it. Remove the auth-phase pam_fprintd.so line from"
+    echo "$PAM_SHARED_AUTH_STACK yourself for the stack to take effect."
+  fi
+
+  # Re-checked, because the offer above may have just fixed it. Everything
+  # else this installer does succeeded, but if the line is still there the
+  # fingerprint stack it wrote provably cannot get the sensor - so say that
+  # in the exit status too, not only in a paragraph somebody may scroll past.
+  # "install.sh finished 0" must not mean "and the thing it installed does
+  # nothing". Checked first that nothing keys off the status: no test, no
+  # Makefile target and no CI job runs install.sh. See JOURNAL.md, 2026-09-15.
+  if pam_fprintd_in_shared_stack; then
+    echo
+    echo "(exiting 2: everything else is installed and done; the fingerprint"
+    echo "stack stays inert until that line is gone)"
+    exit 2
+  fi
+fi

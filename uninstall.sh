@@ -166,6 +166,57 @@ for f in /etc/pam.d/*; do
   fi
 done
 
+# --- 1c. re-enable the fprintd pam-auth-update profile -------------------
+# install.sh disables it so the fingerprint attempt stack can actually get the
+# sensor (two PAM conversations, one reader - see bin/lib.sh and JOURNAL.md,
+# 2026-09-15). Undo that here, but only on the strength of the marker file
+# install.sh wrote: a machine where fingerprint was disabled by hand, or by
+# something else, must not have it switched back on by this uninstaller. That
+# is the same rule the attempt-stack restore above follows - only claim what
+# this tool provably did.
+if [ -f "$DATA_DIR/$PAM_FPRINTD_PROFILE_MARKER" ]; then
+  if ! command -v pam-auth-update >/dev/null 2>&1; then
+    echo "install.sh disabled the 'fprintd' pam-auth-update profile on this" >&2
+    echo "machine, but pam-auth-update is gone - re-enable it yourself if you" >&2
+    echo "want fingerprint back in $PAM_SHARED_AUTH_STACK." >&2
+    echo >&2
+  elif pam_fprintd_in_shared_stack; then
+    # Already back (someone re-enabled it, or a package did). Nothing to do,
+    # and the marker no longer describes reality, so drop it.
+    rm -f "$DATA_DIR/$PAM_FPRINTD_PROFILE_MARKER"
+  else
+    echo "install.sh disabled the 'fprintd' pam-auth-update profile, which is"
+    echo "what took pam_fprintd.so out of $PAM_SHARED_AUTH_STACK."
+    echo "Re-enabling puts fingerprint back for every service that @include's"
+    echo "it (polkit prompts, login, su), and puts back the race with the"
+    echo "fingerprint attempt stack if any of that is still installed."
+    if confirm "Re-enable the 'fprintd' pam-auth-update profile?"; then
+      for f in "$(dirname "$PAM_SHARED_AUTH_STACK")"/common-*; do
+        [ -f "$f" ] || continue
+        if [[ "$f" =~ $PAM_NON_SERVICE_RE ]]; then continue; fi
+        backup_pam_file "$f"
+      done
+      # Same noninteractive frontend install.sh uses, and for the same reason:
+      # a refusal over local modifications should be a printed no-op, not a
+      # debconf dialog in the middle of this script.
+      RC=0
+      sudo env DEBIAN_FRONTEND=noninteractive pam-auth-update --enable fprintd || RC=$?
+      [ "$RC" = 0 ] || echo "pam-auth-update exited $RC." >&2
+      if pam_fprintd_in_shared_stack; then
+        rm -f "$DATA_DIR/$PAM_FPRINTD_PROFILE_MARKER"
+        echo "Re-enabled (previous content backed up as <file>.bak-$RUN_TS)."
+      else
+        echo "pam-auth-update did not put the line back - it refuses to" >&2
+        echo "rewrite common-* files carrying local modifications it can't" >&2
+        echo "reconcile. Nothing was changed; run 'sudo pam-auth-update'" >&2
+        echo "yourself and tick 'Fingerprint authentication'. Leaving the" >&2
+        echo "marker in place so this is offered again." >&2
+      fi
+    fi
+    echo
+  fi
+fi
+
 # --- 2. remove installed module + helper --------------------------------
 # Same candidate list install.sh picks the install directory from (shared
 # via bin/lib.sh), just checking for our own module instead of pam_unix.so.

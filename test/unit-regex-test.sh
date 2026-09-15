@@ -439,6 +439,63 @@ for f in gdm-fingerprint gdm-password common-auth common-session-noninteractive 
   check "/etc/pam.d/$f is still scanned" "$got" "scanned"
 done
 
+# --- the competing shared auth stack ------------------------------------
+# The attempt stack only helps if it is the stack that gets the sensor. While
+# pam_fprintd is also in common-auth, gdm-password races gdm-fingerprint for
+# the reader and wins, so the hardened stack never prompts. See JOURNAL.md,
+# 2026-09-15.
+
+if pam_fprintd_in_shared_stack "$FIXTURES/shared/common-auth"; then got=conflict; else got=clear; fi
+check "detects pam_fprintd in the shared auth stack" "$got" "conflict"
+
+if pam_fprintd_in_shared_stack "$FIXTURES/shared-auth-plain"; then got=conflict; else got=clear; fi
+check "no conflict reported for a shared stack without pam_fprintd" "$got" "clear"
+
+# A continuation would hide the line from a plain grep, and the predicate that
+# decides whether to warn has to see through it - otherwise install.sh hardens
+# a stack that then silently never gets the reader.
+if pam_fprintd_in_shared_stack "$FIXTURES/shared-auth-continued"; then got=conflict; else got=clear; fi
+check "detects pam_fprintd split across a line continuation" "$got" "conflict"
+
+if pam_shared_stack_is_sane_without_fprintd "$FIXTURES/shared-auth-plain"; then got=sane; else got=unsafe; fi
+check "shared stack with pam_unix and no fprintd is sane" "$got" "sane"
+
+if pam_shared_stack_is_sane_without_fprintd "$FIXTURES/shared/common-auth"; then got=sane; else got=unsafe; fi
+check "shared stack still carrying fprintd is not 'done'" "$got" "unsafe"
+
+# The post-condition that decides whether install.sh puts the backups back.
+if pam_shared_stack_is_sane_without_fprintd "$FIXTURES/shared-auth-broken"; then got=sane; else got=unsafe; fi
+check "shared stack with no primary auth module is refused" "$got" "unsafe"
+
+# Which services actually lose fingerprint - the cost quoted to the user
+# before they agree to it.
+mapfile -t losers < <(pam_fprintd_services_losing_fingerprint \
+  "$FIXTURES/shared/common-auth" "$FIXTURES/shared")
+losers_str=" ${losers[*]} "
+
+for want in gdm-password; do
+  case "$losers_str" in *"/shared/$want "*) got=listed ;; *) got=absent ;; esac
+  check "$want loses fingerprint with the shared stack's line gone" "$got" "listed"
+done
+
+# sudo has its own pam_fprintd.so line above the @include, so it keeps
+# fingerprint either way and must not be quoted as a cost.
+case "$losers_str" in *"/shared/sudo "*) got=listed ;; *) got=absent ;; esac
+check "a service with its own fprintd line is not counted as a loss" "$got" "absent"
+
+# gdm-fingerprint never includes the shared stack at all.
+case "$losers_str" in *"/shared/gdm-fingerprint "*) got=listed ;; *) got=absent ;; esac
+check "a service that doesn't include the shared stack is not listed" "$got" "absent"
+
+case "$losers_str" in *".bak-20260101000000 "*) got=listed ;; *) got=absent ;; esac
+check "a .bak- copy of a qualifying service is not listed" "$got" "absent"
+
+case "$losers_str" in *"/shared/common-auth "*) got=listed ;; *) got=absent ;; esac
+check "the shared stack does not list itself" "$got" "absent"
+
+check "exactly one service loses fingerprint in the fixture tree" \
+  "${#losers[@]}" "1"
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "All regex/detection tests passed."
