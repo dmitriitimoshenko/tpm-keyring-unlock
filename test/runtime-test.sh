@@ -37,7 +37,7 @@ check() {
   fi
 }
 
-echo "-- building module against fake helper (2s timeout instead of 15s) --"
+echo "-- building module against fake helper (2s timeout instead of 25s) --"
 gcc -Wall -Wextra -fPIC -shared \
   -DHELPER_PATH="\"$FAKE_HELPER\"" -DHELPER_TIMEOUT_SECS=2 \
   -o /tmp/pam_tpm_keyring_authtok.so \

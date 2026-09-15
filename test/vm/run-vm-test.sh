@@ -464,6 +464,84 @@ if wait_for_ssh "$B1_SSHPORT"; then
   fi
   check "two concurrent unseal calls both succeed (flock serialization)" "$got" "both-correct"
 
+  # --- the persisted primary gets evicted out from under a live enrollment -
+  # GitHub issue #7. bin/seal.sh persists the primary at one MACHINE-WIDE
+  # handle every user shares, so another user's uninstall.sh (or a TPM clear,
+  # or anything else in the tss group) can evict it while this user's
+  # primary.handle file still sits there naming it. Until 2026-09-15 the
+  # helper only fell back to recreating the primary when the FILE was missing,
+  # so that case ended in a bare tpm2_load failure and a silently locked
+  # keyring. Only a real TPM can exercise this: the container layer's helper
+  # is a fake shell script with no handles at all.
+  #
+  # Deliberately in boot 1, not boot 2: the KNOWN_CI_PCR7_DRIFT exemption
+  # wraps the post-reboot check only, so a check placed here is a genuine CI
+  # gate, whereas one placed after the reboot could be swallowed by that
+  # branch or fail for reasons that have nothing to do with this fix.
+  EVICT_HANDLE="$(vm_ssh "$B1_SSHPORT" 'cat ~/.local/share/tpm-keyring-unlock/primary.handle' 2>/dev/null | tr -d '[:space:]')"
+  if vm_ssh "$B1_SSHPORT" "sudo tpm2_readpublic -c $EVICT_HANDLE" >/dev/null 2>&1; then
+    got=present
+  else
+    got=absent
+  fi
+  check "the persisted primary is really at $EVICT_HANDLE before we evict it" "$got" "present"
+
+  # Fingerprint of the user's data dir, to prove the root-run helper never
+  # writes into an unprivileged user's home while recovering (it resolves
+  # $HOME from getent and runs as root during authentication, so a write
+  # there would be a root write through a path that user controls). Name,
+  # size, mode, owner and mtime of every file.
+  DATA_BEFORE="$(vm_ssh "$B1_SSHPORT" 'find ~/.local/share/tpm-keyring-unlock -printf "%f %s %m %U %T@\n" | sort')"
+
+  # Exactly what another user's uninstall.sh does.
+  vm_ssh "$B1_SSHPORT" "sudo tpm2_evictcontrol -C o -c $EVICT_HANDLE" >/dev/null 2>&1
+  if vm_ssh "$B1_SSHPORT" "sudo tpm2_readpublic -c $EVICT_HANDLE" >/dev/null 2>&1; then
+    got=still-there
+  else
+    got=evicted
+  fi
+  # Guards against the check below passing trivially because the eviction
+  # silently did nothing.
+  check "evicting $EVICT_HANDLE actually empties the handle" "$got" "evicted"
+
+  EVICTED_START=$(date +%s%N)
+  GOT_EVICTED="$(vm_ssh "$B1_SSHPORT" 'sudo bash ~/tpm-keyring-unlock/pam/tpm-keyring-unseal.sh ubuntu' \
+    2>"$WORK/unseal-evicted.err")"
+  EVICTED_END=$(date +%s%N)
+  echo "-- tpm-keyring-unseal.sh (persisted primary evicted, slow path) took $(elapsed_ms "$EVICTED_START" "$EVICTED_END")ms --"
+  # THE assertion for issue #7: fails against the pre-2026-09-15 helper,
+  # passes with the load-failure fallback.
+  check "unseal recovers when the shared persisted primary is evicted" \
+    "$GOT_EVICTED" "$SECRET" "$WORK/unseal-evicted.err"
+
+  # The whole point of the slow path being visible rather than silent: the
+  # affected user's only clue is this line in the journal.
+  if grep -q 'seal\.sh' "$WORK/unseal-evicted.err" 2>/dev/null; then got=warned; else got=silent; fi
+  check "the fallback warns on stderr and names bin/seal.sh" "$got" "warned"
+
+  DATA_AFTER="$(vm_ssh "$B1_SSHPORT" 'find ~/.local/share/tpm-keyring-unlock -printf "%f %s %m %U %T@\n" | sort')"
+  if [ "$DATA_BEFORE" = "$DATA_AFTER" ]; then got=untouched; else got=modified; fi
+  check "the root-run helper never writes into the user's data dir" "$got" "untouched"
+
+  # Put the handle back before moving on. Two reasons: the post-reboot check
+  # further down must keep testing what it has always tested (unsealing off a
+  # persisted handle across a TPM reset), and re-persisting is itself the
+  # proof that the primary really is deterministic - the same sealed blob
+  # loads again under a freshly recreated, re-persisted object.
+  vm_ssh "$B1_SSHPORT" "sudo tpm2_createprimary -C o -c /tmp/restore.ctx >/dev/null \
+     && sudo tpm2_evictcontrol -C o -c /tmp/restore.ctx $EVICT_HANDLE >/dev/null" >/dev/null 2>&1
+  if vm_ssh "$B1_SSHPORT" "sudo tpm2_readpublic -c $EVICT_HANDLE" >/dev/null 2>&1; then
+    got=restored
+  else
+    got=missing
+  fi
+  check "the persisted primary can be re-persisted at the same handle" "$got" "restored"
+
+  GOT_RESTORED="$(vm_ssh "$B1_SSHPORT" 'sudo bash ~/tpm-keyring-unlock/pam/tpm-keyring-unseal.sh ubuntu' \
+    2>"$WORK/unseal-restored.err")"
+  check "the same sealed blob unseals again on the restored fast path" \
+    "$GOT_RESTORED" "$SECRET" "$WORK/unseal-restored.err"
+
   B1_OK=1
 else
   check "VM B reachable over SSH (boot 1)" "unreachable" "reachable"

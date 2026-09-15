@@ -400,8 +400,11 @@ a real VM (`swtpm` + OVMF, real toggleable Secure Boot state) — the actual
 `require_secure_boot()` detection logic in both states, a real `bin/seal.sh`
 + `tpm-keyring-unseal.sh` round trip against a real PCR7 policy, that round
 trip surviving a genuine TPM reset (a real swtpm+qemu process restart, the
-same trigger as a physical reboot), and two concurrent unseal calls against
-the same TPM (the `flock` serialization fix). **Still genuinely untested:**
+same trigger as a physical reboot), two concurrent unseal calls against
+the same TPM (the `flock` serialization fix), and recovery when the shared
+persisted primary is evicted out from under a live enrollment — including
+that the root-run helper leaves the user's data directory byte-identical
+while recovering. **Still genuinely untested:**
 any TPM implementation other than this one dev machine's fTPM and the
 software TPM the VM layer uses (real hardware TPMs, especially other
 vendors' fTPMs, can behave differently under contention — that's exactly
@@ -420,15 +423,50 @@ situation — please open an issue.
 Reverses each step. Your actual GNOME keyring password is never changed by
 this tool, so there's nothing to restore there.
 
+One thing worth knowing if more than one person uses this tool on this
+machine: the TPM primary key is a single shared object at one fixed handle
+(`0x81018000`). It's the same key for everyone by construction — the second
+person to seal reuses the one that's already there, rather than spending
+another of the TPM's few persistent-object slots on an identical copy — so
+evicting it is a machine-wide act, not a personal one. `uninstall.sh` looks
+for other users' sealed secrets first and refuses to evict if it finds any,
+or if it can't check. If it does get evicted while someone was still
+depending on it, nothing is lost: their logins keep working, several seconds
+slower, until they re-run `bin/seal.sh`.
+
 ## Threat model, honestly
 
-What this protects against: someone getting hold of your powered-off laptop
-and pulling the disk. The sealed secret is worthless off this TPM.
+**Protected: the disk comes out and gets read somewhere else.** The sealed
+blob is ciphertext bound to this machine's TPM and to its PCR7 state, and
+neither of those travels with the disk.
 
-What this does **not** protect against: anyone with control of your running,
-logged-in machine (root, or you) can read the sealed secret's decrypted
-value the same way this tool does — that's inherent to "unlock
-automatically without asking," not a bug specific to this approach.
+**Not protected: the whole machine is taken.** PCR7 measures the Secure Boot
+state — which keys are enrolled, and which certificate vouched for each
+thing that loaded. It does not measure the kernel, the initrd, or the kernel
+command line, and the policy has no password on it, because unsealing has to
+happen at login without asking anyone anything. So someone holding your
+laptop can pick your own installed system in GRUB, add `init=/bin/bash` to
+its command line, and boot straight to a root shell: same bootloader, same
+signatures, same PCR7, and the TPM unseals for them exactly as it does for
+you. Booting that distro's own install media gets to the same place. Your
+disk isn't encrypted — that was the premise of this whole tool — so the
+sealed file is sitting right there too.
+
+So the honest framing is narrow: **this replaces a keyring password kept in
+a plaintext file, not full-disk encryption.** If "someone walks off with the
+laptop" is in your threat model, use FDE — at which point, as "The fix"
+above says, you don't need this tool at all.
+
+Binding more PCRs (4, 8 and 9 — the bootloader, GRUB's commands including
+that command line, and the kernel/initrd it loads) would narrow that gap,
+and is deliberately not done: it would mean re-running `bin/seal.sh` after
+every kernel and bootloader update, a cost paid on every machine to
+half-cover a case FDE already covers properly.
+
+Also not protected: anyone with control of your running, logged-in machine
+(root, or you) can read the sealed secret's decrypted value the same way
+this tool does — that's inherent to "unlock automatically without asking,"
+not a bug specific to this approach.
 
 One detail worth stating plainly, since the fingerprint stack invites the
 question: a **failed** fingerprint attempt still triggers an unseal. The last
@@ -465,10 +503,13 @@ break it.
   `install.sh`.
 - **Login pauses for several seconds (fingerprint or password) even though
   auto-unlock works.** The TPM operation this relies on has a fast path and
-  a slow fallback path; sealed secrets created before that fast path existed
-  use the slow one until re-sealed. Fix: `bin/seal.sh` (choose "Overwrite"
-  when it asks, same password as before). See JOURNAL.md, 2026-08-16, for
-  why this is one-time and safe.
+  a slow fallback path. Two things put you on the slow one: a secret sealed
+  before the fast path existed, or — on a machine with more than one user —
+  the shared TPM primary having been evicted by someone else's `uninstall.sh`
+  (`journalctl -b 0 | grep -i tpm` says so explicitly in that case). Fix for
+  both: `bin/seal.sh` (choose "Overwrite" when it asks, same password as
+  before). See JOURNAL.md, 2026-08-16 and 2026-09-15, for why this is
+  one-time and safe.
 - **`install.sh` refuses to run, saying it can't determine the Secure Boot
   state.** It checks via `mokutil --sb-state` first, falling back to
   reading the `SecureBoot` EFI variable directly if `mokutil` isn't

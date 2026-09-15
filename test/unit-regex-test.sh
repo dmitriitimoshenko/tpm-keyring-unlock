@@ -496,6 +496,85 @@ check "the shared stack does not list itself" "$got" "absent"
 check "exactly one service loses fingerprint in the fixture tree" \
   "${#losers[@]}" "1"
 
+# --- the machine-wide TPM primary handle ----------------------------------
+# bin/lib.sh's tpm_handle_is_wellformed / tpm_primary_handle_dependents, which
+# is what uninstall.sh now consults before evicting a handle every user of the
+# tool shares (GitHub issue #7, JOURNAL.md 2026-09-15). Pure filesystem +
+# string logic, so it needs no TPM, no container and no root: the predicate
+# takes a passwd-format file as its third argument for exactly this reason.
+# The home directories have to be absolute paths into a throwaway tree, so the
+# passwd fixture is generated here rather than committed.
+
+# A handle read out of an unprivileged user's home ends up as tpm2_load's -C,
+# which is spelled --parent-context and accepts a CONTEXT FILE PATH as well as
+# a handle. So this check is what stands between that file's contents and a
+# root-side open of an arbitrary path during authentication - the reject cases
+# below are the point of it, not the accept case.
+check "well-formed persistent handle accepted" \
+  "$(tpm_handle_is_wellformed 0x81018000 && echo yes || echo no)" "yes"
+for bad in "0X81018000" "0x81018000  extra" "" "0x71018000" "/tmp/evil.ctx" "0x8101800"; do
+  check "malformed handle rejected: '$bad'" \
+    "$(tpm_handle_is_wellformed "$bad" && echo yes || echo no)" "no"
+done
+
+HANDLE_TREE="$(mktemp -d)"
+trap 'rm -rf "$HANDLE_TREE"' EXIT
+
+mkhome() {
+  local user="$1" handle="$2" with_blob="$3"
+  local d="$HANDLE_TREE/$user/.local/share/tpm-keyring-unlock"
+  mkdir -p "$d"
+  [ "$handle" = "-" ] || printf '%s\n' "$handle" >"$d/primary.handle"
+  [ "$with_blob" != "blob" ] || : >"$d/seal.priv"
+  printf '%s:x:1001:1001::%s:/bin/bash\n' "$user" "$HANDLE_TREE/$user"
+}
+
+{
+  printf 'root:x:0:0:root:/root:/bin/bash\n'
+  mkhome alice   0x81018000 blob     # depends on it - the one that must be found
+  mkhome bob     0x81018000 noblob   # handle file left behind, no sealed blob
+  mkhome carol   0x81018001 blob     # sealed under a different handle
+  mkhome dave    0x81018000 blob     # this is the uninstalling user
+  mkhome erin    -          blob     # never persisted a primary at all
+  printf 'ghost:x:1005:1005::%s/nowhere:/bin/bash\n' "$HANDLE_TREE"
+  printf 'nohome:x:1006:1006:::/usr/sbin/nologin\n'
+} >"$HANDLE_TREE/passwd"
+
+deps="$(tpm_primary_handle_dependents 0x81018000 dave "$HANDLE_TREE/passwd" | sort | tr '\n' ' ')"
+check "finds the other user who sealed under the same handle" "$deps" "alice "
+
+# Each of these is a way the old code would have been wrong in the unsafe
+# direction (claiming a dependency that isn't there, so refusing forever) or
+# the dangerous one (missing a real dependency, so evicting anyway).
+case "$deps" in *bob*)   got=listed ;; *) got=absent ;; esac
+check "a stale handle file with no sealed blob is not a dependency" "$got" "absent"
+case "$deps" in *carol*) got=listed ;; *) got=absent ;; esac
+check "a user sealed under a different handle is not a dependency" "$got" "absent"
+case "$deps" in *dave*)  got=listed ;; *) got=absent ;; esac
+check "the uninstalling user is not counted as their own dependent" "$got" "absent"
+case "$deps" in *erin*)  got=listed ;; *) got=absent ;; esac
+check "a user who never persisted a primary is not a dependency" "$got" "absent"
+case "$deps" in *ghost*) got=listed ;; *) got=absent ;; esac
+check "a user whose home doesn't exist is skipped, not an error" "$got" "absent"
+
+# Whitespace: seal.sh writes the handle with a trailing newline, and a file
+# that picked up CRLF must still compare equal rather than silently reading
+# as "nobody depends on this".
+printf '0x81018000\r\n' >"$HANDLE_TREE/alice/.local/share/tpm-keyring-unlock/primary.handle"
+deps_crlf="$(tpm_primary_handle_dependents 0x81018000 dave "$HANDLE_TREE/passwd" | tr '\n' ' ')"
+check "a CRLF-terminated handle file still matches" "$deps_crlf" "alice "
+
+# The empty result must be a SUCCESSFUL scan: uninstall.sh tells "nobody
+# depends on this" apart from "couldn't check" purely by exit status, and
+# fails closed on the latter. A non-zero exit here would turn every clean
+# uninstall into a refusal.
+if none="$(tpm_primary_handle_dependents 0x81018999 dave "$HANDLE_TREE/passwd")"; then
+  got="ok:[$none]"
+else
+  got="nonzero-exit"
+fi
+check "a handle nobody uses returns empty AND exits zero" "$got" "ok:[]"
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "All regex/detection tests passed."

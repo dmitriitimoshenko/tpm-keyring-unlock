@@ -87,9 +87,29 @@ trap cleanup EXIT
 tpm2_createprimary -C o -c "$WORKDIR/primary.ctx" >/dev/null
 tpm2_readpublic -c "$WORKDIR/primary.ctx" -n "$WORKDIR/fresh.name" >/dev/null
 
+# This handle is MACHINE-WIDE, not per-account. Because the primary is
+# deterministic, the second user on a machine to run this lands in the
+# existing-object branch below, finds a byte-identical key, and reuses it
+# rather than burning another of the TPM's scarce persistent-object NV slots
+# on a copy. That sharing is deliberate and stays - but it means the object
+# has no single owner, and the TPM offers no way to ask who still depends on
+# it, which is why uninstall.sh has to look for other users' recorded handles
+# on disk before evicting (bin/lib.sh's tpm_primary_handle_dependents) and
+# why pam/tpm-keyring-unseal.sh treats a dead handle as recoverable rather
+# than fatal. See JOURNAL.md, 2026-08-16 and 2026-09-15, and GitHub issue #7.
 PRIMARY_HANDLE_DEFAULT="0x81018000"
 if [ -f "$DATA_DIR/primary.handle" ]; then
-  PRIMARY_HANDLE="$(cat "$DATA_DIR/primary.handle")"
+  PRIMARY_HANDLE="$(tr -d '[:space:]' <"$DATA_DIR/primary.handle" 2>/dev/null || true)"
+  # Validated before it can reach a tpm2_* tool: -C is --parent-context and
+  # takes a context-FILE PATH as readily as a handle, so an unvalidated file
+  # here would let its contents redirect what gets opened. A file that isn't
+  # a persistent handle is treated as no record at all.
+  if ! tpm_handle_is_wellformed "$PRIMARY_HANDLE"; then
+    echo "$DATA_DIR/primary.handle doesn't contain a TPM persistent handle" >&2
+    echo "(expected something like $PRIMARY_HANDLE_DEFAULT). Ignoring it and" >&2
+    echo "using the default." >&2
+    PRIMARY_HANDLE="$PRIMARY_HANDLE_DEFAULT"
+  fi
 else
   PRIMARY_HANDLE="$PRIMARY_HANDLE_DEFAULT"
 fi

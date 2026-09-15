@@ -5,8 +5,9 @@ set -euo pipefail
 DATA_DIR="$HOME/.local/share/tpm-keyring-unlock"
 HELPER_DST="/usr/local/sbin/tpm-keyring-unseal"
 
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=bin/lib.sh
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bin/lib.sh"
+source "$REPO_DIR/bin/lib.sh"
 
 confirm() {
   local prompt="$1"
@@ -15,6 +16,19 @@ confirm() {
   # terminal) is a "no", so nothing here can be auto-approved by a pipe.
   read -rp "$prompt [Y/n] " ans || return 1
   [[ ! "$ans" =~ ^[Nn][Oo]?$ ]]
+}
+
+# Same, but an empty answer DECLINES. Used for evicting the TPM primary,
+# which is the one step in this script whose blast radius is the whole
+# machine rather than this account, and which nothing can undo without every
+# affected user re-running bin/seal.sh. Declining costs one TPM NV slot;
+# accepting wrongly costs other people their keyring unlock, so the default
+# belongs on "don't". See JOURNAL.md, 2026-09-15.
+confirm_default_no() {
+  local prompt="$1"
+  local ans
+  read -rp "$prompt [y/N] " ans || return 1
+  [[ "$ans" =~ ^[Yy]([Ee][Ss])?$ ]]
 }
 
 # One timestamp for the whole run, so a file touched by two different steps
@@ -251,14 +265,72 @@ fi
 # object doesn't sit in the TPM's limited persistent-object slots forever.
 # Only present on installs that have re-sealed since that change; older
 # sealed data never persisted anything, so there's nothing to evict.
+#
+# That object is MACHINE-WIDE, though, not this account's: bin/seal.sh
+# persists it at one fixed handle every user of this tool shares. The TPM
+# itself cannot say who still depends on it - a persistent object has no
+# owner and no refcount - so the only available answer is to look for other
+# users' recorded handles on disk, which needs root because those data dirs
+# are 0700. See bin/lib.sh's tpm_primary_handle_dependents, GitHub issue #7
+# and JOURNAL.md, 2026-09-15.
 if [ -f "$DATA_DIR/primary.handle" ] && command -v tpm2_evictcontrol >/dev/null 2>&1; then
-  PRIMARY_HANDLE="$(cat "$DATA_DIR/primary.handle")"
-  if confirm "Evict the persisted TPM primary key at $PRIMARY_HANDLE?"; then
-    if tpm2_evictcontrol -C o -c "$PRIMARY_HANDLE" >/dev/null 2>&1; then
-      echo "Evicted."
+  PRIMARY_HANDLE="$(tr -d '[:space:]' <"$DATA_DIR/primary.handle" 2>/dev/null || true)"
+  if ! tpm_handle_is_wellformed "$PRIMARY_HANDLE"; then
+    echo "$DATA_DIR/primary.handle doesn't contain a TPM persistent handle." >&2
+    echo "Not evicting anything on the strength of that." >&2
+  else
+    echo
+    echo "-- checking whether other users still depend on $PRIMARY_HANDLE --"
+    echo "(needs root: other users' data directories are 0700)"
+    # Fail closed. Anything that stops this from producing a trustworthy
+    # answer - sudo declined, getent unavailable, an unreadable home - has
+    # to count as "somebody might", because the failure mode on the other
+    # side is silently breaking someone else's login.
+    if DEPENDENTS="$(sudo bash -c '
+           set -euo pipefail
+           source "$1"
+           tpm_primary_handle_dependents "$2" "$3"
+         ' _ "$REPO_DIR/bin/lib.sh" "$PRIMARY_HANDLE" "$USER")"; then
+      SCAN_OK=1
     else
-      echo "Couldn't evict $PRIMARY_HANDLE (already gone, or TPM not reachable" >&2
-      echo "right now) - continuing anyway." >&2
+      SCAN_OK=0
+      DEPENDENTS=""
+    fi
+
+    if [ "$SCAN_OK" -eq 0 ]; then
+      echo "Couldn't check (sudo declined, or the user list is unavailable)." >&2
+      echo "Not evicting $PRIMARY_HANDLE - it's shared machine-wide, and an" >&2
+      echo "unchecked eviction can break other users' keyring unlock. If you're" >&2
+      echo "sure nobody else uses this tool here:" >&2
+      echo "  tpm2_evictcontrol -C o -c $PRIMARY_HANDLE" >&2
+    elif [ -n "$DEPENDENTS" ]; then
+      # Refuse outright rather than prompt. bin/seal.sh sets the precedent
+      # for this exact shape: when it finds the handle occupied by an object
+      # it didn't create, it refuses and prints the command for someone who
+      # knows better, instead of asking a question whose consequences the
+      # person answering can't see.
+      echo "These users have sealed secrets under $PRIMARY_HANDLE too:" >&2
+      echo "$DEPENDENTS" | sed 's/^/  /' >&2
+      echo "Not evicting it. It's one shared object - taking it away would make" >&2
+      echo "their next login fall back to recreating the primary (several seconds" >&2
+      echo "slower) until each of them re-runs bin/seal.sh." >&2
+      echo "If you really mean to, after they've re-sealed or moved on:" >&2
+      echo "  tpm2_evictcontrol -C o -c $PRIMARY_HANDLE" >&2
+    else
+      echo "No other user's sealed secret names this handle."
+      if confirm_default_no "Evict the TPM primary key at $PRIMARY_HANDLE? It is shared by every
+user of this tool on this machine. Nobody else was found using it - though a
+home that isn't mounted right now wouldn't show up. Anyone still holding one
+keeps logging in, just several seconds slower, until they re-run bin/seal.sh."; then
+        if tpm2_evictcontrol -C o -c "$PRIMARY_HANDLE" >/dev/null 2>&1; then
+          echo "Evicted."
+        else
+          echo "Couldn't evict $PRIMARY_HANDLE (already gone, or TPM not reachable" >&2
+          echo "right now) - continuing anyway." >&2
+        fi
+      else
+        echo "Left $PRIMARY_HANDLE in place."
+      fi
     fi
   fi
 fi

@@ -52,12 +52,25 @@
  * 25s leaves headroom instead of the alarm cutting off a retry that would
  * have succeeded. See JOURNAL.md, 2026-08-14.
  *
- * That ~7s createprimary term is now only paid by sealed data that hasn't
- * been re-sealed since the persisted-primary optimization (2026-08-16,
- * JOURNAL.md) - a re-sealed install's real-world time is closer to 1s even
- * at 5 retries. 25s is kept as-is because this module has no way to know in
- * advance which path a given login will take, and it's already a safe,
- * conservative bound for both. */
+ * That ~7s createprimary term is reached by two different paths, both
+ * current:
+ *   - sealed data that predates the persisted-primary optimization
+ *     (2026-08-16, JOURNAL.md) and hasn't been re-sealed since;
+ *   - a recorded primary.handle whose persisted object has gone away. That
+ *     object is machine-wide, so another user's uninstall.sh evicting it (or
+ *     a TPM clear) leaves a perfectly healthy, fully re-sealed install on the
+ *     slow path until bin/seal.sh is re-run. The helper recovers by
+ *     recreating the primary instead of failing outright - see JOURNAL.md,
+ *     2026-09-15, and GitHub issue #7.
+ * The second path costs one extra failed tpm2_load (a single command that
+ * errors immediately against an empty handle) on top of the old slow path,
+ * so the worst case moves from ~19.5s to ~20s - still inside this budget.
+ * A healthy install on the fast path is closer to 1s even at 5 retries.
+ * 25s is kept as-is because this module has no way to know in advance which
+ * path a given login will take, and it's already a safe, conservative bound
+ * for all of them. It is also why the helper recreates the primary at most
+ * once per call: a second attempt would add another ~7s and blow this
+ * alarm, turning a slow login into a guaranteed failed one. */
 #ifndef HELPER_PATH
 #define HELPER_PATH "/usr/local/sbin/tpm-keyring-unseal"
 #endif
