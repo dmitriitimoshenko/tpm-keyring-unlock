@@ -1,0 +1,3 @@
+#%PAM-1.0
+@include loop-b
+auth    optional        pam_gnome_keyring.so

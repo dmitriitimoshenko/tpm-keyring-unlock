@@ -48,7 +48,22 @@ actually runs there, never skips.
   doesn't exist (skipped, not an error), a CRLF-terminated handle file
   (still matches), and — the one that decides the fail-closed behaviour —
   that finding nobody exits zero, so `uninstall.sh` can tell "nobody
-  depends on this" apart from "couldn't check". The PAM control flow
+  depends on this" apart from "couldn't check".
+  And `pam_auth_authenticates_before_keyring`, which decides whether
+  `install.sh` may wire the module into a given stack at all: the module sets
+  `PAM_AUTHTOK` from the TPM before anyone has authenticated, so the
+  insertion point has to sit below something that already demanded
+  credentials. Both directions are asserted, because both are dangerous — a
+  false "unsafe" refuses a stack every distro ships, a false "safe" writes a
+  login bypass. Fixtures in `test/fixtures/pam.d/ordering/` cover a direct
+  authenticator, one reached through `@include`, one through `auth substack`,
+  one split across a line continuation, a keyring line placed before anything
+  authenticates, a stack whose only modules are `optional`, a
+  fingerprint-only stack (`pam_fprintd` answers yes/no and never yields a
+  password, so it does not count), and an `@include` loop (must refuse, not
+  hang). The real `@include`-based `gdm-password` fixture is asserted
+  accepted separately — that one case breaking would refuse every supported
+  Debian-family install. The PAM control flow
   of the generated stack is covered by `runtime-test.sh` below, against real
   libpam.
 - **`test/runtime-test.sh`** (one container, distro doesn't matter) — the
@@ -142,6 +157,16 @@ script). Two scenarios:
   the old blob is itself the proof that the primary is deterministic.
   This check fails against the pre-2026-09-15 helper — verified, not
   assumed; see `JOURNAL.md`.
+  Finally it creates a second account, points that account's data dir at the
+  first user's with a symlink, and confirms the helper refuses rather than
+  handing root's unseal of someone else's keyring password to whoever asked —
+  asserting both that the secret does not come back *and* that the refusal
+  came from the ownership check rather than some incidental failure, then
+  that the legitimate owner still unseals (an ownership check that locks out
+  the real user would be the worse bug). Also asserts the unseal lock now
+  lives in a root-owned 0700 directory instead of world-writable
+  `/run/lock`. Two real accounts and a real TPM, so no other layer can
+  cover it.
 
 Needs `swtpm`, `qemu-system-x86_64`/`qemu-img`, `/dev/kvm`, and network
 access once to fetch a small Ubuntu cloud image (cached afterward,

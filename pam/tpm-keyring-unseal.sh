@@ -15,6 +15,38 @@ PCR_BANK="sha256:7"
 
 [ -f "$DATA_DIR/seal.priv" ] || exit 1
 
+# This script runs as root and reaches $DATA_DIR purely by resolving $HOME
+# out of getent - it has no other evidence that what it is about to unseal
+# belongs to the user being authenticated. It has to check, because nothing
+# else does: the sealed blob has no auth value and a PCR7-only policy, so it
+# carries no notion of whose it is. Without this, one user could point their
+# own data dir at another's (a symlink is enough; the path is entirely theirs
+# to shape) and have root unseal the *other* user's keyring password into
+# their login. See JOURNAL.md, 2026-09-15.
+#
+# Ownership of the resolved files, not "is this a symlink": a home directory
+# legitimately living behind a symlink is somebody's real setup, and the
+# thing that actually matters is who owns what we end up reading. Owned by
+# the target user and not writable by group or other - a group-writable data
+# dir would let somebody else swap the blob under root's nose.
+TARGET_UID="$(getent passwd "$USERNAME" | cut -d: -f3)"
+[ -n "$TARGET_UID" ] || exit 1
+for f in "$DATA_DIR" "$DATA_DIR/seal.priv" "$DATA_DIR/seal.pub"; do
+  owner="$(stat -Lc '%u' "$f" 2>/dev/null || true)"
+  mode="$(stat -Lc '%a' "$f" 2>/dev/null || true)"
+  if [ "$owner" != "$TARGET_UID" ]; then
+    echo "tpm-keyring-unseal: $f is not owned by $USERNAME - refusing to unseal." >&2
+    exit 1
+  fi
+  # 022 = group-write | other-write. The leading 0 makes bash read stat's
+  # output as octal; a setuid/sticky prefix ("2755") stays harmless here
+  # because the mask only looks at those two bits.
+  if [ -z "$mode" ] || [ $(( 0$mode & 022 )) -ne 0 ]; then
+    echo "tpm-keyring-unseal: $f is writable by group or other - refusing." >&2
+    exit 1
+  fi
+done
+
 # GDM spawns parallel PAM conversations on one login screen (e.g.
 # gdm-fingerprint and gdm-password at once), and this helper is wired into
 # both. Two concurrent tpm2_* sequences against the same TPM have been
@@ -23,7 +55,21 @@ PCR_BANK="sha256:7"
 # concurrent activity on the same device. See JOURNAL.md, 2026-08-14. Serialize
 # so only one unseal talks to the TPM at a time; the loser just waits its turn
 # instead of racing and failing.
-exec 9>/run/lock/tpm-keyring-unseal.lock
+# NOT /run/lock: that directory is world-writable (drwxrwxrwt) on a normal
+# system, so any local user could create this file first and simply hold the
+# lock, stalling every login for the full flock timeout below and then making
+# the unseal fail - an unprivileged denial of keyring auto-unlock, needing no
+# symlink and no race. /run itself is root-owned and mode 755, so a directory
+# created here can only have been created by root. See JOURNAL.md,
+# 2026-09-15.
+LOCK_DIR=/run/tpm-keyring-unlock
+if [ -L "$LOCK_DIR" ] || { [ -e "$LOCK_DIR" ] && [ ! -d "$LOCK_DIR" ]; }; then
+  echo "tpm-keyring-unseal: $LOCK_DIR exists and is not a directory - refusing." >&2
+  exit 1
+fi
+mkdir -p "$LOCK_DIR"
+chmod 700 "$LOCK_DIR"
+exec 9>"$LOCK_DIR/unseal.lock"
 flock -w 10 9 || exit 1
 
 WORKDIR=$(mktemp -d)

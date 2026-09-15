@@ -210,8 +210,22 @@ RESEAL=false
 mapfile -t candidates < <(grep -lE "$PAM_GNOME_KEYRING_AUTH_RE" /etc/pam.d/* 2>/dev/null \
   | grep -vE "$PAM_NON_SERVICE_RE")
 targets=()
+# Stacks that have a pam_gnome_keyring auth line but reach it before anything
+# has demanded credentials. Inserting above that line would put our module -
+# which sets PAM_AUTHTOK from the TPM before anyone authenticates - ahead of
+# whatever runs next, and anything down there that takes its password from
+# PAM_AUTHTOK instead of prompting would then let a login through on a secret
+# nobody typed. Collected separately and reported, never patched. See
+# bin/lib.sh's pam_auth_authenticates_before_keyring and JOURNAL.md,
+# 2026-09-15.
+unsafe_targets=()
 for c in "${candidates[@]}"; do
-  grep -q pam_tpm_keyring_authtok.so "$c" || targets+=("$c")
+  if grep -q pam_tpm_keyring_authtok.so "$c"; then continue; fi
+  if pam_auth_authenticates_before_keyring "$c"; then
+    targets+=("$c")
+  else
+    unsafe_targets+=("$c")
+  fi
 done
 
 # 1e. fingerprint stacks that drop the reader after one unlucky scan or one
@@ -420,6 +434,31 @@ if [ "${#targets[@]}" -gt 0 ]; then
   echo "     service authenticates you via something other than a typed"
   echo "     password (e.g. fingerprint)."
 fi
+# Reported whether or not anything is being wired up: a refused stack is the
+# one case where the tool declines to do what the user asked, so it must not
+# be silent about it.
+if [ "${#unsafe_targets[@]}" -gt 0 ]; then
+  echo
+  echo "  !! NOT wiring the TPM helper into these, and they are the reason:"
+  for t in "${unsafe_targets[@]}"; do
+    echo "       $t"
+  done
+  echo
+  echo "     Each has a pam_gnome_keyring.so auth line that is reached before"
+  echo "     anything in the stack has asked for credentials. The helper line"
+  echo "     goes immediately above that one and hands the TPM-unsealed"
+  echo "     keyring password to PAM before you have authenticated, so on a"
+  echo "     stack shaped like this a module further down that reads its"
+  echo "     password from PAM instead of prompting (pam_unix.so with"
+  echo "     try_first_pass, say) could log someone in on a secret nobody"
+  echo "     typed. Your keyring password is usually your login password, so"
+  echo "     that is a real way in, not a theoretical one."
+  echo
+  echo "     Nothing is wrong with the rest of the install; these files are"
+  echo "     just left alone. If one of them is hand-written, move its"
+  echo "     pam_gnome_keyring.so auth line below the module that actually"
+  echo "     authenticates (pam_unix.so and friends) and re-run."
+fi
 echo
 
 if ! confirm "Proceed with all of the above?"; then
@@ -605,6 +644,15 @@ else
     fi
     if grep -q pam_tpm_keyring_authtok.so "$TARGET"; then
       echo "$TARGET already had the module wired in - left unchanged."
+      continue
+    fi
+    # Re-checked here, not just when the plan was built, for the same reason
+    # the existence check above is: the package install between the two can
+    # rewrite a file under /etc/pam.d. This is the check that must not be
+    # skipped on a stale plan - getting it wrong writes a login bypass.
+    if ! pam_auth_authenticates_before_keyring "$TARGET"; then
+      echo "$TARGET reaches its pam_gnome_keyring.so auth line before anything" >&2
+      echo "authenticates - left untouched (see the note printed above)." >&2
       continue
     fi
     backup_pam_file "$TARGET"
