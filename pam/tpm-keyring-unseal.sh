@@ -15,6 +15,92 @@ PCR_BANK="sha256:7"
 
 [ -f "$DATA_DIR/seal.priv" ] || exit 1
 
+# This script runs as root and reaches $DATA_DIR purely by resolving $HOME
+# out of getent - it has no other evidence that what it is about to unseal
+# belongs to the user being authenticated. It has to check, because nothing
+# else does: the sealed blob has no auth value and a PCR7-only policy, so it
+# carries no notion of whose it is. Without this, one user could point their
+# own data dir at another's (a symlink is enough; the path is entirely theirs
+# to shape) and have root unseal the *other* user's keyring password into
+# their login. See JOURNAL.md, 2026-09-15.
+#
+# Ownership of the resolved files, not "is this a symlink": a home directory
+# legitimately living behind a symlink is somebody's real setup, and the
+# thing that actually matters is who owns what we end up reading. Owned by
+# the target user and not writable by group or other - a group-writable data
+# dir would let somebody else swap the blob under root's nose.
+TARGET_UID="$(getent passwd "$USERNAME" | cut -d: -f3)"
+[ -n "$TARGET_UID" ] || exit 1
+
+# Open the blobs ONCE, right here, and never name those paths again. This is
+# the whole reason the check below is trustworthy, and it is not a style
+# preference - checking a path and then reading the same path later is two
+# separate resolutions with a window in between, and everything in that
+# window belongs to the user we are checking up on. They own every component
+# of $DATA_DIR, so they can swap it for a symlink to somebody else's data dir
+# after the check has passed and before the read happens. The window here is
+# not a few instructions either: the flock below routinely waits, because GDM
+# runs gdm-fingerprint and gdm-password as parallel PAM conversations and
+# both land in this script.
+#
+# A file descriptor is immune to that. Once open it refers to one inode, and
+# /proc/self/fd/N is a procfs magic link that resolves back to that inode
+# rather than re-walking the path - so stat'ing it reports what we actually
+# opened, and reading from it returns what we actually opened, whatever the
+# path means by then. Confirmed rather than assumed; see JOURNAL.md,
+# 2026-09-15.
+exec 7<"$DATA_DIR/seal.priv" || exit 1
+exec 8<"$DATA_DIR/seal.pub" || exit 1
+
+# Now the ownership question, asked of the descriptors instead of the paths.
+# This script runs as root and reached $DATA_DIR purely by resolving $HOME
+# out of getent - it has no other evidence that what it is about to unseal
+# belongs to the user being authenticated, and nothing else supplies any: the
+# sealed blob has no auth value and a PCR7-only policy, so it carries no
+# notion of whose it is.
+for fd in 7 8; do
+  owner="$(stat -Lc '%u' "/proc/self/fd/$fd" 2>/dev/null || true)"
+  mode="$(stat -Lc '%a' "/proc/self/fd/$fd" 2>/dev/null || true)"
+  size="$(stat -Lc '%s' "/proc/self/fd/$fd" 2>/dev/null || true)"
+  # Sealed blobs are tiny - tpm2_create writes ~80 bytes of public area and
+  # ~140 of private. The cap is not about TPM limits, it is about what these
+  # descriptors get copied into below: root-owned scratch under /tmp, which
+  # is tmpfs, which is RAM. Without a bound, a user could grow their own
+  # seal.priv to arbitrary size and make root fill memory on every login
+  # attempt. Refused rather than truncated, because a truncated blob would
+  # come back as a confusing tpm2 error instead of the real reason.
+  if [ -z "$size" ] || [ "$size" -gt 65536 ]; then
+    echo "tpm-keyring-unseal: sealed data is implausibly large - refusing." >&2
+    exit 1
+  fi
+  if [ "$owner" != "$TARGET_UID" ]; then
+    echo "tpm-keyring-unseal: sealed data is not owned by $USERNAME - refusing." >&2
+    exit 1
+  fi
+  # 022 = group-write | other-write. The leading 0 makes bash read stat's
+  # output as octal; a setuid/sticky prefix ("2755") stays harmless here
+  # because the mask only looks at those two bits.
+  if [ -z "$mode" ] || [ $(( 0$mode & 022 )) -ne 0 ]; then
+    echo "tpm-keyring-unseal: sealed data is writable by group or other - refusing." >&2
+    exit 1
+  fi
+done
+
+# The directory is checked by path on purpose and is advisory only. A
+# group-writable data dir cannot smuggle in another user's blob - the
+# descriptor check above settles ownership, and replacing a file needs the
+# replacement to be owned by the target user, which needs root. It is still
+# worth refusing, because a data dir anyone can write to is not a state this
+# tool should keep operating in.
+dir_owner="$(stat -Lc '%u' "$DATA_DIR" 2>/dev/null || true)"
+dir_mode="$(stat -Lc '%a' "$DATA_DIR" 2>/dev/null || true)"
+if [ "$dir_owner" != "$TARGET_UID" ] \
+   || [ -z "$dir_mode" ] || [ $(( 0$dir_mode & 022 )) -ne 0 ]; then
+  echo "tpm-keyring-unseal: $DATA_DIR is not a private directory owned by" >&2
+  echo "$USERNAME - refusing to unseal." >&2
+  exit 1
+fi
+
 # GDM spawns parallel PAM conversations on one login screen (e.g.
 # gdm-fingerprint and gdm-password at once), and this helper is wired into
 # both. Two concurrent tpm2_* sequences against the same TPM have been
@@ -23,11 +109,35 @@ PCR_BANK="sha256:7"
 # concurrent activity on the same device. See JOURNAL.md, 2026-08-14. Serialize
 # so only one unseal talks to the TPM at a time; the loser just waits its turn
 # instead of racing and failing.
-exec 9>/run/lock/tpm-keyring-unseal.lock
+# NOT /run/lock: that directory is world-writable (drwxrwxrwt) on a normal
+# system, so any local user could create this file first and simply hold the
+# lock, stalling every login for the full flock timeout below and then making
+# the unseal fail - an unprivileged denial of keyring auto-unlock, needing no
+# symlink and no race. /run itself is root-owned and mode 755, so a directory
+# created here can only have been created by root. See JOURNAL.md,
+# 2026-09-15.
+LOCK_DIR=/run/tpm-keyring-unlock
+if [ -L "$LOCK_DIR" ] || { [ -e "$LOCK_DIR" ] && [ ! -d "$LOCK_DIR" ]; }; then
+  echo "tpm-keyring-unseal: $LOCK_DIR exists and is not a directory - refusing." >&2
+  exit 1
+fi
+mkdir -p "$LOCK_DIR"
+chmod 700 "$LOCK_DIR"
+exec 9>"$LOCK_DIR/unseal.lock"
 flock -w 10 9 || exit 1
 
 WORKDIR=$(mktemp -d)
 trap 'rm -rf "$WORKDIR"' EXIT
+
+# Drain the descriptors opened before the lock into root-owned scratch space,
+# and work from these copies from here on. The paths under $DATA_DIR are
+# never touched again, so there is nothing left for the user to swap: what
+# gets loaded is exactly the inode whose ownership was checked. Sealed blobs
+# only - this is the TPM-encrypted object, the same thing already written
+# here as seal.ctx, never the unsealed password.
+cat <&7 >"$WORKDIR/seal.priv"
+cat <&8 >"$WORKDIR/seal.pub"
+exec 7<&- 8<&-
 
 # Fast path: if bin/seal.sh has persisted the primary into the TPM's own NV
 # storage (see JOURNAL.md, 2026-08-16), reference that handle directly - no
@@ -95,7 +205,7 @@ fi
 LOADED=0
 if [ -n "$PRIMARY_HANDLE" ]; then
   if tpm2_load -C "$PRIMARY_HANDLE" \
-       -u "$DATA_DIR/seal.pub" -r "$DATA_DIR/seal.priv" \
+       -u "$WORKDIR/seal.pub" -r "$WORKDIR/seal.priv" \
        -c "$WORKDIR/seal.ctx" >/dev/null 2>"$WORKDIR/load.err"; then
     LOADED=1
   else
@@ -126,7 +236,7 @@ fi
 if [ "$LOADED" -eq 0 ]; then
   tpm2_createprimary -C o -c "$WORKDIR/primary.ctx" >/dev/null
   tpm2_load -C "$WORKDIR/primary.ctx" \
-    -u "$DATA_DIR/seal.pub" -r "$DATA_DIR/seal.priv" \
+    -u "$WORKDIR/seal.pub" -r "$WORKDIR/seal.priv" \
     -c "$WORKDIR/seal.ctx" >/dev/null
 fi
 

@@ -542,6 +542,94 @@ if wait_for_ssh "$B1_SSHPORT"; then
   check "the same sealed blob unseals again on the restored fast path" \
     "$GOT_RESTORED" "$SECRET" "$WORK/unseal-restored.err"
 
+  # --- one user must not be able to make root unseal another user's secret.
+  # The helper resolves $HOME out of getent and reads the blob as root, and
+  # the blob has no auth value and a PCR7-only policy, so nothing in it says
+  # whose it is. A second user pointing their own data dir at the first
+  # user's is enough to ask root for someone else's keyring password - the
+  # path is entirely theirs to shape. Needs two real accounts and a real TPM,
+  # so this is the only layer that can test it.
+  vm_ssh "$B1_SSHPORT" 'sudo useradd -m -s /bin/bash eve 2>/dev/null || true
+     sudo -u eve mkdir -p /home/eve/.local/share
+     sudo -u eve ln -sfn /home/ubuntu/.local/share/tpm-keyring-unlock \
+       /home/eve/.local/share/tpm-keyring-unlock' >/dev/null 2>&1
+  GOT_EVE="$(vm_ssh "$B1_SSHPORT" 'sudo bash ~/tpm-keyring-unlock/pam/tpm-keyring-unseal.sh eve' \
+    2>"$WORK/unseal-eve.err" || true)"
+  # The secret must not come back. Compared against the secret itself rather
+  # than against "empty", so a future change that leaks it some other way
+  # still fails this.
+  if [ "$GOT_EVE" = "$SECRET" ]; then got=leaked; else got=refused; fi
+  check "helper refuses another user's sealed blob reached by symlink" "$got" "refused"
+  # And refused for the stated reason, not because something unrelated broke.
+  if grep -q 'not owned by' "$WORK/unseal-eve.err" 2>/dev/null; then
+    got=ownership
+  else
+    got=other
+  fi
+  check "that refusal is the ownership check, not an incidental failure" "$got" "ownership" \
+    "$WORK/unseal-eve.err"
+
+  # The legitimate owner must still work afterwards - an ownership check that
+  # also locks out the real user would be a worse bug than the one it fixes.
+  GOT_OWNER="$(vm_ssh "$B1_SSHPORT" 'sudo bash ~/tpm-keyring-unlock/pam/tpm-keyring-unseal.sh ubuntu' \
+    2>"$WORK/unseal-owner.err")"
+  check "the real owner still unseals after the ownership check" \
+    "$GOT_OWNER" "$SECRET" "$WORK/unseal-owner.err"
+
+  # --- and the same attack won as a RACE, which is the version that matters.
+  # Checking a path and later reading that path is two resolutions with a
+  # window between them, and the window belongs to the user being checked:
+  # they own every component of their own data dir. The static symlink case
+  # above passes even on code that is wrong here, which is exactly how this
+  # was missed the first time - so this check makes the window wide on
+  # purpose and swaps inside it.
+  #
+  # mallory gets a data dir of her own holding plausible but useless blobs
+  # owned by her, so the ownership check genuinely passes, and only then
+  # points it at ubuntu's.
+  vm_ssh "$B1_SSHPORT" 'sudo useradd -m -s /bin/bash mallory 2>/dev/null || true
+     sudo -u mallory mkdir -p /home/mallory/.local/share/own-blobs
+     sudo -u mallory chmod 700 /home/mallory/.local/share/own-blobs
+     sudo -u mallory sh -c "head -c 80  /dev/urandom >/home/mallory/.local/share/own-blobs/seal.pub"
+     sudo -u mallory sh -c "head -c 137 /dev/urandom >/home/mallory/.local/share/own-blobs/seal.priv"
+     sudo -u mallory chmod 600 /home/mallory/.local/share/own-blobs/seal.pub \
+                               /home/mallory/.local/share/own-blobs/seal.priv
+     sudo -u mallory ln -sfn /home/mallory/.local/share/own-blobs \
+       /home/mallory/.local/share/tpm-keyring-unlock' >/dev/null 2>&1
+
+  # Hold the lock so the helper is guaranteed to sit in flock rather than
+  # racing on a few instructions. Not a contrivance: GDM runs
+  # gdm-fingerprint and gdm-password as parallel PAM conversations and both
+  # land in this script, so one of them waiting on the other is the ordinary
+  # case on a real login screen.
+  GOT_RACE="$(vm_ssh "$B1_SSHPORT" '
+     sudo mkdir -p /run/tpm-keyring-unlock
+     sudo sh -c "flock /run/tpm-keyring-unlock/unseal.lock -c \"sleep 5\" >/dev/null 2>&1 &"
+     sleep 0.5
+     sudo bash ~/tpm-keyring-unlock/pam/tpm-keyring-unseal.sh mallory >/tmp/race.out 2>/tmp/race.err &
+     helper=$!
+     sleep 1.5
+     sudo -u mallory ln -sfn /home/ubuntu/.local/share/tpm-keyring-unlock \
+       /home/mallory/.local/share/tpm-keyring-unlock
+     wait "$helper" 2>/dev/null || true
+     cat /tmp/race.out' 2>"$WORK/race.err")"
+  # Compared against the secret itself, not against "empty": the only thing
+  # that must never happen is ubuntu's password coming back.
+  if [ "$GOT_RACE" = "$SECRET" ]; then got=leaked; else got=refused; fi
+  check "no leak when the data dir is swapped after the check and before the read" \
+    "$got" "refused" "$WORK/race.err"
+
+  # And the legitimate owner is still fine once the dust settles.
+  GOT_OWNER2="$(vm_ssh "$B1_SSHPORT" 'sudo bash ~/tpm-keyring-unlock/pam/tpm-keyring-unseal.sh ubuntu' \
+    2>"$WORK/unseal-owner2.err")"
+  check "the real owner still unseals after the race check" \
+    "$GOT_OWNER2" "$SECRET" "$WORK/unseal-owner2.err"
+
+  # The lock no longer lives in world-writable /run/lock, so an unprivileged
+  # user cannot pre-create it and hold it to stall every login.
+  LOCKDIR_MODE="$(vm_ssh "$B1_SSHPORT" 'stat -Lc "%U %a" /run/tpm-keyring-unlock' 2>/dev/null)"
+  check "the unseal lock lives in a root-owned 0700 directory" "$LOCKDIR_MODE" "root 700"
+
   B1_OK=1
 else
   check "VM B reachable over SSH (boot 1)" "unreachable" "reachable"

@@ -1,0 +1,3 @@
+#%PAM-1.0
+auth    substack        common-auth
+auth    optional        pam_gnome_keyring.so
