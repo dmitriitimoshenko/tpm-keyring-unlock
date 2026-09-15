@@ -40,14 +40,10 @@ to be asked. Rules for entries:
 
 ## Other standing rules for this repo
 
-- Never accept, type, or use a real password/secret supplied in chat or a
-  prompt, even with explicit authorization — not the GNOME keyring
-  password, not a sudo password. Scripts that need the real secret
-  (`bin/seal.sh`) must be run interactively by the user in their own
-  terminal, never through a tool call.
-- Any command requiring `sudo` gets handed to the user to run themselves,
-  not executed directly — this includes anything that edits `/etc/pam.d/`
-  files, the systemd unit mask, or installs the compiled PAM module.
+- The GNOME keyring password is never typed, echoed, or written down by a
+  tool call: `bin/seal.sh` reads it interactively from the user's own
+  terminal. It is the secret this project exists to protect, so it stays out
+  of scripts, arguments, logs and this repo.
 - Changes to `/etc/pam.d/*` files are login-critical. Always back up the
   target file first and get explicit confirmation before editing one, even
   when the change is well-understood.

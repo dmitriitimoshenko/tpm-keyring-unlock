@@ -1,0 +1,6 @@
+#
+# every primary auth module gone: nobody can log in through this
+#
+auth	requisite			pam_deny.so
+auth	required			pam_permit.so
+auth	optional			pam_cap.so

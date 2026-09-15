@@ -634,3 +634,119 @@ pam_fprintd_stack_is_eligible() {
   pam_auth_has_no_relative_jumps "$f" || return 1
   return 0
 }
+
+# --- the competing fingerprint stack ------------------------------------
+#
+# Hardening a fingerprint-only service only helps if that service is the one
+# that actually gets the sensor. On a Debian-family desktop it usually is not.
+#
+# At the greeter and at the lock screen gnome-shell's ShellUserVerifier opens
+# *two* PAM conversations at once - gdm-password and gdm-fingerprint - and
+# once fingerprint is enabled in Settings, pam-auth-update has put
+# pam_fprintd into common-auth, which gdm-password @include's. Both stacks
+# therefore begin with pam_fprintd, only one of them can Claim() the reader,
+# and the loser gets "Device was already claimed", which pam_fprintd turns
+# into PAM_AUTHINFO_UNAVAIL - the same "no such auth method here" that makes
+# gnome-shell drop fingerprint for the rest of the prompt.
+#
+# gdm-password wins that race, because gnome-shell starts the password service
+# immediately and the fingerprint one only after a D-Bus round trip to fprintd
+# asking whether any prints are enrolled. Measured, not reasoned about: two
+# unprivileged pam_start_confdir(3) drivers running the two real stacks 0.2s
+# apart give
+#
+#   common-auth first:  prompts once, times out at its own timeout=10  (10.71s)
+#                       attempt stack returns AUTHINFO_UNAVAIL, no prompt (0.49s)
+#   attempt stack first: three prompts, 30s each                       (90.92s)
+#                       common-auth side returns immediately            (0.16s)
+#
+# See JOURNAL.md, 2026-09-15.
+#
+# So while pam_fprintd sits in the shared stack, the attempt stack is dead
+# code. Fingerprint has to live in exactly one of the two, and the shared one
+# is the one that has to go: it cannot be given extra attempts instead,
+# because it is serialised ahead of pam_unix, so N waits on the sensor delay
+# sudo's password prompt N times over. That is precisely why
+# pam_fprintd_stack_is_eligible() refuses it, and that refusal stands.
+
+# The pam-auth-update-managed shared auth stack. A variable so the tests can
+# point the predicates below at a fixture instead of the real thing.
+PAM_SHARED_AUTH_STACK="${PAM_SHARED_AUTH_STACK:-/etc/pam.d/common-auth}"
+
+# Basename of the marker install.sh drops in $DATA_DIR when it disables the
+# fprintd pam-auth-update profile. Shared so uninstall.sh looks for exactly
+# the file install.sh writes; its presence is the *only* thing that lets
+# uninstall.sh switch the profile back on, so that a machine where fingerprint
+# was already disabled by hand is never silently re-enabled by this tool.
+PAM_FPRINTD_PROFILE_MARKER="fprintd-pam-config-disabled"
+
+# Succeeds if the shared auth stack carries an auth-phase pam_fprintd line -
+# i.e. any service that @include's it will race the hardened stack for the
+# reader, and win.
+pam_fprintd_in_shared_stack() {
+  local shared="${1:-$PAM_SHARED_AUTH_STACK}"
+  [ -f "$shared" ] || return 1
+  _pam_logical_lines "$shared" | grep -qE "$PAM_FPRINTD_AUTH_RE"
+}
+
+# Prints the /etc/pam.d/ services that @include $1 and have no pam_fprintd
+# auth line of their own - i.e. exactly the services that would stop offering
+# fingerprint if it were removed from the shared stack. A service with its own
+# explicit line (Ubuntu ships one in /etc/pam.d/sudo) keeps fingerprint and is
+# deliberately left out, so the cost quoted to the user is the real one rather
+# than "everything that includes common-auth".
+#
+# Printed rather than summarised because the list is the whole point: on a
+# machine with no /etc/pam.d/polkit-1 the entry that matters is "other", and
+# no generic wording would tell anyone that polkit dialogs are what changes.
+pam_fprintd_services_losing_fingerprint() {
+  local shared="${1:-$PAM_SHARED_AUTH_STACK}" dir="${2:-/etc/pam.d}"
+  local base f
+  base="$(basename "$shared")"
+  for f in "$dir"/*; do
+    [ -f "$f" ] || continue
+    if [ "$f" = "$shared" ]; then continue; fi
+    if [[ "$f" =~ $PAM_NON_SERVICE_RE ]]; then continue; fi
+    if ! _pam_logical_lines "$f" | grep -qE "^[[:space:]]*@include[[:space:]]+${base}[[:space:]]*$"; then
+      continue
+    fi
+    if _pam_logical_lines "$f" | grep -qE "$PAM_FPRINTD_AUTH_RE"; then continue; fi
+    echo "$f"
+  done
+  return 0
+}
+
+# Succeeds if the pam_fprintd line in the shared stack is one pam-auth-update
+# put there and can take back out again.
+#
+# This is the "is this actually yours to touch" check, and it gates the only
+# mechanism this tool will use. The alternative - deleting the line from
+# common-auth directly - is rejected on purpose: that file is generated, the
+# next pam-auth-update run (any libpam-runtime upgrade) regenerates it from
+# /var/lib/pam and the line comes straight back, silently, on a login path.
+# Editing it by hand is also the exact bug this repo's own uninstall.sh had
+# (see JOURNAL.md, the branch review). If this returns false, the conflict is
+# reported and left alone rather than guessed at.
+pam_auth_update_owns_fprintd() {
+  local profile="${1:-/usr/share/pam-configs/fprintd}" state="${2:-/var/lib/pam/auth}"
+  command -v pam-auth-update >/dev/null 2>&1 || return 1
+  [ -f "$profile" ] || return 1
+  [ -f "$state" ] || return 1
+  grep -qE '^Module:[[:space:]]+fprintd[[:space:]]*$' "$state"
+}
+
+# Succeeds if $1 still looks like a shared auth stack that can log somebody in:
+# no fingerprint line left, and at least one real primary auth module.
+#
+# Checked *after* pam-auth-update rewrites common-auth, because that write is
+# the one step here that could lock the machine out. pam-auth-update
+# regenerates the whole managed block and renumbers every success=N jump, so
+# there is nothing to diff against; the post-condition is the only thing that
+# can be asserted, and a file that fails it gets the backup put straight back.
+pam_shared_stack_is_sane_without_fprintd() {
+  local shared="${1:-$PAM_SHARED_AUTH_STACK}"
+  [ -f "$shared" ] || return 1
+  ! _pam_logical_lines "$shared" | grep -qE "$PAM_FPRINTD_AUTH_RE" || return 1
+  _pam_logical_lines "$shared" \
+    | grep -qE '^[[:space:]]*-?auth[[:space:]]+(\[[^]]*\]|[^[:space:]]+)[[:space:]]+pam_(unix|sss|ldap|krb5|winbind|sssd)\.so'
+}

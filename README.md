@@ -26,11 +26,14 @@ unencrypted, never passed as a command-line argument. See Requirements below
 before running it. Every prompt defaults to yes, so Enter accepts; the
 scripts refuse to run without a terminal rather than answering themselves.
 
-One `[Y/n]` question comes *before* that plan, and only on machines that have
-a fingerprint-only PAM stack: whether to also stop the fingerprint reader from
-dropping out mid-prompt (see "The fingerprint reader dropping out mid-prompt"
-below). It is asked first so your answer shows up in the plan you then
-approve — answering `n` leaves that file alone entirely.
+Up to two `[Y/n]` questions come *before* that plan, and only on machines
+that have a fingerprint-only PAM stack: whether to stop the fingerprint
+reader from dropping out mid-prompt, and — if fingerprint is also enabled
+system-wide, which makes a second PAM stack race yours for the sensor —
+whether to take it out of the shared stack so the first answer can actually
+take effect. Both are covered under "The fingerprint reader dropping out
+mid-prompt" below. They are asked first so your answers show up in the plan
+you then approve — answering `n` leaves those files alone entirely.
 
 ## The problem
 
@@ -133,6 +136,18 @@ above, on a service that isn't named after fingerprints at all.
 `pam_gnome_keyring.so` line and patches all of them for exactly this
 reason.
 
+There is a trade-off here, and it is worth knowing before you enable it.
+The same profile is what puts `pam_fprintd.so` into `common-auth`, and at
+the GDM greeter and lock screen that stack races `gdm-fingerprint` for the
+sensor — and wins, with a single attempt on Ubuntu's own `timeout=10`. So
+fingerprint for `sudo` and polkit and a fingerprint prompt that retries at
+the lock screen are, as things stand, mutually exclusive: you get one or
+the other. `install.sh` will explain this and offer to disable the profile
+if it finds both. See "The attempt stack only works if the shared stack
+gives up the sensor" below for the measurements and for exactly what each
+choice costs. `sudo` itself is the exception — Ubuntu's `/etc/pam.d/sudo`
+has its own `pam_fprintd.so` line and keeps fingerprint either way.
+
 ## The fingerprint reader dropping out mid-prompt
 
 This one is separate from the keyring problem, but `install.sh` offers to fix
@@ -233,6 +248,64 @@ the idle timeout on every invocation. If you want a longer window for
 `sudo`, edit `/usr/share/pam-configs/fprintd` and re-run
 `sudo pam-auth-update` — editing `/etc/pam.d/common-auth` directly gets
 reverted, since `pam-auth-update` regenerates that file.
+
+### The attempt stack only works if the shared stack gives up the sensor
+
+Refusing `common-auth` leaves a problem that has to be solved the other way
+round. If fingerprint is enabled system-wide, `pam-auth-update` has put
+`pam_fprintd.so` into `common-auth`, and `/etc/pam.d/gdm-password`
+`@include`s it. At the GDM greeter and at the lock screen, gnome-shell opens
+**two** PAM conversations at once — `gdm-password` and `gdm-fingerprint` —
+so both stacks reach for the one sensor. Only one can claim it; the loser is
+told the reader is *unavailable*, which is the same answer that makes GNOME
+drop fingerprint for the rest of the prompt.
+
+`gdm-password` wins that race every time — it starts first, while the
+fingerprint service waits on a D-Bus round trip to `fprintd` to ask whether
+any prints are enrolled. So the scan you actually get is `common-auth`'s
+single attempt on Ubuntu's own `timeout=10`, and the attempt stack in
+`gdm-fingerprint` never prompts at all. Measured with two unprivileged
+`pam_start_confdir(3)` drivers running the two real stacks 0.2 s apart:
+the `common-auth` side prompts and times out at 10.71 s while the attempt
+stack returns `PAM_AUTHINFO_UNAVAIL` in 0.49 s; start them the other way
+round and it is exactly reversed (three prompts, 90.92 s).
+
+So fingerprint has to live in **exactly one** of the two stacks, and it
+cannot be the shared one. When `install.sh` finds this conflict it explains
+it, lists the services that would stop offering fingerprint, and offers to
+disable the `fprintd` `pam-auth-update` profile — the supported way to take
+that line out, since hand-editing `common-auth` is undone by the next
+`pam-auth-update` run:
+
+```
+sudo pam-auth-update --disable fprintd     # what the installer runs
+sudo pam-auth-update --enable fprintd      # undo, any time
+```
+
+What that changes, and what it doesn't:
+
+- **GDM login and the lock screen keep fingerprint**, now through the
+  hardened `gdm-fingerprint` stack — which is the whole point.
+- **`sudo` keeps fingerprint**, because Ubuntu's `/etc/pam.d/sudo` carries
+  its own `pam_fprintd.so` line above its `@include common-auth`. Any
+  service with its own line is unaffected and isn't listed as a cost.
+- **polkit prompts lose it**, along with `login`, `su` and anything else
+  reaching fingerprint only through `common-auth`; they fall back to the
+  password they already accept. The installer prints the actual list for
+  your machine rather than a generic warning — on a system with no
+  `/etc/pam.d/polkit-1`, the entry that matters is `other`.
+- Re-enabling fingerprint in GNOME Settings can put the line back, and the
+  10-second prompt with it.
+
+The write is guarded like every other login-critical step here: every
+`common-*` file is backed up first, `pam-auth-update` is run with
+`DEBIAN_FRONTEND=noninteractive` so a refusal over local modifications is a
+printed no-op rather than a debconf dialog mid-script, `--force` is never
+used (it would discard local edits to all four `common-*` files), and the
+result must still contain a real primary auth module — if it doesn't, the
+backups go straight back. `uninstall.sh` offers to re-enable the profile,
+but only if `install.sh` left the marker recording that it was the one that
+disabled it.
 
 Two things worth knowing:
 
