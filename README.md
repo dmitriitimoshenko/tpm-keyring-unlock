@@ -401,10 +401,14 @@ a real VM (`swtpm` + OVMF, real toggleable Secure Boot state) — the actual
 + `tpm-keyring-unseal.sh` round trip against a real PCR7 policy, that round
 trip surviving a genuine TPM reset (a real swtpm+qemu process restart, the
 same trigger as a physical reboot), two concurrent unseal calls against
-the same TPM (the `flock` serialization fix), and recovery when the shared
+the same TPM (the `flock` serialization fix), recovery when the shared
 persisted primary is evicted out from under a live enrollment — including
 that the root-run helper leaves the user's data directory byte-identical
-while recovering. **Still genuinely untested:**
+while recovering — and, with two more real accounts on the guest, that the
+helper refuses to unseal a blob belonging to somebody else, both when the
+data directory is simply pointed at another user's and when it is swapped
+*during* the run, after the ownership check and before the read.
+**Still genuinely untested:**
 any TPM implementation other than this one dev machine's fTPM and the
 software TPM the VM layer uses (real hardware TPMs, especially other
 vendors' fTPMs, can behave differently under contention — that's exactly
@@ -432,7 +436,16 @@ evicting it is a machine-wide act, not a personal one. `uninstall.sh` looks
 for other users' sealed secrets first and refuses to evict if it finds any,
 or if it can't check. If it does get evicted while someone was still
 depending on it, nothing is lost: their logins keep working, several seconds
-slower, until they re-run `bin/seal.sh`.
+slower, until they re-run `bin/seal.sh`. The same goes for removing the PAM
+module and the helper: both are shared, so that step names who else is still
+relying on them and asks, defaulting to no.
+
+Sharing the key does **not** mean sharing the secrets. Each user's sealed
+blob lives in their own `0700` directory, and the helper refuses to unseal
+one that isn't owned by the account being authenticated — it verifies that
+through the file descriptors it has already opened, so pointing a data
+directory at somebody else's doesn't work even if the swap happens while the
+helper is running.
 
 ## Threat model, honestly
 

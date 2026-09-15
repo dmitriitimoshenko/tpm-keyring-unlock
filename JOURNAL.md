@@ -4840,3 +4840,59 @@ what was actually in `main` rather than trusting that two merged PRs meant
 two merged PRs. Stacked PRs need the base merged first *and* the child
 retargeted before merging; merging the child into a stale base silently
 orphans it.
+
+## Building a branch on a squash-merged base, and the conflicts that followed (2026-09-16)
+
+Recorded because it cost a round trip and the cause is invisible until you
+look for it.
+
+PR #13 was opened against `main` and came back `mergeable=false`,
+`mergeable_state=dirty` - conflicts across every file the earlier work had
+touched. The branch had been built on top of
+`fix/shared-primary-handle-and-threat-model`, which was the right base for
+the *content* and the wrong base for the *history*.
+
+This repository merges by **squash**. Every merge on `main` is a single-parent
+commit with a `(#N)` suffix - `b93ab48`, `ad2574a`, `c652f0e`, `6f7afc8` - so
+when #11 merged, `main` got a brand-new commit holding its content and the
+original branch commit never became an ancestor of `main`. A branch built on
+that original commit therefore carries #11's changes as commits of its own,
+and re-applying them onto a `main` that already has the same content is
+exactly the conflict that showed up.
+
+The tell was in plain sight in `git log` from the start; the mistake was
+assuming "merged" means "my branch's commits are now in main", which is true
+for merge commits and false for squashes.
+
+Diagnosed and fixed with three commands rather than by resolving conflicts
+by hand:
+
+    git cat-file -p 6f7afc8 | grep -c '^parent'   -> 1      (squash, not a merge)
+    git merge-base --is-ancestor be20618 origin/main -> no  (history diverged)
+    git diff be20618 origin/main                  -> empty  (content identical)
+
+That third one is what made the repair safe and mechanical: the squash had
+preserved the content byte for byte, so the branch could be rebuilt from
+`origin/main` and the two commits `main` lacked cherry-picked onto it. They
+applied without a single conflict, because they had been written against
+exactly that content.
+
+The rebuild was then checked the only way worth trusting:
+
+    git diff rebuild origin/fix/toctou-and-restore-hardening  -> empty
+
+An identical tree means the VM results already gathered still described the
+code being shipped, so a 25-minute real-TPM run did not have to be repeated
+to prove a history rewrite changed nothing.
+
+**Rules this leaves behind.** Under squash merging, branch off `main` after
+the base PR lands, never off the base PR's branch - and if a stacked branch
+already exists, rebuild it from `main` and cherry-pick the delta rather than
+merging or rebasing the whole thing. Before trusting any rewrite, diff the
+new tree against the tested one; if it is empty, existing test evidence
+carries over, and if it is not, the tests have to be re-run.
+
+Worth noting what went right: the same squash mechanic had already orphaned
+PR #12 (see the entry above), and both incidents were caught by checking what
+`main` actually contained rather than by trusting that a merged PR meant
+merged content. That check is cheap and belongs in the release routine.
