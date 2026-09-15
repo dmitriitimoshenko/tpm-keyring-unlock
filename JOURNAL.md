@@ -4732,3 +4732,111 @@ path, the false-accept and the false-refuse are *both* dangerous, and the
 false-refuse is the one a threat-model mindset forgets. Refusing
 `gdm-fingerprint` would not have looked like a security bug; it would have
 looked like the tool not working.
+
+## The ownership check was checking a path, not a file (2026-09-15, review before tagging)
+
+Found while reviewing the release candidate before cutting a tag, on code
+added earlier the same day. The check introduced to stop one user having root
+unseal another user's secret did not actually stop it.
+
+    line  33-48   stat -L on $DATA_DIR/seal.priv, seal.pub   <- by path
+    line  73      flock -w 10                                <- waits
+    line 143      tpm2_load -u $DATA_DIR/seal.pub ...        <- by path again
+
+Two independent path resolutions with a window between them, and every
+component of that path belongs to the user being checked. They move their own
+data dir aside and drop in a symlink to somebody else's after the check has
+passed and before the read happens.
+
+The window is not a few instructions, either. `flock -w 10` sits in the
+middle of it, and waiting there is the *ordinary* case rather than a rare
+one: GDM runs gdm-fingerprint and gdm-password as parallel PAM conversations
+and both land in this script, so one routinely waits on the other. An
+attacker also gets unlimited retries - it is their own login.
+
+Reproduced on a throwaway directory rather than argued about:
+
+    проверка владельца: uid=1000  содержимое=[attacker-own-blob]   <- passed
+    чтение после паузы: содержимое=[SECRET-OF-VICTIM]              <- other user's
+
+**Fix:** open `seal.priv` and `seal.pub` once, before the lock, and never
+name those paths again. Ownership is asked of `/proc/self/fd/N` and the bytes
+are drained from the descriptors into root-owned scratch space after the
+lock; both `tpm2_load` calls read the copies. A descriptor refers to one
+inode for its whole life, so there is nothing left to swap.
+
+The procfs behaviour this rests on was verified rather than assumed, because
+the obvious reading ("it is a symlink, so `stat -L` re-walks the path") is
+wrong and would have made the fix useless:
+
+    readlink   : .../fdtest/real/blob        # after the path was swapped
+    stat -L uid: 1000  size=9
+    read via fd : [ORIGINAL]
+    read by path: [SWAPPED]
+
+A magic link resolves to the file description's inode, not to the pathname it
+prints.
+
+### Why the existing test passed anyway
+
+`test/vm/run-vm-test.sh` already had "helper refuses another user's sealed
+blob reached by symlink", and it was green throughout. It plants the symlink
+*before* invoking the helper, so it only ever exercised the static case -
+which the broken code handles correctly. A green test on the same subject is
+what made the hole easy to miss.
+
+The new check makes the window wide on purpose (holds the lock so the helper
+is guaranteed to wait in flock) and swaps inside it. mallory gets a data dir
+of her own holding plausible but useless blobs owned by her, so the ownership
+check genuinely passes on her own files, and only then is it pointed at
+ubuntu's. It asserts the one thing that must never happen - ubuntu's secret
+coming back - rather than asserting an error message, so any future way of
+leaking it still fails the check.
+
+Lesson, and it is the second time today the same one has come up: a test
+written from the same mental model as the code inherits the model's blind
+spot. The static symlink test and the path-based check were written in the
+same breath and agreed with each other. What broke the tie was reading the
+code again with the question "when exactly does the read happen relative to
+the check", not running the tests.
+
+### A denial of service introduced by the fix itself
+
+Caught while re-reading the fix rather than by a test, and worth recording
+because it is the ordinary shape of a security patch making something else
+worse. Draining the descriptors means `cat <&7 >"$WORKDIR/seal.priv"`, and
+`$WORKDIR` is `mktemp -d` under /tmp - tmpfs, i.e. RAM. The previous code
+handed the path to `tpm2_load`, which reads what it needs and rejects
+nonsense quickly; the new code copies first. Nothing bounded that copy, so a
+user could grow their own `seal.priv` to any size and have root fill memory
+on every login attempt.
+
+Bounded at 64 KiB, which is roughly 470x the real thing - measured on this
+machine, `seal.pub` is 80 bytes and `seal.priv` is 137. Refused rather than
+truncated: a truncated blob would surface as a puzzling tpm2 error instead of
+the actual reason.
+
+The general point: moving data that used to be streamed by a tool into a
+buffer of your own is a resource decision, not just a plumbing change, and
+the size of the thing being buffered is attacker-controlled here.
+
+### Two smaller things from the same review
+
+**`uninstall.sh` conflated "nobody else" with "could not check".** The scan
+hoisted to the top of the run ended in `2>/dev/null || true`, so a declined
+sudo produced an empty result indistinguishable from a genuine absence - and
+the module/helper step then told the user "No other user's sealed secret was
+found" about a step that removes auto-unlock for everyone on the machine. The
+eviction step further down already got this right with an explicit
+`SCAN_OK`. Now both do: found / none found / could not find out are three
+outcomes, and the third says so.
+
+**PR #12 never reached `main`.** #11 merged to `main` at 19:30:02 and #12
+merged into its own base branch 33 seconds later, so GitHub never retargeted
+it. `main` carried none of the hardening - no insertion-point guard, no
+ownership check, no lock move, no SECURITY.md - while `VERSION` on the branch
+already said 1.3.0. Caught only because the release review started by asking
+what was actually in `main` rather than trusting that two merged PRs meant
+two merged PRs. Stacked PRs need the base merged first *and* the child
+retargeted before merging; merging the child into a stale base silently
+orphans it.

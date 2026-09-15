@@ -63,16 +63,26 @@ echo
 # Whoever is answering these prompts should know that before the first one,
 # not after three of them. Best-effort and non-fatal - other users' data dirs
 # are 0700, so this needs root, and a declined sudo just means we say less.
+# Three outcomes, not two. "Nobody else uses this" and "could not find out"
+# look identical if the scan's failure is swallowed, and they are not the
+# same claim at all - the second one gets asserted to somebody about to take
+# auto-unlock away from every account on the machine. The eviction step
+# further down already distinguishes them; so does this.
 OTHER_SEALED=""
+OTHER_SCAN_OK=0
 if command -v getent >/dev/null 2>&1; then
-  OTHER_SEALED="$(sudo bash -c '
+  if OTHER_SEALED="$(sudo bash -c '
          while IFS=: read -r u _ _ _ _ h _; do
            [ -n "$u" ] && [ -n "$h" ] || continue
            [ "$u" != "$1" ] || continue
            [ -f "$h/.local/share/tpm-keyring-unlock/seal.priv" ] || continue
            printf "%s\n" "$u"
          done < <(getent passwd)
-       ' _ "$USER" 2>/dev/null || true)"
+       ' _ "$USER" 2>/dev/null)"; then
+    OTHER_SCAN_OK=1
+  else
+    OTHER_SEALED=""
+  fi
 fi
 if [ -n "$OTHER_SEALED" ]; then
   echo "Heads up: other users have sealed secrets on this machine -"
@@ -81,6 +91,14 @@ if [ -n "$OTHER_SEALED" ]; then
   echo "Removing any of them stops their keyring auto-unlocking too, and they"
   echo "would need to re-install to get it back. Their sealed secrets and"
   echo "keyring passwords are untouched either way."
+  echo
+elif [ "$OTHER_SCAN_OK" -eq 0 ]; then
+  echo "Heads up: couldn't check whether anyone else on this machine has a"
+  echo "sealed secret (that needs root, and the check was declined or"
+  echo "unavailable). The PAM lines, the module and the helper are shared by"
+  echo "every user of this tool here, so removing them may stop someone"
+  echo "else's keyring auto-unlocking. Their sealed secrets and keyring"
+  echo "passwords are untouched either way."
   echo
 fi
 
@@ -279,6 +297,10 @@ if [ -n "$found_module" ] || [ -f "$HELPER_DST" ]; then
   if [ -n "$OTHER_SEALED" ]; then
     echo "Reminder: these users still depend on the module and helper:"
     echo "$OTHER_SEALED" | sed 's/^/  /'
+  elif [ "$OTHER_SCAN_OK" -eq 0 ]; then
+    echo "The PAM module and helper are shared by every user of this tool on"
+    echo "this machine, and it was not possible to check whether anyone else"
+    echo "is still using them."
   else
     echo "The PAM module and helper are shared by every user of this tool on"
     echo "this machine. No other user's sealed secret was found, though a home"

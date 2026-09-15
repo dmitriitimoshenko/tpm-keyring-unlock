@@ -160,15 +160,24 @@ script). Two scenarios:
   the old blob is itself the proof that the primary is deterministic.
   This check fails against the pre-2026-09-15 helper — verified, not
   assumed; see `JOURNAL.md`.
-  Finally it creates a second account, points that account's data dir at the
-  first user's with a symlink, and confirms the helper refuses rather than
+  Finally it goes after the same secret from another account, twice. First
+  the static case: a second user whose data dir is a symlink to the first
+  user's, confirming the helper refuses rather than
   handing root's unseal of someone else's keyring password to whoever asked —
   asserting both that the secret does not come back *and* that the refusal
   came from the ownership check rather than some incidental failure, then
   that the legitimate owner still unseals (an ownership check that locks out
-  the real user would be the worse bug). Also asserts the unseal lock now
+  the real user would be the worse bug). Then the racing case, which is the
+  one that matters: a third account with plausible blobs of her own, so the
+  ownership check genuinely passes on her files, and the data dir swapped for
+  the first user's *after* that check and *before* the read — with the lock
+  deliberately held so the helper is sitting in `flock` and the window is
+  wide rather than a few instructions. The static check passes even against
+  code that gets this wrong, which is how it was missed the first time, so
+  the racing check asserts the only thing that must never happen: the other
+  user's secret coming back. Also asserts the unseal lock now
   lives in a root-owned 0700 directory instead of world-writable
-  `/run/lock`. Two real accounts and a real TPM, so no other layer can
+  `/run/lock`. Three real accounts and a real TPM, so no other layer can
   cover it.
 
 Needs `swtpm`, `qemu-system-x86_64`/`qemu-img`, `/dev/kvm`, and network
