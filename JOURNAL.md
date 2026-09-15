@@ -4591,7 +4591,7 @@ fixture tree shows exactly that, and shows how close it runs: Debian's
 them safe; nothing generalised it. The installer patches every matching
 service.
 
-**Fix:** `pam_auth_authenticates_before_keyring` in `bin/lib.sh`, consulted
+**Fix:** `pam_auth_insertion_point_is_safe` in `bin/lib.sh`, consulted
 when the plan is built and again immediately before each write (same reason
 the vanished-target re-check exists: a package install between the two can
 rewrite `/etc/pam.d`, and this is the check that must not run on a stale
@@ -4683,3 +4683,52 @@ plainly that a public issue beats an unreported finding.
 Still outstanding from that fork's journal: a `USERWITHAUTH` assertion,
 mentioned as unreported but not described in enough detail to act on. Worth
 asking about rather than guessing.
+
+### Correcting the check above, found by pointing it at a real machine (2026-09-15, same day)
+
+The predicate as first written asked the wrong question, and only running it
+against this machine's actual `/etc/pam.d` caught it. It asked *"does
+something above the insertion point authenticate?"*. That reads as the same
+thing as the hazard and is not. It flagged two live files:
+
+    /etc/pam.d/gdm-autologin     >>> UNSAFE <<<
+    /etc/pam.d/gdm-fingerprint   >>> UNSAFE <<<
+
+Both were wrong, and the second one badly. `gdm-fingerprint`'s auth phase is
+three `pam_fprintd` lines, then our module, then `pam_gnome_keyring`, then
+`@include common-account` - a different phase. Nothing below our line can
+authenticate anybody: the only thing there is the keyring module, which is
+the intended *consumer* of PAM_AUTHTOK. It is completely safe. But
+`pam_fprintd` is not a password module, so "something above authenticates"
+was false, and the installer would have **refused to wire up
+`gdm-fingerprint`** - the single scenario this entire tool exists for.
+`gdm-autologin` is the same story: below our line is `pam_permit.so`, which
+lets everyone through regardless and never reads a password.
+
+The correct question is *"can anything below the insertion point consume the
+PAM_AUTHTOK we are about to set?"*. That is the actual exploit chain: our
+module sets the token, and a password module further down takes it instead of
+prompting. Necessary condition, and the whole condition. Renamed to
+`pam_auth_insertion_point_is_safe` and rewritten to scan strictly *after* the
+keyring line, following includes below it (a stack whose keyring line
+precedes `@include common-auth` puts all of common-auth, `try_first_pass` and
+all, underneath us).
+
+Re-checked against the same machine afterwards: all seven services SAFE,
+including `gdm-fingerprint` and `gdm-autologin`.
+
+The depth cap changed direction as part of this. It used to return "does not
+authenticate" when the include chain got too deep, which with the new
+question means *fail open* - an include chain we gave up on would read as
+safe. It now returns "authenticates", so giving up means refusing. `loop-below`
+covers it.
+
+Two lessons, both cheap and both nearly missed. First: a proxy condition that
+sounds equivalent to the real one usually is not, and the way to tell is to
+run it against real data rather than only against fixtures written from the
+same misunderstanding - every one of the original fixtures passed, because
+they encoded the same wrong question. Second: for a check that gates a login
+path, the false-accept and the false-refuse are *both* dangerous, and the
+false-refuse is the one a threat-model mindset forgets. Refusing
+`gdm-fingerprint` would not have looked like a security bug; it would have
+looked like the tool not working.

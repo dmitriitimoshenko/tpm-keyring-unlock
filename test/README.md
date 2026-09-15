@@ -49,21 +49,24 @@ actually runs there, never skips.
   (still matches), and — the one that decides the fail-closed behaviour —
   that finding nobody exits zero, so `uninstall.sh` can tell "nobody
   depends on this" apart from "couldn't check".
-  And `pam_auth_authenticates_before_keyring`, which decides whether
-  `install.sh` may wire the module into a given stack at all: the module sets
-  `PAM_AUTHTOK` from the TPM before anyone has authenticated, so the
-  insertion point has to sit below something that already demanded
-  credentials. Both directions are asserted, because both are dangerous — a
-  false "unsafe" refuses a stack every distro ships, a false "safe" writes a
-  login bypass. Fixtures in `test/fixtures/pam.d/ordering/` cover a direct
-  authenticator, one reached through `@include`, one through `auth substack`,
-  one split across a line continuation, a keyring line placed before anything
-  authenticates, a stack whose only modules are `optional`, a
-  fingerprint-only stack (`pam_fprintd` answers yes/no and never yields a
-  password, so it does not count), and an `@include` loop (must refuse, not
-  hang). The real `@include`-based `gdm-password` fixture is asserted
-  accepted separately — that one case breaking would refuse every supported
-  Debian-family install. The PAM control flow
+  And `pam_auth_insertion_point_is_safe`, which decides whether `install.sh`
+  may wire the module into a given stack at all: the module sets
+  `PAM_AUTHTOK` from the TPM before anyone has authenticated, so nothing
+  *below* the insertion point may be a password module that would take that
+  token instead of prompting. Both directions are asserted, and the accepting
+  ones matter most — a false "safe" writes a login bypass, but a false
+  "unsafe" refuses `gdm-fingerprint`, which is the entire scenario this tool
+  exists for. Fixtures in `test/fixtures/pam.d/ordering/` cover a direct
+  authenticator above, one reached through `@include`, one through `auth
+  substack`, one split across a line continuation, a fingerprint-only stack
+  (no password module above it at all, and still safe), an autologin stack
+  (`pam_permit.so` below, which grants regardless and reads no password), a
+  keyring line placed before `@include common-auth`, a bare `pam_unix.so
+  try_first_pass` below, an `auth substack` below, and an `@include` loop
+  below (must refuse rather than hang — the walk fails closed when it gives
+  up). The real `@include`-based `gdm-password` fixture is asserted accepted
+  separately: that one breaking would refuse every supported Debian-family
+  install. The PAM control flow
   of the generated stack is covered by `runtime-test.sh` below, against real
   libpam.
 - **`test/runtime-test.sh`** (one container, distro doesn't matter) — the
