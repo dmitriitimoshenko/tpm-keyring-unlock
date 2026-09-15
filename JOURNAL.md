@@ -3028,3 +3028,134 @@ Two of its thirteen findings were wrong on the facts, and one of my own new
 test assertions was wrong too (it counted a fixture's comment line and blamed
 the code). Reproducing each claim by hand before believing it cost a few
 minutes and changed the outcome three times. Worth doing that every time.
+
+## CI: the VM test drove `seal.sh` through a pipe, which it now refuses (2026-09-15, after the merge)
+
+The `feat/fingerprint-attempt-stack` branch's PR (#9) failed one job — "VM
+(swtpm + OVMF) - real TPM/Secure Boot round trip" — with three checks red
+and the rest green:
+
+    FAIL - seal.sh seals the throwaway secret (got: failed, want: sealed)
+    FAIL - tpm-keyring-unseal.sh returns the sealed secret (same boot) (got: , want: vm-test-throwaway-secret-1789460695)
+    FAIL - two concurrent unseal calls both succeed (flock serialization) (got: 1= 2=, want: both-correct)
+
+Only the first is a real failure; the other two are downstream of it (there
+was nothing sealed left to unseal, so both returned empty). The captured
+stderr named the cause exactly:
+
+    | This script is interactive - it reads your keyring password from the
+    | terminal, and must never take it from a pipe or a file. Run it
+    | directly from a terminal.
+
+**Root cause:** that guard (`[ ! -t 0 ]` in `bin/seal.sh`) is *this
+branch's own* addition — see "All prompts default to yes, and the scripts
+refuse to run without a terminal (2026-09-14, last)". `test/vm/run-vm-test.sh`
+has always driven the seal step by piping the throwaway secret twice
+(password + confirm) into a plain `ssh`, which is precisely the shape the
+new guard exists to reject. Nothing about the TPM, swtpm, OVMF or the PCR7
+policy was involved; the test simply hadn't been updated alongside the
+guard that landed in the same branch.
+
+**Fix, and the option deliberately not taken.** The obvious shortcut — an
+env var like `SEAL_ALLOW_PIPED_STDIN=1` honoured by `seal.sh` for tests —
+was rejected: it would put a documented bypass of the "never from a pipe
+or a file" rule into the shipped script, where anything (a wrapper, a
+misread README, a future installer path) could set it, and the whole point
+of the guard is that no such path exists. The test is what should adapt.
+
+`test/vm/run-vm-test.sh` now has a `vm_ssh_tty` helper alongside `vm_ssh`,
+identical but for `ssh -tt`. Doubling the flag forces pseudo-terminal
+allocation even though the test script's own stdin is a pipe (plain `-t`
+declines with "Pseudo-terminal will not be allocated because stdin is not a
+terminal"), so the remote `read -rsp` sees a real tty and `[ -t 0 ]` holds,
+while the piped secret still reaches it through the pty.
+
+Two consequences of using a pty, both accounted for in the test:
+
+- **stderr merges into stdout.** A pty is one stream, so `2>"$WORK/seal.err"`
+  would have captured nothing and the diagnostics `check` prints on failure
+  would have been lost. The seal step now captures a single combined stream
+  into `$WORK/seal.out` and hands that to `check`.
+- **The line discipline echoes what we write.** The throwaway secret appears
+  in that capture. Acceptable here and only here: it is generated per run as
+  `vm-test-throwaway-secret-$RANDOM`, it is already printed verbatim by
+  `check`'s own `want:` message on failure, and the VM is destroyed at
+  teardown. It is never a real credential — that remains the user's to type
+  into their own terminal.
+
+Suppressing the echo was tried on paper and dropped: `stty -echo` on the
+remote side loses a race (ssh writes the piped bytes to the pty master as
+soon as the channel opens, typically before the remote shell has run a
+single command), and waiting for the "Password:" prompt before sending
+would mean an expect-style driver for one test step.
+
+**Verified** before touching CI, because the pty behaviour is the whole fix
+and "it should work" wasn't good enough. A standalone `pty.fork()` harness
+fed both lines *before* the child reached its `read` — the worst case for
+the race above — against a child that mimics `seal.sh`'s shape (tty check,
+a 1 s stall standing in for the `tpm2_*` preflight, then two `read -rsp`):
+
+    ---- captured ----
+    sekret-throwaway
+    sekret-throwaway
+    TTY
+    Password:
+    Confirm:
+    MATCH:sekret-throwaway
+    ---- exit: 0
+
+So `[ -t 0 ]` passes through the pty, the line discipline buffers input
+written before the read and hands it over intact, and the echo is exactly
+the cosmetic one described above.
+
+The full `test/vm/run-vm-test.sh` was then run locally (swtpm + OVMF +
+KVM), where every check passes — including the reboot-survival one that CI
+downgrades to a KNOWN LIMITATION because PCR7 drifts between boots on
+GitHub's runners:
+
+    ok   - Secure Boot OFF: require_secure_boot() refuses
+    ok   - Secure Boot ON: require_secure_boot() allows
+    ok   - seal.sh seals the throwaway secret
+    ok   - tpm-keyring-unseal.sh returns the sealed secret (same boot)
+    ok   - two concurrent unseal calls both succeed (flock serialization)
+    ok   - tpm-keyring-unseal.sh survives a real reboot (fresh primary, same sealed blob)
+    All VM tests passed.
+
+`test/unit-regex-test.sh` also passes (110 checks, up from 102 — the extra
+8 come from `main`'s `dash-prefixed` fixture, merged in alongside this).
+`test/runtime-test.sh` was not run on the host: it installs the built
+module into the real `/lib/.../security/`, which is a Docker-only step here
+and is already green in CI.
+
+## Merging `main` into the branch: three conflicts, and how each was decided (2026-09-15, same pass)
+
+`main` had moved on by one commit — "fix: detect auth lines written with the
+pam.conf `-` prefix" (#6) — while this branch was open. Merging it back in
+produced two textual conflicts and one thing worth checking that git
+resolved silently.
+
+- **`VERSION`: 1.2.0 (ours) vs 1.1.8 (theirs), from a common 1.1.7.** Kept
+  **1.2.0**. The branch adds a feature (the fingerprint attempt stack);
+  `main`'s was a patch-level fix. A merge that contains both is a minor
+  release, not a patch, and 1.2.0 already sorts above 1.1.8 — no need for a
+  1.2.1.
+- **`JOURNAL.md`: both sides appended.** Kept both, obviously (this file is
+  append-only by its own rule). Order was the only question: `main`'s entry
+  is dated 2026-08-30 and the branch's block runs 2026-09-14 → 09-15, so
+  `main`'s was placed *before* the branch's block rather than at the end,
+  keeping the file's chronological order intact. It now sits between the
+  2026-08-18 and 2026-09-14 entries.
+- **`bin/lib.sh`: no conflict, but the interesting one.** Git merged
+  cleanly because the two sides touched different lines, and the result is
+  the one we want: `PAM_GNOME_KEYRING_AUTH_RE` picks up `main`'s optional
+  dash (`^\s*-?auth`), which the branch had independently already applied to
+  `PAM_FPRINTD_AUTH_RE` and `PAM_FPRINTD_RETRY_LINE_RE`. All three patterns
+  now agree on the `pam.conf(5)` prefix — checked by hand rather than
+  assumed, since a silent auto-merge leaving the gnome-keyring pattern on
+  the old `^\s*auth` anchor would have re-introduced exactly the Mint/LightDM
+  bug #6 fixed, with no conflict marker to notice.
+
+Confirmed by running `test/unit-regex-test.sh` on the merged tree: 110
+checks pass, and `main`'s `dash-prefixed` fixture is exercised by the
+branch's expanded suite (detection, count-of-one, needs-patching, sed
+insertion, and insertion position).

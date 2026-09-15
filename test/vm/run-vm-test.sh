@@ -273,6 +273,15 @@ start_vm() {
 
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=5)
 vm_ssh() { local port="$1"; shift; ssh "${SSH_OPTS[@]}" -i "$WORK/id_test" -p "$port" ubuntu@127.0.0.1 "$@"; }
+# Same, but forces a pseudo-terminal on the remote side (-tt, doubled so it
+# applies even though this script's own stdin is a pipe, not a tty). Needed
+# for bin/seal.sh, which refuses to run unless stdin is a terminal - the
+# password must come from a tty, never a pipe or a file. A pty makes the
+# remote `read -rsp` see a terminal while still letting us feed it the
+# throwaway test secret. Note the pty merges the remote's stderr into its
+# stdout, so callers capture one combined stream, and the line discipline
+# echoes what we write back into it.
+vm_ssh_tty() { local port="$1"; shift; ssh "${SSH_OPTS[@]}" -tt -i "$WORK/id_test" -p "$port" ubuntu@127.0.0.1 "$@"; }
 vm_scp() { local port="$1"; shift; scp "${SSH_OPTS[@]}" -i "$WORK/id_test" -P "$port" "$@"; }
 
 wait_for_ssh() {
@@ -397,10 +406,13 @@ if wait_for_ssh "$B1_SSHPORT"; then
   # effect - matches the real install.sh flow (usermod -aG tss, relogin).
   vm_ssh "$B1_SSHPORT" 'sudo usermod -aG tss ubuntu'
 
-  printf '%s\n%s\n' "$SECRET" "$SECRET" | vm_ssh "$B1_SSHPORT" \
-    'bash ~/tpm-keyring-unlock/bin/seal.sh' >"$WORK/seal.out" 2>"$WORK/seal.err"
+  # Through a pty, not a plain pipe: seal.sh exits early if stdin isn't a
+  # terminal (see vm_ssh_tty above). Output is one combined stream because
+  # of that pty, so there's a single file to hand `check` for diagnostics.
+  printf '%s\n%s\n' "$SECRET" "$SECRET" | vm_ssh_tty "$B1_SSHPORT" \
+    'bash ~/tpm-keyring-unlock/bin/seal.sh' >"$WORK/seal.out" 2>&1
   if [ $? -eq 0 ]; then got=sealed; else got=failed; fi
-  check "seal.sh seals the throwaway secret" "$got" "sealed" "$WORK/seal.err"
+  check "seal.sh seals the throwaway secret" "$got" "sealed" "$WORK/seal.out"
   log_pcr7 "$B1_SSHPORT" "boot 1, right after seal"
 
   UNSEAL1_START=$(date +%s%N)
