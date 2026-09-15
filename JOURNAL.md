@@ -4266,3 +4266,280 @@ Worth recording how this was nearly missed: the state was read several turns
 earlier, cached in the reasoning, and then asserted as current while the user
 was saying the problem was gone. The user was right and the assertion was
 stale. Re-read the file, don't re-read your own earlier output.
+
+## A machine-wide TPM object with a per-user lifecycle (2026-09-15, issues #7 and #8)
+
+Two reported issues, fixed together because the first one's honest fix is
+half documentation and the second one is entirely documentation, and both
+land in the same paragraphs.
+
+### Issue #7: the persisted primary is shared, but only one user's uninstall decides its fate
+
+`bin/seal.sh` persists the TPM primary at `PRIMARY_HANDLE_DEFAULT`
+(`0x81018000`), one object for the whole machine. That sharing is right and
+stays: the primary is deterministic, so the second user to seal lands in the
+existing-object branch, compares names, matches, and reuses it instead of
+spending another of the TPM's few persistent-object NV slots on a
+byte-identical key. The 2026-08-16 entry below introduced it and got that
+part correct.
+
+What that entry did not consider is that a persistent TPM object has **no
+owner and no refcount, and there is no TPM API that answers "who still
+depends on this?"**. That is the root of the whole bug, and it is worth
+stating plainly because it constrains every possible fix: the dependency
+only exists on the filesystem, in each user's own `primary.handle`, so any
+check has to be a filesystem scan and can therefore never be complete.
+
+The eviction step in `uninstall.sh` read *the uninstalling user's*
+`$DATA_DIR/primary.handle` and evicted what it named. With the default
+handle that is always the object every other user is also using. Worse, the
+helper only fell back to recreating the primary when the handle **file** was
+missing:
+
+    if [ -f "$DATA_DIR/primary.handle" ]; then
+      PRIMARY_HANDLE="$(cat "$DATA_DIR/primary.handle")"
+    else
+      tpm2_createprimary ...
+
+The other user's file is still there and still says `0x81018000`, so that
+branch never fires; `tpm2_load` just fails against an empty handle. From
+their side the keyring stops unlocking one day, and the only trace is the
+module's generic `tpm-keyring-unseal helper produced no usable output`.
+
+Two things found while confirming the report, neither of which was in it:
+
+- **It is not only an uninstall problem.** Anyone in the `tss` group can run
+  `tpm2_evictcontrol -C o -c 0x81018000` (the owner hierarchy has no auth
+  value here), so any local user could already brick every account's
+  auto-unlock with one command. A TPM clear does the same.
+- **It bites a single user too.** Accept the evict prompt, decline the
+  "delete `$DATA_DIR`" prompt right after it, and you have done this to
+  yourself. Fix (2) alone would not have covered that; fix (1) does.
+
+### The fix, and what was rejected
+
+**Fall back on `tpm2_load` failing, not on the file being absent.** The load
+is the authoritative test and it is free: `seal.priv` is cryptographically
+bound to its parent's name, so a wrong or absent object at that handle
+cannot load it, and a foreign object squatting there gets ignored rather
+than used. Exactly one retry, then the recreate path is left fatal.
+
+*Rejected: verifying the handle up front with `tpm2_readpublic` and
+comparing names, the way `bin/seal.sh` does.* Recorded because it is the
+obvious "more careful" design and someone will propose it again. `seal.sh`
+can do it because it has just derived a fresh primary to compare against.
+The helper has not, and deriving one costs the ~7s `tpm2_createprimary`
+that the persisted handle exists to avoid — so "verify first" would spend
+the entire optimization, on every login, to detect what the failing load
+detects for nothing.
+
+*Rejected: retrying more than once.* `tpm2_createprimary -C o` is
+deterministic, so a second attempt recomputes an identical key and fails
+identically. It is not free either: see the timeout arithmetic below.
+
+*Rejected: letting the helper repair `$DATA_DIR`* — deleting the stale
+`primary.handle`, or re-persisting the primary. This one is a firm no and
+the reason is now a comment in the file so it does not get "improved" back
+in. The helper runs **as root, during authentication**, against a path an
+unprivileged user completely controls (it resolves `$HOME` from `getent`).
+Writing there is a root write through a symlink that user can plant.
+Re-persisting would be worse: an unattended machine-wide TPM write during
+one user's login, on the strength of one failed command — precisely the
+class of thing issue #7 is complaining about, pointed the other way.
+`bin/seal.sh`, running as the user, stays the only writer. The cost of not
+healing is a slow login, so the fix is to make that slow login *say so*
+rather than to make it disappear.
+
+*Rejected: giving each user their own handle (derived from UID, say).* It
+would dissolve the collision, and it is wrong: it stores N byte-identical
+copies of the same deterministic key in scarce NV slots, introduces a brand
+new failure mode (NV exhaustion on user N, in a path with no handling for
+it), is unstable across UID reuse, and — decisively — does nothing for
+anyone already installed, since their `primary.handle` still says
+`0x81018000` forever. Sharing was never the bug. The lifecycle was.
+
+**`uninstall.sh` now looks before it evicts**, via a new
+`tpm_primary_handle_dependents` in `bin/lib.sh`: walk `getent passwd`, and
+count a user as dependent if their recorded handle matches *and* a
+`seal.priv` sits beside it (a leftover handle file with no blob is not a
+dependency). On a hit it **refuses** rather than prompting, and prints the
+`tpm2_evictcontrol` command for someone who knows better — the same
+refuse-and-instruct shape `bin/seal.sh` already uses for an occupied handle.
+Prompting was considered and rejected: `confirm()` defaults to **yes** on a
+bare Enter, which is the wrong default for an irreversible machine-wide act,
+and the person answering cannot see the consequence anyway.
+
+The scan **fails closed**. sudo declined, `getent` unavailable, a home that
+is unreadable or unmounted — all count as "somebody might", because the
+failure on the other side is silently breaking another person's login. It
+can produce a false "nobody depends on this" (an unmounted home, an
+LDAP/SSSD setup with the default `enumerate=false`) but never a false
+positive, which is exactly why the no-dependents path still asks, now
+through a new `confirm_default_no`, and says out loud that an unmounted home
+would not have shown up.
+
+### Issue #8: the threat model was true and still misleading
+
+The old wording — "someone getting hold of your powered-off laptop and
+pulling the disk" — is accurate word by word, and readers take "my
+powered-off laptop is protected" from it, which the policy does not provide.
+PCR7 binds the Secure Boot state and the certificates that vouched for what
+loaded. It does not cover the kernel, the initrd, or the kernel command
+line, and the policy carries no auth value because login-time unsealing has
+to be non-interactive. The tool is explicitly for machines *without* FDE. So
+whoever has the machine has the secret.
+
+The reporter's example was a signed live image. The README now leads with a
+simpler and strictly stronger one: **boot the machine's own installed system
+and add `init=/bin/bash` in GRUB.** Same bootloader, same signatures,
+identical PCR7, root shell, no external media at all. It also removes the
+reader's escape hatch of "I don't leave USB booting enabled".
+
+*Rejected: adding the reporter's "any signed live image" claim with a
+footnote about shim.* The claim is over-broad — shim measures its embedded
+vendor certificate into PCR7, so another distro's signed image can land on a
+different value — but a hedging sentence buys the reader nothing and can be
+misread as "so a live USB might not work on my machine", which is a false
+sense of safety about the one scenario they could actually test. Fixed at
+the source instead by writing "that distro's own install media", which is
+precise and needs no footnote.
+
+Binding PCRs 4/8/9 would narrow the gap and is still deliberately not done —
+a re-seal after every kernel and bootloader update, paid everywhere, to
+half-cover what FDE covers properly. Now stated in the README rather than
+left for the reader to wonder about.
+
+### Timeout budget: unchanged value, false comment
+
+`HELPER_TIMEOUT_SECS` stays 25. Worst case on the new fallback path:
+
+    flock wait            10s   (only against a second parallel PAM stack)
+    failed tpm2_load      ~0.2s (one command, errors immediately, empty handle)
+    tpm2_createprimary    ~7s   (6.9s measured on this fTPM, 2026-08-14)
+    successful tpm2_load  ~0.2s
+    5 policy-session retries ~2.5s
+    -----------------------------
+                          ~20s   against a 25s alarm
+
+i.e. the pre-existing slow path plus one cheap failed command. That same
+arithmetic is why the retry is capped at one: a second `createprimary` puts
+it at ~27s, past the alarm, converting a recoverable slow login into a
+guaranteed failed one.
+
+What did have to change is the comment above it, which claimed the ~7s term
+"is now only paid by sealed data that hasn't been re-sealed since the
+persisted-primary optimization". That is false as of this change: a fully
+re-sealed, perfectly healthy install pays it too, whenever the shared handle
+has gone away. A wrong comment here is what makes the next person mis-size
+the budget.
+
+### An unverified trust assumption found on the way
+
+`primary.handle` was read and passed straight to `tpm2_load -C` and
+`tpm2_evictcontrol -c` with no validation, at all three read sites. That flag
+is spelled `--parent-context` and accepts a **context-file path** as readily
+as a handle:
+
+    $ tpm2_load -h
+    [ -C | --parent-context=<value>]
+
+So the contents of a file in an unprivileged user's home were steering what
+the root-run helper opens during authentication. Now validated against
+`^0x81[0-9a-fA-F]{6}$` (the TPM 2.0 persistent-object range) before reaching
+any tool; anything else is treated as "no handle recorded" and routes to the
+recreate path, which is the fail-safe direction.
+
+### Evidence
+
+Baseline, before any change, on this machine (`make test-vm`): all 9 checks
+passed, including the reboot-survival one that is informational in CI only.
+
+The new VM check was written to fail first, and that was confirmed rather
+than assumed. Negative control: the *new* `test/vm/run-vm-test.sh` run
+against the *unmodified* `HEAD` helper, so the only difference between the
+two runs is the fix itself.
+
+    ok   - the persisted primary is really at 0x81018000 before we evict it
+    ok   - evicting 0x81018000 actually empties the handle
+    FAIL - unseal recovers when the shared persisted primary is evicted
+           (got: , want: vm-test-throwaway-secret-1789490640)
+    FAIL - the fallback warns on stderr and names bin/seal.sh
+           (got: silent, want: warned)
+    ok   - the root-run helper never writes into the user's data dir
+    ok   - the persisted primary can be re-persisted at the same handle
+    ok   - the same sealed blob unseals again on the restored fast path
+
+One number in that run needs a caveat so it is not misread later: with the
+fix in, the same check reports the recovery taking ~760ms, not the ~7s this
+entry quotes elsewhere. That is not a contradiction — `swtpm` computes a
+primary far faster than this machine's AMD fTPM does. The 6.9s figure
+(2026-08-14) is the real-hardware one and is what the timeout budget is
+sized against; the VM number says only that the fallback path executes, not
+what it costs on real silicon. The VM layer cannot measure that, which is
+why the timing print there is diagnostic and not an assertion.
+
+Worth reading closely, because it is the reported bug reproduced exactly:
+`got: ` is empty — the helper produced no output at all, which is precisely
+the condition behind the module's "helper produced no usable output". The
+two setup checks either side passing is what makes the failure meaningful:
+the handle really was populated beforehand, and the eviction really did
+empty it, so the check cannot be passing or failing for an unrelated reason.
+The restore checks passing even on the unfixed helper confirms the state is
+genuinely put back, so the reboot check further down keeps testing what it
+has always tested rather than silently degrading into a second fallback test.
+
+With the fix in, the same script on the same machine: all 16 checks pass,
+`All VM tests passed`, exit 0. The two that failed in the negative control
+now read
+
+    ok   - unseal recovers when the shared persisted primary is evicted
+    ok   - the fallback warns on stderr and names bin/seal.sh
+
+and, the one that pins down the "root never writes to $DATA_DIR" rule as a
+test rather than a comment,
+
+    ok   - the root-run helper never writes into the user's data dir
+
+The pre-existing reboot-survival check still passes too, which is the point
+of putting the handle back afterwards: had the restore been botched, that
+check would have quietly turned into a second test of the fallback path and
+stopped covering what it was written for.
+
+Full local suite alongside it: `test/run-all.sh` green (regex/detection,
+runtime, and all five packaging distros; the arm64 cross-build SKIPPED
+locally for want of a registered binfmt handler, and covered in CI).
+
+A bash detail worth recording, confirmed on a throwaway script rather than
+assumed, because it decided how the fallback is written:
+
+    inner() { false; echo "REACHED-AFTER-FALSE"; }
+    if ! inner; then ...    -> prints REACHED-AFTER-FALSE
+    inner || echo guarded   -> prints REACHED-AFTER-FALSE
+    inner                   -> script aborts, exit 1
+
+`set -e` is suppressed for the *entire body* of a function invoked in a
+condition context. So the fallback is written as a plain `if ! tpm2_load`
+around the command itself and deliberately not factored into a function —
+doing so would silently disarm error handling for every command inside it.
+
+### Deliberately left for their own issues, not folded in here
+
+Found while reading the surrounding code, real, and each its own change with
+its own risk — bundling them into a PR whose job is two named issues would
+make it unreviewable:
+
+- **`/run/lock` is world-writable** (`drwxrwxrwt`, verified on this machine)
+  and the helper does `exec 9>/run/lock/tpm-keyring-unseal.lock` as root. Any
+  local user can pre-create that file and hold the lock, stalling every login
+  for the full `flock -w 10` and then failing the unseal — an unprivileged
+  denial of keyring auto-unlock. Wants a root-owned `/run/tpm-keyring-unlock/`.
+- **The helper does not check that `$DATA_DIR` and its contents are actually
+  owned by the target user and not symlinks.** It resolves `$HOME` from
+  `getent` and reads as root, and the sealed blob has no auth value and a
+  PCR7-only policy, so nothing binds a blob to a user. Needs its own design
+  pass (legitimately symlinked homes exist), which is why it is not a
+  drive-by fix here.
+- **`uninstall.sh` removes the PAM module and the helper with no prompt at
+  all** (the only destructive step without a `confirm()`), which on a shared
+  machine takes auto-unlock away from everyone — a larger blast radius than
+  the eviction this entry is about.

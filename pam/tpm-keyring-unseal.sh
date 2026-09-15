@@ -33,24 +33,112 @@ trap 'rm -rf "$WORKDIR"' EXIT
 # storage (see JOURNAL.md, 2026-08-16), reference that handle directly - no
 # recomputation needed. Cuts per-login cost from ~7.4s to well under 1s
 # (createprimary alone profiled at ~6.9s on this machine's fTPM, 2026-08-14
-# entry). Falls back to recreating the primary fresh, exactly as before,
-# for sealed data from before this existed (an install that hasn't re-run
-# bin/seal.sh since upgrading) - nothing breaks mid-migration, it's just
-# slower until re-sealed. tpm2 primary keys are deterministic (same
-# hierarchy + same template = same key every time); a *saved context file*
-# for a transient object is tied to the TPM's reset count and becomes
-# unloadable after every reboot, which is why this fallback recreates
-# rather than loading a saved primary.ctx - see JOURNAL.md.
+# entry). tpm2 primary keys are deterministic (same hierarchy + same
+# template = same key every time); a *saved context file* for a transient
+# object is tied to the TPM's reset count and becomes unloadable after every
+# reboot, which is why the slow path below recreates the primary rather than
+# loading a saved primary.ctx - see JOURNAL.md.
+#
+# The handle is read but never trusted. Two independent reasons, both real:
+#
+#  1. That persistent object is MACHINE-WIDE, not per-user. bin/seal.sh
+#     persists it at one fixed handle shared by every user on the box (the
+#     primary is deterministic, so the second user to seal reuses the first
+#     user's object). So another user's uninstall.sh evicting it - or a TPM
+#     clear, or anything else in the tss group calling tpm2_evictcontrol -
+#     leaves this user's primary.handle pointing at an empty handle, with
+#     the file itself perfectly intact. Keying the fallback off the file's
+#     *absence* (which is what this did until 2026-09-15) never fires in
+#     that case: tpm2_load just fails and the keyring silently stops
+#     unlocking. See JOURNAL.md, 2026-09-15, and GitHub issue #7.
+#  2. The file lives in an unprivileged user's home and this script runs as
+#     root during authentication. tpm2_load's -C takes a handle *or a
+#     context-file path* (it is spelled --parent-context), so unvalidated
+#     file content here is a user steering a root-side open of an arbitrary
+#     path. Hence the format check before it is ever passed to a tool.
+#
+# A failed load is the complete and authoritative test: seal.priv is
+# cryptographically bound to its real parent's name, so a wrong or absent
+# object at that handle cannot load it, and a foreign object squatting
+# there gets ignored rather than used. Deliberately NOT done: verifying the
+# handle up front with tpm2_readpublic and comparing names the way
+# bin/seal.sh does. The helper has nothing to compare against without first
+# deriving a fresh primary - i.e. paying the ~7s createprimary this whole
+# fast path exists to avoid - so "verify first" would cost the optimization
+# on every login to detect what the load already detects for free.
+PRIMARY_HANDLE=""
 if [ -f "$DATA_DIR/primary.handle" ]; then
-  PRIMARY_HANDLE="$(cat "$DATA_DIR/primary.handle")"
-else
-  tpm2_createprimary -C o -c "$WORKDIR/primary.ctx" >/dev/null
-  PRIMARY_HANDLE="$WORKDIR/primary.ctx"
+  # `|| true` so an unreadable file (root-squashed NFS home, say) routes to
+  # the slow path instead of killing the script under `set -e`. Whitespace
+  # is stripped because a stray CR or newline would otherwise be passed to
+  # -C verbatim.
+  PRIMARY_HANDLE="$(tr -d '[:space:]' <"$DATA_DIR/primary.handle" 2>/dev/null || true)"
+  # TPM 2.0 persistent objects live in 0x81000000-0x81ffffff; bin/seal.sh
+  # never writes anything else. Anything else is treated as "no handle".
+  # Spelled out here rather than sourced from bin/lib.sh's
+  # TPM_PERSISTENT_HANDLE_RE on purpose: install.sh copies this script alone
+  # to /usr/local/sbin, so the repo (and lib.sh with it) need not exist on
+  # the machine at authentication time. Keep the two in step by hand - it is
+  # the one place in this project where that duplication is deliberate.
+  if ! [[ "$PRIMARY_HANDLE" =~ ^0x81[0-9a-fA-F]{6}$ ]]; then
+    echo "tpm-keyring-unseal: $DATA_DIR/primary.handle is not a TPM persistent" >&2
+    echo "handle; ignoring it and recreating the primary (slower login). Re-run" >&2
+    echo "bin/seal.sh to restore the fast path." >&2
+    PRIMARY_HANDLE=""
+  fi
 fi
 
-tpm2_load -C "$PRIMARY_HANDLE" \
-  -u "$DATA_DIR/seal.pub" -r "$DATA_DIR/seal.priv" \
-  -c "$WORKDIR/seal.ctx" >/dev/null
+# `if ! tpm2_load` rather than `tpm2_load || fallback`, and deliberately not
+# wrapped in a function: `set -e` is suppressed for the whole body of a
+# function invoked in a condition context, which would silently disarm error
+# handling for every command inside it.
+LOADED=0
+if [ -n "$PRIMARY_HANDLE" ]; then
+  if tpm2_load -C "$PRIMARY_HANDLE" \
+       -u "$DATA_DIR/seal.pub" -r "$DATA_DIR/seal.priv" \
+       -c "$WORKDIR/seal.ctx" >/dev/null 2>"$WORKDIR/load.err"; then
+    LOADED=1
+  else
+    # stderr, never stdout: stdout is the secret channel, and the PAM module
+    # copies it verbatim into PAM_AUTHTOK. The module leaves stderr inherited
+    # from the login process, so this lands in the journal, where README's
+    # troubleshooting section already sends people (`journalctl -b 0 | grep
+    # -i tpm`). Says "tpm" on purpose, so that grep finds it.
+    echo "tpm-keyring-unseal: the persisted TPM primary at $PRIMARY_HANDLE did not" >&2
+    echo "load - it has been evicted (another user's uninstall.sh, or a TPM clear)." >&2
+    echo "Recreating it for this login; this adds ~7s. Re-run bin/seal.sh to restore" >&2
+    echo "the fast path." >&2
+    sed 's/^/tpm-keyring-unseal: tpm2_load: /' "$WORKDIR/load.err" >&2 || true
+    # A failed load can still have created a partial context file; the retry
+    # below must not be able to succeed off leftovers.
+    rm -f "$WORKDIR/seal.ctx"
+  fi
+fi
+
+# Slow path, unchanged in behavior from before the persisted primary existed:
+# recreate the deterministic primary and load under it. Left fatal under
+# `set -e` on purpose - if this fails, there is nothing further to try.
+# Exactly one retry, never a loop: tpm2_createprimary is deterministic, so a
+# second attempt would recompute the identical key and fail identically,
+# while costing another ~7s against the PAM module's 25s alarm (which a
+# second attempt would blow - see the budget comment in
+# pam/pam_tpm_keyring_authtok.c).
+if [ "$LOADED" -eq 0 ]; then
+  tpm2_createprimary -C o -c "$WORKDIR/primary.ctx" >/dev/null
+  tpm2_load -C "$WORKDIR/primary.ctx" \
+    -u "$DATA_DIR/seal.pub" -r "$DATA_DIR/seal.priv" \
+    -c "$WORKDIR/seal.ctx" >/dev/null
+fi
+
+# Note for anyone tempted to "self-heal" here: this script must never write
+# to $DATA_DIR. It runs as root during authentication against a path an
+# unprivileged user fully controls, so rewriting or deleting primary.handle
+# would be a root write through a symlink that user can plant. Re-persisting
+# the primary would be worse still - an unattended machine-wide TPM write
+# during one user's login, which is the exact class of thing issue #7 is
+# about. bin/seal.sh, running as the user, is the only writer. The cost of
+# not healing is a slow login plus the warning above, and that is the right
+# trade. See JOURNAL.md, 2026-09-15.
 
 # The policy-session-check-then-use step (startauthsession -> policypcr ->
 # unseal) has been observed to fail with "Esys_Unseal ... PCR have changed

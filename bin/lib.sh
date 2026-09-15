@@ -750,3 +750,73 @@ pam_shared_stack_is_sane_without_fprintd() {
   _pam_logical_lines "$shared" \
     | grep -qE '^[[:space:]]*-?auth[[:space:]]+(\[[^]]*\]|[^[:space:]]+)[[:space:]]+pam_(unix|sss|ldap|krb5|winbind|sssd)\.so'
 }
+
+# --- the machine-wide TPM primary handle ---------------------------------
+#
+# bin/seal.sh persists the TPM primary key at ONE fixed handle shared by
+# every user of this tool on the machine. That is deliberate and correct -
+# the primary is deterministic, so the second user to seal finds the first
+# user's object, compares names, matches, and reuses it rather than burning
+# a second persistent-object NV slot on a byte-identical key.
+#
+# The sharp edge is lifecycle: a persistent TPM object has no owner and no
+# refcount, and there is no TPM API that answers "who is still using this?".
+# So `uninstall.sh` evicting "its" handle is a machine-wide act that used to
+# be taken on one user's say-so, breaking every other user's keyring unlock
+# with no warning (GitHub issue #7, JOURNAL.md 2026-09-15). The only place
+# the dependency is recorded at all is the filesystem: each user's own
+# $DATA_DIR/primary.handle.
+
+# TPM 2.0 persistent objects live in the 0x81000000-0x81ffffff range, and
+# bin/seal.sh never records anything outside it. Used to reject a garbled or
+# hostile primary.handle before its contents reach a tpm2_* tool, where -C
+# would otherwise accept it as a *context-file path* rather than a handle.
+# NOTE: pam/tpm-keyring-unseal.sh carries this same pattern inline. It has
+# to: install.sh copies that script by itself to /usr/local/sbin, where this
+# file isn't reachable. If you change the pattern, change it there too.
+TPM_PERSISTENT_HANDLE_RE='^0x81[0-9a-fA-F]{6}$'
+
+tpm_handle_is_wellformed() {
+  [[ "$1" =~ $TPM_PERSISTENT_HANDLE_RE ]]
+}
+
+# Prints, one per line, the names of OTHER users who have recorded $1 as
+# their persisted primary handle and still have a sealed blob next to it.
+#
+#   $1  the handle about to be evicted (e.g. 0x81018000)
+#   $2  username to skip (the one running uninstall.sh)
+#   $3  optional passwd-format file to read instead of `getent passwd` -
+#       used ONLY by test/unit-regex-test.sh, so this predicate can be
+#       driven against a fixture home tree with no TPM, no container and
+#       no root. Never passed in production.
+#
+# Needs to run as root in production: the data dirs are 0700. A user whose
+# home is unreadable, unmounted, or not enumerated (LDAP/SSSD with the
+# default enumerate=false) simply does not appear here - this can produce a
+# false "nobody depends on it", never a false positive, which is why the
+# caller must still warn rather than treat an empty result as proof.
+#
+# Requires seal.priv beside the handle file on purpose: a leftover
+# primary.handle with no blob next to it is not a live dependency.
+tpm_primary_handle_dependents() {
+  local handle="$1" skip_user="$2" passwd_file="${3:-}"
+  local user home_dir data_dir recorded
+
+  while IFS=: read -r user _ _ _ _ home_dir _; do
+    [ -n "$user" ] || continue
+    [ -n "$home_dir" ] || continue
+    [ "$user" != "$skip_user" ] || continue
+    data_dir="$home_dir/.local/share/tpm-keyring-unlock"
+    [ -f "$data_dir/primary.handle" ] || continue
+    [ -f "$data_dir/seal.priv" ] || continue
+    recorded="$(tr -d '[:space:]' <"$data_dir/primary.handle" 2>/dev/null || true)"
+    [ "$recorded" = "$handle" ] || continue
+    printf '%s\n' "$user"
+  done < <(if [ -n "$passwd_file" ]; then cat "$passwd_file"; else getent passwd; fi)
+
+  # Explicit: finding nobody is a successful scan, not a failure. The caller
+  # distinguishes "none found" from "couldn't check" by this exit status and
+  # fails closed on the latter, so it must not be left to whatever the last
+  # command in the loop body happened to return.
+  return 0
+}

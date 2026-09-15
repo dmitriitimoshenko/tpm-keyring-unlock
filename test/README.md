@@ -35,7 +35,20 @@ actually runs there, never skips.
   (`fprintd-dash-auth`), and someone's hand-written retry stack
   (`fprintd-handrolled`, which `uninstall.sh` must not claim as its own).
   Plus which `/etc/pam.d/` entries count as services at all — `.bak-<ts>`,
-  `.pacnew`, `.rpmsave`, `.dpkg-old` and friends are not. The PAM control flow
+  `.pacnew`, `.rpmsave`, `.dpkg-old` and friends are not.
+  Also `tpm_handle_is_wellformed` and `tpm_primary_handle_dependents`, the
+  two predicates `uninstall.sh` consults before evicting the TPM primary
+  key that every user of the tool on a machine shares. Driven against a
+  generated passwd file and a throwaway home tree — the predicate takes the
+  passwd source as an argument precisely so this needs no TPM, no container
+  and no root. Covers the cases where being wrong costs someone else their
+  login: a stale handle file with no sealed blob beside it (not a
+  dependency), a user sealed under a different handle (not one), the
+  uninstalling user themselves (never their own dependent), a home that
+  doesn't exist (skipped, not an error), a CRLF-terminated handle file
+  (still matches), and — the one that decides the fail-closed behaviour —
+  that finding nobody exits zero, so `uninstall.sh` can tell "nobody
+  depends on this" apart from "couldn't check". The PAM control flow
   of the generated stack is covered by `runtime-test.sh` below, against real
   libpam.
 - **`test/runtime-test.sh`** (one container, distro doesn't matter) — the
@@ -46,7 +59,7 @@ actually runs there, never skips.
   lands in `PAM_AUTHTOK`, captured via `pam_exec.so expose_authtok`), helper
   exits with no output (`PAM_AUTHTOK` stays empty), and helper hangs past
   the timeout (`-DHELPER_TIMEOUT_SECS=2` for the test, instead of waiting
-  out the real 15s - asserts the process actually gets killed and the call
+  out the real 25s - asserts the process actually gets killed and the call
   returns promptly instead of hanging).
   Plus the control flow of the fingerprint attempt stack `install.sh`
   writes, with `pam_flow_stub.so` standing in for `pam_fprintd.so`: that a
@@ -112,6 +125,23 @@ script). Two scenarios:
   unseals, covering the transactional staging path in `bin/seal.sh`.
   It also fires two concurrent unseal calls at the real TPM to check the
   `flock` serialization fix for the second reboot regression in the journal.
+  Then, still in the first boot, it evicts the persisted primary out from
+  under the live enrollment — exactly what another user's `uninstall.sh`
+  does to a handle that is shared machine-wide (GitHub issue #7) — leaving
+  the user's `primary.handle` file in place naming the now-empty handle,
+  and confirms the helper still returns the secret by recreating the
+  primary instead of failing. It asserts the eviction really emptied the
+  handle first, so the recovery check can't pass against a no-op; that the
+  fallback says so on stderr and names `bin/seal.sh`, since that journal
+  line is the affected user's only clue; and that the user's data directory
+  is byte-identical afterwards, which is what pins down the rule that the
+  root-run helper never writes into an unprivileged user's home while
+  recovering. It then re-persists the primary at the same handle and
+  unseals the same blob again, both to leave the reboot check below testing
+  what it has always tested and because a freshly recreated primary loading
+  the old blob is itself the proof that the primary is deterministic.
+  This check fails against the pre-2026-09-15 helper — verified, not
+  assumed; see `JOURNAL.md`.
 
 Needs `swtpm`, `qemu-system-x86_64`/`qemu-img`, `/dev/kvm`, and network
 access once to fetch a small Ubuntu cloud image (cached afterward,
