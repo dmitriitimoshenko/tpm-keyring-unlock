@@ -1567,6 +1567,38 @@ test suite (`test/vm/run-vm-test.sh`) and Docker packaging tests
 `bin/seal.sh` / the PAM-dir-detection logic in `bin/lib.sh` directly), so
 they were unaffected by this change and required no update.
 
+## Failed re-seal now preserves the previous enrollment (2026-08-22)
+
+**Problem:** `bin/seal.sh` deleted `pcr.policy`, `seal.pub`, and
+`seal.priv` immediately after the user accepted the overwrite prompt. Every
+fallible operation needed to build the replacement happened afterward. A TPM
+error, interruption, or full filesystem during `tpm2_create` therefore turned
+a working enrollment into no enrollment at all. The two-entry password prompt
+only detects entries that differ from each other; it does not prove the
+resulting TPM object is loadable and unseals to the supplied bytes.
+
+**Fix:** build the PCR policy, public/private blobs, and handle metadata in a
+mode-0700 staging directory under `DATA_DIR`, leaving the installed files
+untouched. Load the staged object, open a fresh PCR policy session, unseal it,
+and compare the exact result to the supplied password. Only after that complete
+round trip succeeds are the staged files mode-normalized to 0600 and moved into
+place. Cleanup also flushes any TPM sessions/objects left live by a failed
+command before deleting the staging and context directories.
+
+Keeping staging below `DATA_DIR` is deliberate: it keeps staged files on the
+destination filesystem and avoids a cross-filesystem `mv` silently becoming a
+copy. This is failure-transactional for every checked command path; the four
+separate destination names are still not a single power-loss-atomic filesystem
+transaction, which would require a versioned state-directory format and an
+atomic pointer swap. That larger format migration was not necessary to fix the
+actual early-deletion bug and was deliberately kept out of this focused change.
+
+**Regression coverage:** the real-TPM VM test now shadows only `tpm2_create`
+with a helper that exits 42 during an accepted re-seal. It asserts that the
+re-seal fails and then invokes the real root helper against swtpm to prove the
+original secret still unseals. This would fail against the previous code
+because its early `rm -f` removed the old blobs before reaching the injected
+failure.
 ## Detection missed `-auth` lines, so Debian-family LightDM stacks went unpatched (2026-08-30)
 
 Reported from a Linux Mint 22.3 (Cinnamon, LightDM, Ubuntu 24.04 base)
@@ -3470,3 +3502,243 @@ holds the device, exactly as the `pam_start_confdir` run predicted, and they
 were a red herring from the first entry onward. The lesson is the one already
 written above: log correlation produced three different confident diagnoses
 here, and running the code produced one correct one.
+
+## Merging PR #5 (transactional re-seal) into the branch: two conflicts, and two things git merged silently and wrongly (2026-09-15, after the fingerprint work)
+
+PR #5 (`Tunahanyrd:fix/preserve-enrollment-on-reseal-failure`, opened
+2026-08-22) sat open while `main` moved through #6 and #9. Merging `main`
+into it produced two textual conflicts; the interesting part is what git
+resolved *without* a conflict marker, which in both cases was wrong.
+
+- **`JOURNAL.md`: both sides appended.** Kept both. The PR's entry is dated
+  2026-08-22 and `main`'s block runs 2026-08-30 → 09-15, so the PR's entry
+  goes *before* `main`'s, between the 2026-08-18 and 2026-08-30 entries -
+  same reasoning as the #6 merge above, chronological order preserved.
+
+- **`bin/seal.sh`, the overwrite prompt.** `main` had changed it to `[Y/n]`
+  with `read ... || exit 0` (a failed read declines rather than
+  overwriting); the PR had deleted the `rm -f` that followed it. These are
+  the same hunk from git's point of view but orthogonal in intent, so both
+  were kept: `main`'s prompt wording and read-failure handling, minus the
+  `rm -f`. The whole point of the PR is that accepting the prompt must not
+  delete anything - the replacement is built in `STAGE_DIR` and only moved
+  into place after it has proved it unseals.
+
+- **`bin/seal.sh`, the `chmod` - merged clean, and broken.** `main` added
+  `chmod 600 "$DATA_DIR/seal.pub" ...` after the `tpm2_create` that wrote
+  those files directly into `DATA_DIR`. The PR moved that write into
+  `STAGE_DIR` and added its own `chmod 600 "$STAGE_DIR/..."`. The two sides
+  touched different lines, so git kept **both**, leaving `main`'s
+  `DATA_DIR` chmod sitting *before* the `mv` loop that creates those files.
+  On a re-seal it is a harmless no-op on the old files; on a **first-ever**
+  seal `DATA_DIR` is empty at that point, `chmod` exits non-zero, `set -e`
+  fires, and enrollment fails outright. Dropped `main`'s copy and carried
+  its comment (the `sg tss` rationale) onto the staging chmod, which covers
+  the same four files and now also guarantees they are never visible at
+  their final names with any mode other than 0600.
+
+- **`test/vm/run-vm-test.sh` - merged clean, and vacuous.** The PR's new
+  regression drives `seal.sh` by piping `y` + the two password entries into
+  a plain `vm_ssh`. That was correct when the PR was written, but `main`
+  has since added the `[ -t 0 ]` guard (see "CI: the VM test drove
+  `seal.sh` through a pipe, which it now refuses", above) and the
+  `vm_ssh_tty` helper for exactly this. Merged as-is, the script would exit
+  at the tty guard *before* reaching the injected `tpm2_create` failure -
+  and since the check only asserts "the re-seal failed", it would have gone
+  green while testing nothing. Switched to `vm_ssh_tty`, and folded stderr
+  into the same file (`2>&1`, `check` now pointed at `.out`) because a pty
+  is one stream - same two consequences already documented for the seal
+  step above.
+
+Verified on the merged tree: `bash -n` clean on `bin/seal.sh`, `bin/lib.sh`,
+`install.sh`, `uninstall.sh`, `pam/tpm-keyring-unseal.sh` and
+`test/vm/run-vm-test.sh`; `make test-regex` passes 116 checks with no
+failures; `make build` compiles the PAM module clean under `-Wall -Wextra`.
+The VM layer (`make test-vm`) has not been run here and is the one that
+actually exercises the staging path - it needs swtpm and `/dev/kvm`.
+
+**Not fixed in this merge, and deliberately so** - these are properties of
+the PR itself, not of the merge, and changing them is a review decision
+rather than a conflict resolution:
+
+1. The self-test writes the unsealed plaintext to `"$WORKDIR/unsealed"`,
+   i.e. a `mktemp -d` under `/tmp`. That is a secret at rest on a path it
+   does not need to touch, against this repo's own rule; `/tmp` is tmpfs on
+   Ubuntu but that is a distro default, not a guarantee. A comparison
+   through `cmp -s - <(tpm2_unseal ...)` gets the same assurance via
+   `/dev/fd` with no file.
+2. The self-test runs `startauthsession → policypcr → unseal` exactly once.
+   `pam/tpm-keyring-unseal.sh` retries that sequence up to five times
+   precisely because this machine's fTPM has been observed to fail it with
+   `Esys_Unseal ... PCR have changed since checked` (2026-08-14 entry). A
+   spurious failure here is fail-safe - the old enrollment is untouched -
+   but it would abort a legitimate seal for no reason.
+3. `primary.handle` is now written only at the end, in the staged batch. If
+   a first-ever seal dies between `tpm2_evictcontrol` and the `mv`, the
+   primary is persisted in TPM NV with no file recording the handle, and
+   `uninstall.sh` (which reads `primary.handle` to evict) will not clean it
+   up. It is derived, idempotent metadata, not part of the enrollment being
+   protected, so it belongs in `DATA_DIR` immediately after `evictcontrol`.
+
+## The staged self-test aborted every seal: `tpm2_flushcontext` after `tpm2_unseal` fails on `/dev/tpmrm0` (2026-09-15, after merging PR #5)
+
+CI on the merged PR #5 branch failed one job - "VM (swtpm + OVMF) - real
+TPM/Secure Boot round trip" - with five checks red:
+
+    FAIL - seal.sh seals the throwaway secret (got: failed, want: sealed)
+    FAIL - tpm-keyring-unseal.sh returns the sealed secret (same boot) (got: , want: vm-test-throwaway-secret-...)
+    ok   - injected tpm2_create failure makes re-seal fail
+    FAIL - failed re-seal preserves the previous working secret (got: , want: ...)
+    FAIL - two concurrent unseal calls both succeed (flock serialization) (got: 1= 2=, want: both-correct)
+    FAIL - tpm-keyring-unseal.sh survives a real reboot (got: , want: ...)
+
+Only the first is a real failure; the rest report an empty `got:` because
+nothing was ever sealed. Note the one `ok` in the middle - "injected
+`tpm2_create` failure makes re-seal fail" passed while testing nothing at
+all, for the second time in this file. It only asserts that the re-seal
+*failed*, and it does, for whatever reason happens to be current.
+
+The captured pty stream named the failing tool but not the line:
+
+    | Persisting primary key into the TPM at 0x81018000 (one-time cost;
+    | avoids recomputing it on every future login - see JOURNAL.md).
+    | ERROR: Could not read serialized ESYS_TR from disk
+    | ERROR: Could not load session context
+    | ERROR: Argument neither a session nor a transient.
+    | ERROR: Unable to run tpm2_flushcontext
+
+Every command between that echo and the error is `>/dev/null` on success,
+so the log cannot say *which* `tpm2_flushcontext` died.
+
+**Two wrong guesses, and why the first repro was worthless.** The first
+hypothesis was that `tpm2_unseal -p session:FILE` consumes and deletes the
+session file. Tested against a standalone `swtpm` over TCP: the file
+survived, and `tpm2_flushcontext` on it returned 0. Hypothesis dead.
+
+The second attempt - replaying `bin/seal.sh`'s exact TPM sequence against
+that same standalone swtpm - died at `tpm2_create` with `out of memory for
+object contexts`, which is not the CI failure at all. That is the tell:
+talking to swtpm directly means there is **no resource manager**, so every
+transient object stays loaded and the slots run out. `/dev/tpmrm0`, which
+is what both the VM guest and this machine actually use, is the in-kernel
+resource manager - it swaps objects in and out, and it **flushes everything
+a client created when that client closes the device**. No host-side repro
+without one is faithful. `tpm2-abrmd` is not installed here, so the only
+faithful environment is the VM test itself.
+
+**Reproduced locally with `test/vm/run-vm-test.sh`** - byte-identical
+failure, same five checks, same four ERROR lines. That is the whole reason
+this test layer exists.
+
+**Root cause.** Each `tpm2_*` invocation is its own process, so each opens
+and closes `/dev/tpmrm0`. When `tpm2_unseal` exits, the resource manager
+drops the session and the loaded object it was using; the saved context
+files left on disk no longer resolve to anything. The PR's self-test then
+runs, bare and under `set -euo pipefail`:
+
+    tpm2_flushcontext "$TEST_SESSION" >/dev/null
+    tpm2_flushcontext "$TEST_OBJECT" >/dev/null
+
+which exits non-zero and takes the whole seal down - *after* the self-test
+had already succeeded. The evidence that pins it to these two lines and not
+to the earlier `tpm2_flushcontext "$SESSION"` on line 122: that earlier one
+is byte-identical to `main`'s, where this same VM job is green. It flushes
+a session that `tpm2_policypcr` wrote and nothing has consumed.
+
+This was already known in this repo and simply not carried across.
+`pam/tpm-keyring-unseal.sh` has always written the post-unseal flush as
+`tpm2_flushcontext "$SESSION_CTX" >/dev/null 2>&1 || true` - both on the
+success path and the retry path. The `|| true` there is not defensive
+style; it is this exact failure, tolerated.
+
+**Fix:** same treatment in `bin/seal.sh`, with a comment saying why so the
+next person does not "tidy up" the `|| true`. Nothing leaks by tolerating
+it - the resource manager is what cleaned the handles up in the first
+place, and the EXIT trap retries the same flushes just as tolerantly.
+
+**Confirmed** by re-running `test/vm/run-vm-test.sh` on the fixed tree:
+
+    ok   - seal.sh seals the throwaway secret
+    ok   - tpm-keyring-unseal.sh returns the sealed secret (same boot)
+    ok   - injected tpm2_create failure makes re-seal fail
+    ok   - failed re-seal preserves the previous working secret
+    ok   - two concurrent unseal calls both succeed (flock serialization)
+    ok   - tpm-keyring-unseal.sh survives a real reboot (fresh primary, same sealed blob)
+    All VM tests passed.
+
+Worth noting what that fourth line means: this is the first run in which
+PR #5's regression test has ever actually tested its own premise - a real
+`tpm2_create` failure mid-re-seal, with the previously sealed secret still
+unsealing afterwards. The reboot-survival check also passes as a hard check
+here, unlike on the CI runner where PCR7 differs between boots and it is
+downgraded to a KNOWN LIMITATION.
+
+**Standing lesson, now twice over.** A check written as "the command
+failed, as injected" passes for any failure, including one that never
+reaches the code under test. Both times it was masked - once by the tty
+guard, once by this - the surrounding checks are what exposed it. Such an
+assertion should pin the *reason*: match the injected exit status, or grep
+the captured output for the tool that was supposed to fail.
+
+## The re-seal self-test wrote the keyring password to disk in the clear (2026-09-15, after CI went green)
+
+With CI green on the merged PR #5 branch, the remaining review items were
+triaged by whether they threaten stored data. One did, and it is the only
+change made here - the rest work and were deliberately left alone.
+
+**Problem.** PR #5's self-test proved the staged object unseals by writing
+the result to a file and comparing:
+
+    tpm2_unseal -c "$TEST_OBJECT" -p "session:$TEST_SESSION" >"$WORKDIR/unsealed"
+    ...
+    if ! printf '%s' "$PASSWORD" | cmp -s - "$WORKDIR/unsealed"; then
+
+`$WORKDIR` is a plain `mktemp -d`, so that file lands under `/tmp`. The
+reflex answer is "`/tmp` is tmpfs, it never touches a disk" - which is a
+distro default, not a guarantee, and is not the whole story even when it
+holds. Checked on this machine rather than assumed:
+
+    $ findmnt -no FSTYPE,OPTIONS /tmp
+    tmpfs rw,nosuid,nodev,size=15799436k,...
+    $ swapon --show
+    NAME      TYPE SIZE USED PRIO
+    /swap.img file   8G   0B   -1
+    $ findmnt -no SOURCE,FSTYPE /
+    /dev/nvme0n1p5 ext4          # no LUKS, no crypt devices at all
+
+tmpfs pages are swappable, the swap file lives on the root filesystem, and
+that filesystem is not encrypted. So the GNOME keyring password - the one
+secret this entire project exists to keep inside the TPM - could be written
+to persistent storage in the clear, by the very step that was added to make
+sealing safer. `rm -rf "$WORKDIR"` in the trap does not help: it unlinks a
+file, it does not recall a page the kernel already swapped out.
+
+**Fix.** Keep it in process memory, where `$PASSWORD` already lives:
+
+    UNSEALED="$(tpm2_unseal -c "$TEST_OBJECT" -p "session:$TEST_SESSION")"
+    ...
+    if [ "$UNSEALED" != "$PASSWORD" ]; then
+
+Command substitution rather than `cmp -s - <(tpm2_unseal ...)` on purpose.
+Process substitution would equally avoid the file, but it makes the unseal
+part of a comparison instead of a command: a genuine `tpm2_unseal` failure
+would then surface as "returned a different secret" rather than aborting on
+its own error. A plain assignment keeps `set -e` behaviour intact, since the
+assignment's exit status is the substitution's. Command substitution strips
+trailing newlines, which cannot matter here - `$PASSWORD` comes from `read`,
+so it has none to lose. `UNSEALED` joins the `unset` on both the mismatch
+path and the success path.
+
+**Audited the rest of the repo for the same shape.** The only other
+`tpm2_unseal` is `pam/tpm-keyring-unseal.sh:71`, which writes to stdout for
+the PAM module to read over a pipe - no file, by design. No other place
+writes a secret anywhere.
+
+**Confirmed** with `test/vm/run-vm-test.sh` on the fixed tree: all checks
+pass, including the real-TPM round trip, the injected-failure regression and
+reboot survival.
+
+**Deliberately not changed** (they work; see the previous entry for the full
+list): the missing retry around the self-test's policy session, the staged
+`primary.handle`, and the injected-failure check that passes for any
+failure.
