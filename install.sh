@@ -210,8 +210,20 @@ RESEAL=false
 mapfile -t candidates < <(grep -lE "$PAM_GNOME_KEYRING_AUTH_RE" /etc/pam.d/* 2>/dev/null \
   | grep -vE "$PAM_NON_SERVICE_RE")
 targets=()
+# Stacks where a password module runs BELOW the pam_gnome_keyring auth line.
+# Our module sets PAM_AUTHTOK from the TPM before anyone has authenticated, so
+# anything down there that takes its password from PAM_AUTHTOK instead of
+# prompting would let a login through on a secret nobody typed. Collected
+# separately and reported, never patched. See bin/lib.sh's
+# pam_auth_insertion_point_is_safe and JOURNAL.md, 2026-09-15.
+unsafe_targets=()
 for c in "${candidates[@]}"; do
-  grep -q pam_tpm_keyring_authtok.so "$c" || targets+=("$c")
+  if grep -q pam_tpm_keyring_authtok.so "$c"; then continue; fi
+  if pam_auth_insertion_point_is_safe "$c"; then
+    targets+=("$c")
+  else
+    unsafe_targets+=("$c")
+  fi
 done
 
 # 1e. fingerprint stacks that drop the reader after one unlucky scan or one
@@ -420,6 +432,30 @@ if [ "${#targets[@]}" -gt 0 ]; then
   echo "     service authenticates you via something other than a typed"
   echo "     password (e.g. fingerprint)."
 fi
+# Reported whether or not anything is being wired up: a refused stack is the
+# one case where the tool declines to do what the user asked, so it must not
+# be silent about it.
+if [ "${#unsafe_targets[@]}" -gt 0 ]; then
+  echo
+  echo "  !! NOT wiring the TPM helper into these, and they are the reason:"
+  for t in "${unsafe_targets[@]}"; do
+    echo "       $t"
+  done
+  echo
+  echo "     Each has a password module (pam_unix.so and friends) BELOW its"
+  echo "     pam_gnome_keyring.so auth line. The helper line goes immediately"
+  echo "     above that one and hands the TPM-unsealed keyring password to"
+  echo "     PAM before you have authenticated, so a password module further"
+  echo "     down that takes its password from PAM instead of prompting"
+  echo "     (try_first_pass) could log someone in on a secret nobody typed."
+  echo "     Your keyring password is usually your login password, so that is"
+  echo "     a real way in, not a theoretical one."
+  echo
+  echo "     Nothing is wrong with the rest of the install; these files are"
+  echo "     just left alone. If one is hand-written, move its"
+  echo "     pam_gnome_keyring.so auth line below the module that actually"
+  echo "     authenticates and re-run."
+fi
 echo
 
 if ! confirm "Proceed with all of the above?"; then
@@ -605,6 +641,15 @@ else
     fi
     if grep -q pam_tpm_keyring_authtok.so "$TARGET"; then
       echo "$TARGET already had the module wired in - left unchanged."
+      continue
+    fi
+    # Re-checked here, not just when the plan was built, for the same reason
+    # the existence check above is: the package install between the two can
+    # rewrite a file under /etc/pam.d. This is the check that must not be
+    # skipped on a stale plan - getting it wrong writes a login bypass.
+    if ! pam_auth_insertion_point_is_safe "$TARGET"; then
+      echo "$TARGET has a password module below its pam_gnome_keyring.so auth" >&2
+      echo "line - left untouched (see the note printed above)." >&2
       continue
     fi
     backup_pam_file "$TARGET"

@@ -57,6 +57,33 @@ fi
 echo "== tpm-keyring-unlock uninstaller =="
 echo
 
+# Worked out once, up front, because the very first step below already
+# affects other people: removing the PAM line from a shared service stops
+# their keyring auto-unlocking just as surely as deleting the module does.
+# Whoever is answering these prompts should know that before the first one,
+# not after three of them. Best-effort and non-fatal - other users' data dirs
+# are 0700, so this needs root, and a declined sudo just means we say less.
+OTHER_SEALED=""
+if command -v getent >/dev/null 2>&1; then
+  OTHER_SEALED="$(sudo bash -c '
+         while IFS=: read -r u _ _ _ _ h _; do
+           [ -n "$u" ] && [ -n "$h" ] || continue
+           [ "$u" != "$1" ] || continue
+           [ -f "$h/.local/share/tpm-keyring-unlock/seal.priv" ] || continue
+           printf "%s\n" "$u"
+         done < <(getent passwd)
+       ' _ "$USER" 2>/dev/null || true)"
+fi
+if [ -n "$OTHER_SEALED" ]; then
+  echo "Heads up: other users have sealed secrets on this machine -"
+  echo "$OTHER_SEALED" | sed 's/^/  /'
+  echo "The PAM lines, the module and the helper are shared by all of you."
+  echo "Removing any of them stops their keyring auto-unlocking too, and they"
+  echo "would need to re-install to get it back. Their sealed secrets and"
+  echo "keyring passwords are untouched either way."
+  echo
+fi
+
 # --- 1. remove the PAM stack line ---------------------------------------
 # Scans every /etc/pam.d/ service, not just ones named after fingerprints:
 # install.sh patches any service with an auth-phase pam_gnome_keyring.so
@@ -241,13 +268,34 @@ for candidate in "${PAM_MODULE_DIR_CANDIDATES[@]}"; do
     break
   fi
 done
-if [ -n "$found_module" ]; then
-  sudo rm -f "$found_module"
-  echo "Removed $found_module"
-fi
-if [ -f "$HELPER_DST" ]; then
-  sudo rm -f "$HELPER_DST"
-  echo "Removed $HELPER_DST"
+# The module and the helper are machine-wide, not this account's: every user
+# who sealed here depends on them, and these were the only destructive steps
+# in this script with no confirmation at all. Removing them takes keyring
+# auto-unlock away from everyone on the box - a wider blast radius than the
+# TPM handle eviction further down, which does ask. Same disclosure as there:
+# name who else is relying on this before asking. See JOURNAL.md, 2026-09-15.
+if [ -n "$found_module" ] || [ -f "$HELPER_DST" ]; then
+  echo
+  if [ -n "$OTHER_SEALED" ]; then
+    echo "Reminder: these users still depend on the module and helper:"
+    echo "$OTHER_SEALED" | sed 's/^/  /'
+  else
+    echo "The PAM module and helper are shared by every user of this tool on"
+    echo "this machine. No other user's sealed secret was found, though a home"
+    echo "that isn't mounted right now wouldn't show up."
+  fi
+  if confirm_default_no "Remove the machine-wide PAM module and helper?"; then
+    if [ -n "$found_module" ]; then
+      sudo rm -f "$found_module"
+      echo "Removed $found_module"
+    fi
+    if [ -f "$HELPER_DST" ]; then
+      sudo rm -f "$HELPER_DST"
+      echo "Removed $HELPER_DST"
+    fi
+  else
+    echo "Left the PAM module and helper in place."
+  fi
 fi
 
 # --- 3. unmask the systemd units ----------------------------------------

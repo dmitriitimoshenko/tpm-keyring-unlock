@@ -4543,3 +4543,192 @@ make it unreviewable:
   all** (the only destructive step without a `confirm()`), which on a shared
   machine takes auto-unlock away from everyone — a larger blast radius than
   the eviction this entry is about.
+
+## The insertion point was never checked, and three deferred findings (2026-09-15, later the same day)
+
+Prompted by an audit published in a downstream fork
+(`SoulInfernoDE/tpm-keyring-unlock`, commit `e7bd6c9`), which recorded a set
+of review findings from 2026-08-30 that had never been reported here. One of
+them was not on the list in the PR #11 entry above, and is the most serious
+thing in this file.
+
+### The installer never checked what runs *above* the line it inserts
+
+`install.sh` wires the module in with a single unconditional edit:
+
+    sudo sed -E -i "/${PAM_GNOME_KEYRING_AUTH_RE}/i auth optional pam_tpm_keyring_authtok.so"
+
+i.e. immediately above the auth-phase `pam_gnome_keyring.so` line, in *every*
+`/etc/pam.d` service that has one. Nothing anywhere verified what precedes
+that point. Confirmed by grepping `install.sh` and `bin/lib.sh` for any such
+predicate before writing one: there was none.
+
+Why that matters. The module unseals the keyring password and calls
+`pam_set_item(PAM_AUTHTOK)` **before anyone has authenticated** - the README
+already says as much about a failed fingerprint attempt. That is safe only
+while nothing below the insertion point can turn `PAM_AUTHTOK` into a
+successful authentication.
+
+The module itself cannot: `pam_sm_authenticate` returns `PAM_IGNORE` on every
+path, the success path included (`pam_tpm_keyring_authtok.c:223`); the only
+`PAM_SUCCESS` in the file is in `pam_sm_setcred`, a different phase that does
+not decide authentication. Checked rather than assumed, because the fork's
+write-up framed it as "an optional module becomes a bypass", which would only
+follow if it voted.
+
+The real mechanism is the module *below*. A `pam_unix.so` with
+`try_first_pass` takes its password from `PAM_AUTHTOK` instead of prompting.
+If one runs below our line on a stack where nothing above demanded
+credentials, it authenticates using a secret nobody typed - and this tool's
+own premise is that the keyring password is usually the login password. That
+is a login and screen-unlock bypass.
+
+It does not bite on stacks anyone ships, because `pam_gnome_keyring`'s auth
+line sits after the authenticator, so the insertion lands below it. The
+fixture tree shows exactly that, and shows how close it runs: Debian's
+`common-auth` really does carry `pam_unix.so nullok try_first_pass` - just
+*above* the keyring line. PR #6 checked this for three Mint files and found
+them safe; nothing generalised it. The installer patches every matching
+service.
+
+**Fix:** `pam_auth_insertion_point_is_safe` in `bin/lib.sh`, consulted
+when the plan is built and again immediately before each write (same reason
+the vanished-target re-check exists: a package install between the two can
+rewrite `/etc/pam.d`, and this is the check that must not run on a stale
+plan). A stack that fails it is listed, explained, and left alone.
+
+The part that took the actual work is the include walk, and it is the reason
+a naive version of this fix would have been worse than no fix. Debian-family
+stacks keep the authenticator in `common-auth`, so `/etc/pam.d/gdm-password`
+is literally:
+
+    auth    requisite       pam_nologin.so
+    @include common-auth
+    auth    optional        pam_gnome_keyring.so
+
+Checking only the file's own lines reports the single most common supported
+configuration as unsafe and refuses to wire it up. So the predicate follows
+`@include`, `auth include` and `auth substack`, with a depth cap - include
+loops are legal to write and would otherwise hang an installer on a login
+path.
+
+`pam_fprintd` is deliberately *not* counted as an authenticator. It answers
+yes/no and never produces a password, and a failed scan leaves libpam walking
+the rest of the stack - which is precisely the situation that makes an
+unguarded insertion point dangerous.
+
+A test caught a real defect in the first version of this predicate, which is
+worth recording because the bug was in the safe-looking direction: it
+returned success as soon as it saw an authenticator, even in a file with no
+`pam_gnome_keyring` line at all. Harmless for `install.sh`, which only asks
+about files that already matched - but a safety predicate that answers "safe"
+to a question nobody asked is one that gets reused somewhere it shouldn't be.
+It now requires the insertion point to exist. The lesson is the ordinary one:
+the assertion that failed was the one written for the direction that "can't
+happen".
+
+### The three findings PR #11 deferred, now fixed
+
+Deferred there to keep that PR reviewable; taken together here because they
+are all "root trusts something it shouldn't".
+
+**The lock lived in a world-writable directory.** `/run/lock` is
+`drwxrwxrwt`. Any local user could create `tpm-keyring-unseal.lock` first and
+simply hold it - no symlink, no race - stalling every login for the full
+`flock -w 10` and then failing the unseal. Moved to `/run/tpm-keyring-unlock`,
+created 0700; `/run` itself is root-owned and 755, so a directory there can
+only have been made by root. The helper refuses if the path exists and is not
+a directory.
+
+**The helper never checked whose blob it was unsealing.** It resolves `$HOME`
+from `getent` and reads as root, and the sealed object has no auth value and
+a PCR7-only policy, so nothing in it binds it to a user. One user pointing
+their own data dir at another's - a symlink is enough, the path is entirely
+theirs to shape - could have root unseal *someone else's* keyring password
+into their login. Now the resolved data dir and blobs must be owned by the
+user being authenticated and not group- or other-writable.
+
+Ownership of the *resolved* files, deliberately, rather than refusing
+symlinks: a home behind a symlink is somebody's real setup, and who owns what
+we end up reading is the thing that actually matters. The first version of
+the mode check was wrong in a way `bash -n` cannot see - a `case` with `;;&`
+whose `*)` arm matched too and `continue`d instead of refusing. Replaced with
+`[ $(( 0$mode & 022 )) -ne 0 ]` and checked against 700/600/770/606/2755/755/640
+before trusting it. Shell pattern matching is not a good way to ask an
+arithmetic question.
+
+**`uninstall.sh` removed machine-wide components with no prompt.** Deleting
+the PAM module and `/usr/local/sbin/tpm-keyring-unseal` were the only
+destructive steps in the script with no `confirm()` at all, and they take
+keyring auto-unlock from every user on the box. Now gated behind
+`confirm_default_no`.
+
+Placing that disclosure took a correction. It was first put next to the
+module removal, which is wrong: step 1 removes the PAM lines and runs
+*earlier*, and that alone stops other users' keyrings unlocking. Whoever is
+answering needs to know before the first prompt, not the fourth. The scan is
+now done once at the top of the run and reported there.
+
+### Reporting channel
+
+Verified while reviewing the fork's claims: private vulnerability reporting
+was **disabled** on this repo (`gh api .../private-vulnerability-reporting`
+-> `{"enabled":false}`) and there was no `SECURITY.md`. That is the direct
+reason findings sat in a third party's public journal for eleven days instead
+of arriving here - there was no private channel to use. Reporting is now
+enabled (re-checked: `{"enabled":true}`) and `SECURITY.md` says so, says what
+is already known and in the threat model so nobody re-reports it, and says
+plainly that a public issue beats an unreported finding.
+
+Still outstanding from that fork's journal: a `USERWITHAUTH` assertion,
+mentioned as unreported but not described in enough detail to act on. Worth
+asking about rather than guessing.
+
+### Correcting the check above, found by pointing it at a real machine (2026-09-15, same day)
+
+The predicate as first written asked the wrong question, and only running it
+against this machine's actual `/etc/pam.d` caught it. It asked *"does
+something above the insertion point authenticate?"*. That reads as the same
+thing as the hazard and is not. It flagged two live files:
+
+    /etc/pam.d/gdm-autologin     >>> UNSAFE <<<
+    /etc/pam.d/gdm-fingerprint   >>> UNSAFE <<<
+
+Both were wrong, and the second one badly. `gdm-fingerprint`'s auth phase is
+three `pam_fprintd` lines, then our module, then `pam_gnome_keyring`, then
+`@include common-account` - a different phase. Nothing below our line can
+authenticate anybody: the only thing there is the keyring module, which is
+the intended *consumer* of PAM_AUTHTOK. It is completely safe. But
+`pam_fprintd` is not a password module, so "something above authenticates"
+was false, and the installer would have **refused to wire up
+`gdm-fingerprint`** - the single scenario this entire tool exists for.
+`gdm-autologin` is the same story: below our line is `pam_permit.so`, which
+lets everyone through regardless and never reads a password.
+
+The correct question is *"can anything below the insertion point consume the
+PAM_AUTHTOK we are about to set?"*. That is the actual exploit chain: our
+module sets the token, and a password module further down takes it instead of
+prompting. Necessary condition, and the whole condition. Renamed to
+`pam_auth_insertion_point_is_safe` and rewritten to scan strictly *after* the
+keyring line, following includes below it (a stack whose keyring line
+precedes `@include common-auth` puts all of common-auth, `try_first_pass` and
+all, underneath us).
+
+Re-checked against the same machine afterwards: all seven services SAFE,
+including `gdm-fingerprint` and `gdm-autologin`.
+
+The depth cap changed direction as part of this. It used to return "does not
+authenticate" when the include chain got too deep, which with the new
+question means *fail open* - an include chain we gave up on would read as
+safe. It now returns "authenticates", so giving up means refusing. `loop-below`
+covers it.
+
+Two lessons, both cheap and both nearly missed. First: a proxy condition that
+sounds equivalent to the real one usually is not, and the way to tell is to
+run it against real data rather than only against fixtures written from the
+same misunderstanding - every one of the original fixtures passed, because
+they encoded the same wrong question. Second: for a check that gates a login
+path, the false-accept and the false-refuse are *both* dangerous, and the
+false-refuse is the one a threat-model mindset forgets. Refusing
+`gdm-fingerprint` would not have looked like a security bug; it would have
+looked like the tool not working.

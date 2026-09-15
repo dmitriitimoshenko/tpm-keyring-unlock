@@ -1,0 +1,7 @@
+#%PAM-1.0
+auth	requisite	pam_nologin.so
+auth	[success=2 authinfo_unavail=ignore auth_err=ignore maxtries=ignore default=die]	pam_fprintd.so max-tries=1
+auth	[success=1 authinfo_unavail=ignore auth_err=ignore maxtries=ignore default=die]	pam_fprintd.so max-tries=1
+auth	required	pam_fprintd.so max-tries=1
+auth    optional        pam_gnome_keyring.so
+@include common-account

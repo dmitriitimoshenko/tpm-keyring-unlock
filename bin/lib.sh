@@ -820,3 +820,107 @@ tpm_primary_handle_dependents() {
   # command in the loop body happened to return.
   return 0
 }
+
+# --- is our insertion point actually safe? --------------------------------
+#
+# install.sh inserts `auth optional pam_tpm_keyring_authtok.so` immediately
+# above the auth-phase pam_gnome_keyring.so line. That module unseals the
+# keyring password and calls pam_set_item(PAM_AUTHTOK) - unconditionally,
+# before anyone has authenticated (a failed fingerprint already triggers it;
+# see README's threat model section).
+#
+# The module itself can never grant a login: pam_sm_authenticate returns
+# PAM_IGNORE on every path, success included, so it never votes. The hazard
+# is a module BELOW it that authenticates using PAM_AUTHTOK instead of
+# prompting - pam_unix.so with try_first_pass is the ordinary example. On
+# such a stack our module hands it a valid password nobody typed, and since
+# the keyring password is usually the login password (that is this tool's
+# whole premise), that is a login and screen-unlock bypass.
+#
+# So the question is what runs BELOW the insertion point, not above it. That
+# distinction matters and the first version of this check got it wrong: it
+# asked whether something above already authenticated, which reads as the
+# same thing and is not. On gdm-fingerprint nothing above is a password
+# module - pam_fprintd only answers yes/no - yet nothing below it can consume
+# PAM_AUTHTOK either, so it is perfectly safe, and refusing it would have
+# disabled the single scenario this tool exists for. See JOURNAL.md,
+# 2026-09-15.
+#
+# Modules that can authenticate with a password, and so could consume a
+# PAM_AUTHTOK they did not prompt for. Same list as
+# pam_shared_stack_is_sane_without_fprintd deliberately: one notion of "this
+# module can log somebody in" for the whole tool. pam_gnome_keyring is not in
+# it - it is the intended consumer of PAM_AUTHTOK and unlocks a keyring
+# rather than granting a session.
+PAM_PRIMARY_AUTH_RE='^[[:space:]]*-?auth[[:space:]]+(\[[^]]*\]|[^[:space:]]+)[[:space:]]+pam_(unix|sss|sssd|ldap|krb5|winbind)\.so'
+
+# Succeeds if the auth phase of $1 contains a primary auth module anywhere,
+# following @include / `auth include` / `auth substack`.
+#
+# Used to look inside an include that sits below the insertion point: a stack
+# whose keyring line comes before `@include common-auth` puts the whole of
+# common-auth - pam_unix.so with try_first_pass and all - underneath our
+# module.
+_pam_stack_authenticates() {
+  local f="$1" dir="${2:-/etc/pam.d}" depth="${3:-0}"
+  local line inc
+  [ -f "$f" ] || return 1
+  # Include loops are legal to write and would otherwise hang an installer on
+  # a login path; libpam caps recursion, so cap it here too. Hitting the cap
+  # reports "yes, this authenticates" on purpose - the honest answer is "could
+  # not tell", and the only caller treats that as a reason to refuse. Failing
+  # open here would mean an include chain we gave up on reads as safe. Real
+  # stacks are one or two levels deep, so nothing legitimate reaches this.
+  [ "$depth" -lt 8 ] || return 0
+  while IFS= read -r line; do
+    [[ ! "$line" =~ $PAM_PRIMARY_AUTH_RE ]] || return 0
+    if [[ "$line" =~ ^[[:space:]]*@include[[:space:]]+([^[:space:]]+)[[:space:]]*$ ]]; then
+      inc="${BASH_REMATCH[1]}"
+    elif [[ "$line" =~ ^[[:space:]]*-?auth[[:space:]]+(include|substack)[[:space:]]+([^[:space:]]+) ]]; then
+      inc="${BASH_REMATCH[2]}"
+    else
+      continue
+    fi
+    ! _pam_stack_authenticates "$dir/$inc" "$dir" "$((depth + 1))" || return 0
+  done < <(_pam_logical_lines "$f")
+  return 1
+}
+
+# Succeeds if it is safe to insert our module immediately above the
+# auth-phase pam_gnome_keyring.so line in $1 - i.e. nothing below that point
+# could authenticate somebody using the PAM_AUTHTOK we are about to set.
+#
+# Returns failure when there is no pam_gnome_keyring auth line at all: no
+# insertion point is not a safe insertion point, and a predicate that answers
+# "safe" to a question nobody asked gets reused somewhere it shouldn't be.
+#
+# What this proves and what it does not: it proves no password module runs
+# after ours in this service's auth phase. It is not a complete model of
+# libpam - it does not reason about control flags or jumps, and it treats any
+# primary auth module below as disqualifying whether or not it actually
+# carries try_first_pass, because `optional` ordering is not worth splitting
+# hairs over on a login path.
+pam_auth_insertion_point_is_safe() {
+  local f="$1" dir="${2:-/etc/pam.d}"
+  local line inc seen_keyring=0
+  [ -f "$f" ] || return 1
+  _pam_logical_lines "$f" | grep -qE "$PAM_GNOME_KEYRING_AUTH_RE" || return 1
+  while IFS= read -r line; do
+    if [ "$seen_keyring" -eq 0 ]; then
+      # Everything up to and including the keyring line runs before our
+      # module does, so it cannot consume what we have not set yet.
+      [[ ! "$line" =~ $PAM_GNOME_KEYRING_AUTH_RE ]] || seen_keyring=1
+      continue
+    fi
+    [[ ! "$line" =~ $PAM_PRIMARY_AUTH_RE ]] || return 1
+    if [[ "$line" =~ ^[[:space:]]*@include[[:space:]]+([^[:space:]]+)[[:space:]]*$ ]]; then
+      inc="${BASH_REMATCH[1]}"
+    elif [[ "$line" =~ ^[[:space:]]*-?auth[[:space:]]+(include|substack)[[:space:]]+([^[:space:]]+) ]]; then
+      inc="${BASH_REMATCH[2]}"
+    else
+      continue
+    fi
+    ! _pam_stack_authenticates "$dir/$inc" "$dir" 1 || return 1
+  done < <(_pam_logical_lines "$f")
+  return 0
+}

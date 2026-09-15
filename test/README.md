@@ -48,7 +48,25 @@ actually runs there, never skips.
   doesn't exist (skipped, not an error), a CRLF-terminated handle file
   (still matches), and — the one that decides the fail-closed behaviour —
   that finding nobody exits zero, so `uninstall.sh` can tell "nobody
-  depends on this" apart from "couldn't check". The PAM control flow
+  depends on this" apart from "couldn't check".
+  And `pam_auth_insertion_point_is_safe`, which decides whether `install.sh`
+  may wire the module into a given stack at all: the module sets
+  `PAM_AUTHTOK` from the TPM before anyone has authenticated, so nothing
+  *below* the insertion point may be a password module that would take that
+  token instead of prompting. Both directions are asserted, and the accepting
+  ones matter most — a false "safe" writes a login bypass, but a false
+  "unsafe" refuses `gdm-fingerprint`, which is the entire scenario this tool
+  exists for. Fixtures in `test/fixtures/pam.d/ordering/` cover a direct
+  authenticator above, one reached through `@include`, one through `auth
+  substack`, one split across a line continuation, a fingerprint-only stack
+  (no password module above it at all, and still safe), an autologin stack
+  (`pam_permit.so` below, which grants regardless and reads no password), a
+  keyring line placed before `@include common-auth`, a bare `pam_unix.so
+  try_first_pass` below, an `auth substack` below, and an `@include` loop
+  below (must refuse rather than hang — the walk fails closed when it gives
+  up). The real `@include`-based `gdm-password` fixture is asserted accepted
+  separately: that one breaking would refuse every supported Debian-family
+  install. The PAM control flow
   of the generated stack is covered by `runtime-test.sh` below, against real
   libpam.
 - **`test/runtime-test.sh`** (one container, distro doesn't matter) — the
@@ -142,6 +160,16 @@ script). Two scenarios:
   the old blob is itself the proof that the primary is deterministic.
   This check fails against the pre-2026-09-15 helper — verified, not
   assumed; see `JOURNAL.md`.
+  Finally it creates a second account, points that account's data dir at the
+  first user's with a symlink, and confirms the helper refuses rather than
+  handing root's unseal of someone else's keyring password to whoever asked —
+  asserting both that the secret does not come back *and* that the refusal
+  came from the ownership check rather than some incidental failure, then
+  that the legitimate owner still unseals (an ownership check that locks out
+  the real user would be the worse bug). Also asserts the unseal lock now
+  lives in a root-owned 0700 directory instead of world-writable
+  `/run/lock`. Two real accounts and a real TPM, so no other layer can
+  cover it.
 
 Needs `swtpm`, `qemu-system-x86_64`/`qemu-img`, `/dev/kvm`, and network
 access once to fetch a small Ubuntu cloud image (cached afterward,

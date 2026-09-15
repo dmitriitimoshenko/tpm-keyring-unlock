@@ -575,6 +575,59 @@ else
 fi
 check "a handle nobody uses returns empty AND exits zero" "$got" "ok:[]"
 
+# --- nothing below the insertion point may consume PAM_AUTHTOK ------------
+# install.sh puts `auth optional pam_tpm_keyring_authtok.so` immediately above
+# the pam_gnome_keyring auth line, and that module sets PAM_AUTHTOK from the
+# TPM before anyone has authenticated. The module never votes (PAM_IGNORE on
+# every path), so the hazard is a password module BELOW it taking that token
+# instead of prompting - pam_unix.so with try_first_pass - which would log
+# somebody in on a secret nobody typed.
+#
+# Both directions are load-bearing, and the safe ones more so: a false
+# "unsafe" refuses gdm-fingerprint, which is the entire scenario this tool
+# exists for. See JOURNAL.md, 2026-09-15.
+ORDERING="$REPO_DIR/test/fixtures/pam.d/ordering"
+
+for f in safe-direct safe-include safe-substack safe-continued \
+         safe-fingerprint-only safe-autologin; do
+  if pam_auth_insertion_point_is_safe "$ORDERING/$f" "$ORDERING"; then
+    got=safe
+  else
+    got=refused
+  fi
+  check "insertion point accepted: $f" "$got" "safe"
+done
+
+for f in unsafe-keyring-first unsafe-unix-below unsafe-substack-below loop-below; do
+  if pam_auth_insertion_point_is_safe "$ORDERING/$f" "$ORDERING"; then
+    got=safe
+  else
+    got=refused
+  fi
+  check "insertion point refused: $f" "$got" "refused"
+done
+
+# The two that would break a real, working install if the predicate drifted
+# back to asking what runs *above* the insertion point. gdm-fingerprint has
+# no password module above it at all - pam_fprintd only answers yes/no - and
+# is still perfectly safe, because nothing below it can consume PAM_AUTHTOK.
+# gdm-password reaches its authenticator through @include common-auth.
+if pam_auth_insertion_point_is_safe "$FIXTURES/shared/gdm-password" "$FIXTURES/shared"; then
+  got=safe
+else
+  got=refused
+fi
+check "a real @include-based gdm-password stack is still accepted" "$got" "safe"
+
+# No pam_gnome_keyring auth line means no insertion point, which is not the
+# same as a safe one.
+if pam_auth_insertion_point_is_safe "$FIXTURES/no-match" "$FIXTURES"; then
+  got=safe
+else
+  got=refused
+fi
+check "a stack with no keyring auth line is not called safe" "$got" "refused"
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "All regex/detection tests passed."
