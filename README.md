@@ -3,28 +3,26 @@
 [![test](https://github.com/dmitriitimoshenko/tpm-keyring-unlock/actions/workflows/test.yml/badge.svg)](https://github.com/dmitriitimoshenko/tpm-keyring-unlock/actions/workflows/test.yml)
 
 You log in with your fingerprint, and GNOME still asks for a password the
-first time something needs a saved secret. This fixes that — without blanking
+first time something needs a saved secret. This fixes that without blanking
 the keyring password and without leaving it in a file.
 
 The password goes into the TPM instead, sealed to this machine's Secure Boot
-state, and PAM unseals it at login.
+state. PAM unseals it at login.
 
-## Is this for you?
+## Requirements
 
-**Yes, if** your disk is *not* encrypted, you use GNOME keyring, and
-fingerprint login already works.
+This only helps if your disk is **not** encrypted. If it is, the keyring
+password mostly duplicates protection you already have: blank it and you are
+done.
 
-**No, if** your disk is encrypted. The keyring password is then mostly
-duplicating protection you already have — blank it and you're done. This tool
-would add nothing.
-
-You also need, and `install.sh` refuses to continue without:
+You also need fingerprint login already working, and all of the following.
+`install.sh` checks each one and stops if it is missing.
 
 - TPM 2.0 with `/dev/tpmrm0`
-- Secure Boot **on** (PCR7 is meaningless as a lock otherwise)
+- Secure Boot enabled. PCR7 is meaningless as a lock otherwise.
 - systemd, and `gnome-keyring` as your actual secrets backend
-- `tpm2-tools`, a C compiler, PAM headers — the installer offers to fetch
-  these on apt / dnf / pacman / zypper
+- `tpm2-tools`, a C compiler, and PAM headers. The installer offers to fetch
+  these on apt, dnf, pacman and zypper.
 
 ## Install
 
@@ -34,9 +32,10 @@ cd tpm-keyring-unlock
 ./install.sh
 ```
 
-It prints the whole plan first — packages, group change, the exact PAM diffs,
-each file backed up — and asks once before touching anything. Enter accepts.
-Without a terminal it refuses to run rather than answering itself.
+The installer prints its whole plan first: packages to install, the group
+change, and the exact PAM diffs it would apply, with every file backed up. It
+asks once before touching anything, and Enter accepts. It will not run without
+a terminal.
 
 Then seal your keyring password:
 
@@ -44,74 +43,73 @@ Then seal your keyring password:
 bin/seal.sh
 ```
 
-Typed interactively, never written to disk unencrypted, never passed as an
-argument.
+You type the password into the terminal. It is never written to disk
+unencrypted and never passed as a command-line argument.
 
 Log out and back in to test.
 
-## Threat model, honestly
-
-Read this before trusting it with anything.
+## What this protects, and what it doesn't
 
 **Protected: the disk comes out and gets read somewhere else.** The sealed
-blob is ciphertext bound to this machine's TPM and its PCR7 state. Neither
+blob is ciphertext bound to this machine's TPM and its PCR7 state, and neither
 travels with the disk.
 
 **Not protected: the whole machine is taken.** PCR7 measures the Secure Boot
-state — which keys are enrolled, which certificate vouched for what loaded.
-It does *not* measure the kernel, the initrd, or the kernel command line, and
-the policy has no password on it, because unsealing has to happen at login
-without asking anyone anything.
+state: which keys are enrolled, and which certificate vouched for what loaded.
+It does not measure the kernel, the initrd, or the kernel command line. The
+policy also has no password on it, because unsealing has to happen at login
+without a prompt.
 
-So someone holding your laptop can pick your own installed system in GRUB,
-add `init=/bin/bash`, and boot to a root shell: same bootloader, same
+Someone holding your laptop can therefore pick your own installed system in
+GRUB, add `init=/bin/bash`, and boot to a root shell. Same bootloader, same
 signatures, same PCR7, and the TPM unseals for them exactly as it does for
-you. That distro's own install media gets to the same place. Your disk isn't
-encrypted — that was the premise — so the sealed file is right there too.
+you. That distro's own install media reaches the same place. Your disk is not
+encrypted, which was the premise here, so the sealed file is sitting right
+there as well.
 
-**The honest framing is narrow: this replaces a keyring password kept in a
-plaintext file, not full-disk encryption.** If "someone walks off with the
-laptop" is in your threat model, use FDE — at which point you don't need this.
+**This replaces a keyring password kept in a plaintext file. It is not a
+substitute for full-disk encryption.** If "someone walks off with the laptop"
+is in your threat model, use FDE, and then you do not need this tool.
 
-Two more things, stated plainly:
+Two further limits:
 
-- **Anyone with your running, logged-in machine** (root, or you) can read the
-  unsealed value the same way this tool does. That's inherent to "unlock
-  without asking," not specific to this approach.
-- **A failed fingerprint attempt still triggers an unseal.** libpam keeps
-  walking the stack after the distro's `required` fingerprint line fails, so
-  the module below it runs anyway. The login still fails and the token is
-  discarded, but someone at your lock screen can make the TPM do an unseal by
-  touching the sensor. That predates this tool; the seal is bound to the
-  machine's state, not to who's standing there.
+- Anyone with your running, logged-in machine, meaning root or you, can read
+  the unsealed value the same way this tool does. Every "unlock without
+  asking" scheme has this property.
+- A failed fingerprint attempt still triggers an unseal. libpam keeps walking
+  the stack after the distro's `required` fingerprint line fails, so the
+  module below it runs anyway. The login still fails and the token is
+  discarded, but someone at your lock screen can make the TPM perform an
+  unseal by touching the sensor. This predates the tool: the seal is bound to
+  the machine's state, not to who is standing in front of it.
 
-Binding more PCRs (4, 8, 9) would narrow the gap and is deliberately not done
-— it would mean re-sealing after every kernel and bootloader update, to
-half-cover what FDE covers properly.
+Binding more PCRs (4, 8 and 9) would narrow the gap. It is not done, because
+it would mean re-sealing after every kernel and bootloader update to partly
+cover a case FDE already covers.
 
 If your Secure Boot settings ever change, PCR7 changes and the seal breaks.
-Re-run `bin/seal.sh`. Routine kernel and driver updates don't affect it.
+Re-run `bin/seal.sh`. Routine kernel and driver updates do not affect it.
 
 ## How it works
 
-Two separate things had to be fixed.
+Two separate problems had to be solved.
 
-**1. A systemd/PAM race that breaks keyring auto-unlock for everyone**,
+**1. A systemd/PAM race that breaks keyring auto-unlock for everyone,**
 password logins included, on distros that pre-start
 `gnome-keyring-daemon.service`. The daemon is already running by the time PAM
 tries to unlock it, so PAM spawns a second, disconnected one instead. Masking
 the unit fixes it.
 
-> If you're getting the keyring prompt even with **password** logins, this
-> alone may be your whole fix — try it before anything else:
+> If you get the keyring prompt even with password logins, this alone may be
+> your whole fix. Try it before anything else:
 >
 > ```bash
 > systemctl --user mask gnome-keyring-daemon.socket gnome-keyring-daemon.service
 > ```
 
-**2. Fingerprint auth never sets `PAM_AUTHTOK`**, so `pam_gnome_keyring.so`
-has nothing to work with. A small PAM module unseals the password and sets it,
-purely so the next module can use it:
+**2. Fingerprint auth never sets `PAM_AUTHTOK`,** so `pam_gnome_keyring.so`
+has nothing to work with. A small PAM module unseals the password and sets it
+for the next module to use:
 
 ```
 auth	required	pam_fprintd.so
@@ -119,28 +117,28 @@ auth    optional        pam_tpm_keyring_authtok.so   <- added by this tool
 auth    optional        pam_gnome_keyring.so         <- already there
 ```
 
-It is always `auth optional` and always returns `PAM_IGNORE` — it cannot grant
-or deny a login under any circumstances, including its own failure. If a real
-password was typed, it does nothing.
+That module is always `auth optional` and always returns `PAM_IGNORE`, so it
+cannot grant or deny a login, including when it fails. If a real password was
+typed, it does nothing.
 
-This isn't only about services named `*fingerprint*`. `install.sh` patches
-every `/etc/pam.d/` service with an auth-phase `pam_gnome_keyring.so` line,
-because `gdm-password` can succeed via fingerprint too the moment you enable
+Services named `*fingerprint*` are not the only ones affected. `install.sh`
+patches every `/etc/pam.d/` service with an auth-phase `pam_gnome_keyring.so`
+line, because `gdm-password` can also succeed via fingerprint once you enable
 it system-wide. It refuses to patch a stack where a password module runs
-*below* the insertion point, which would let a token nobody typed authenticate
-a login.
+*below* the insertion point, since that would let a token nobody typed
+authenticate a login.
 
 ## The fingerprint reader dropping out mid-prompt
 
-Separate problem; `install.sh` offers to fix it while it's there.
+This is a separate problem, and `install.sh` offers to fix it in the same run.
 
 One badly angled scan, or 30 seconds of not touching the sensor, and
-fingerprint disappears for the rest of the lock screen — the sensor sitting
-there working. `pam_fprintd` returns "no such auth method here", and
-gnome-shell treats that as permanent. `max-tries=` does not help: it only
-counts clean mismatches.
+fingerprint disappears for the rest of the lock screen while the sensor keeps
+working. `pam_fprintd` returns "no such auth method here", and gnome-shell
+treats that as permanent. `max-tries=` does not help, because it only counts
+clean mismatches.
 
-PAM has no loop, so the fix is to invoke the module three times:
+PAM has no loop construct, so the fix is to invoke the module three times:
 
 ```
 auth  [success=2 …]  pam_fprintd.so max-tries=1
@@ -148,66 +146,68 @@ auth  [success=1 …]  pam_fprintd.so max-tries=1
 auth  required       pam_fprintd.so max-tries=1
 ```
 
-**One line is one scan, so whatever goes wrong costs exactly one attempt** —
-mismatch, bad scan, timeout, all the same. Three attempts total, which is what
-the module's own default allowed anyway; only *which* failures count has
-changed. Each keeps its own 30s deadline.
+One line is one scan, so a mismatch, a bad scan and a timeout each cost
+exactly one attempt. Three attempts is what the module's own default allowed
+before, so the count has not changed, only which failures count toward it.
+Each attempt keeps its own 30-second deadline.
 
-Applied only to a stack that offers fingerprint and nothing else
-(`gdm-fingerprint` on Ubuntu/Debian), backed up first. Stacks it can't
-reproduce faithfully — a `sufficient` fingerprint line, a numeric jump above
-it, an extra auth module — are refused rather than guessed at, and shared
-stacks like `common-auth` are never touched. `uninstall.sh` only reverts a
-file it can prove it wrote, and says so when it can't.
+This is applied only to a stack that offers fingerprint and nothing else,
+which on Ubuntu and Debian means `gdm-fingerprint`, and the file is backed up
+first. Stacks that the rewrite cannot reproduce faithfully are refused rather
+than guessed at: a `sufficient` fingerprint line, a numeric jump above it, or
+an extra auth module. Shared stacks such as `common-auth` are never touched.
+`uninstall.sh` only reverts a file it can prove it wrote, and says so when it
+cannot.
 
-Full reasoning, measurements and the `pam_fprintd` source archaeology are in
-[`JOURNAL.md`](JOURNAL.md).
+The measurements and the `pam_fprintd` source reading behind all of this are
+in [`JOURNAL.md`](JOURNAL.md).
 
-Worth knowing: `/etc/pam.d/gdm-fingerprint` belongs to the `gdm` package, so
-an upgrade can restore its version. Re-run `install.sh` if dropouts come back.
+One thing to expect: `/etc/pam.d/gdm-fingerprint` belongs to the `gdm`
+package, so an upgrade can restore the distro's version. Re-run `install.sh`
+if dropouts come back.
 
-## Also want fingerprint for `sudo`?
+## Fingerprint for `sudo`
 
-That's separate and not this tool's doing:
+This is a separate setting that the tool does not change for you:
 
 ```bash
 sudo pam-auth-update --enable fprintd
 ```
 
-Re-run `install.sh` afterwards — enabling it system-wide means `gdm-password`
-can now succeed via fingerprint too, which reopens the same gap on a service
-not named after fingerprints.
+Re-run `install.sh` afterwards. Enabling fingerprint system-wide means
+`gdm-password` can now succeed via fingerprint too, which reopens the same gap
+on a service that is not named after fingerprints.
 
-**There's a trade-off.** The same profile puts `pam_fprintd.so` into
+It also costs you something. The same profile puts `pam_fprintd.so` into
 `common-auth`, and at the greeter that stack races `gdm-fingerprint` for the
-sensor — and wins, with a single attempt on a 10s timeout. So fingerprint for
-`sudo`/polkit and a retrying fingerprint prompt at the lock screen are
-mutually exclusive as things stand. `install.sh` detects the conflict,
-explains it, lists exactly which services would lose fingerprint on *your*
-machine, and offers to disable the profile:
+sensor and wins, with a single attempt on a 10-second timeout. Fingerprint for
+`sudo` and polkit, and a retrying fingerprint prompt at the lock screen, are
+therefore mutually exclusive. `install.sh` detects the conflict, explains it,
+lists which services would lose fingerprint on your machine, and offers to
+disable the profile:
 
 ```bash
 sudo pam-auth-update --disable fprintd     # what the installer runs
 sudo pam-auth-update --enable fprintd      # undo, any time
 ```
 
-`sudo` itself keeps fingerprint either way — Ubuntu's `/etc/pam.d/sudo` has
-its own line. polkit prompts, `login` and `su` fall back to the password they
-already accept.
+`sudo` itself keeps fingerprint either way, because Ubuntu's `/etc/pam.d/sudo`
+carries its own line. polkit prompts, `login` and `su` fall back to the
+password they already accept.
 
-## More than one person on this machine?
+## Shared machines
 
-The TPM primary key is **one shared object** at a fixed handle
-(`0x81018000`) — the same key for everyone by construction. So evicting it, or
-removing the PAM module and helper, is a machine-wide act. `uninstall.sh`
-checks for other users' sealed secrets first, names who's affected, and
-refuses (or defaults to no) rather than quietly breaking someone else's login.
+The TPM primary key is one shared object at a fixed handle (`0x81018000`), and
+it is the same key for every user. Evicting it, or removing the PAM module and
+the helper, therefore affects the whole machine. `uninstall.sh` looks for
+other users' sealed secrets first, names who would be affected, and either
+refuses or defaults to no instead of breaking someone else's login.
 
-**Sharing the key does not mean sharing the secrets.** Each user's blob lives
-in their own `0700` directory, and the helper refuses to unseal one that isn't
-owned by the account being authenticated — verified through file descriptors
-it has already opened, so pointing a data directory at someone else's doesn't
-work even if the swap happens mid-login.
+Sharing the key does not mean sharing the secrets. Each user's blob lives in
+their own `0700` directory, and the helper refuses to unseal one that is not
+owned by the account being authenticated. It verifies this through file
+descriptors it has already opened, so pointing a data directory at someone
+else's does not work even if the swap happens mid-login.
 
 ## Uninstall
 
@@ -215,58 +215,62 @@ work even if the swap happens mid-login.
 ./uninstall.sh
 ```
 
-Reverses each step, asking before each one. Your actual keyring password is
-never changed by this tool, so there's nothing to restore there.
+Reverses each step, asking before each one. Your keyring password itself is
+never changed by this tool, so there is nothing to restore there.
 
 ## Troubleshooting
 
-- **Still prompted after install.** Find which service handled your login:
+- **Still prompted after install.** Find which service handled your login with
   `journalctl -b 0 | grep gkr-pam`. The name in brackets tells you which
-  `/etc/pam.d/` file needs patching — re-run `install.sh`, it'll offer.
-- **Broke after a reboot, nothing else changed.** `journalctl -b 0 | grep -i tpm`,
-  then `sudo /usr/local/sbin/tpm-keyring-unseal $USER >/dev/null; echo $?`.
-  Non-zero usually means PCR7 changed (a Secure Boot setting moved) — re-run
-  `bin/seal.sh`.
-- **Broke after `pam-auth-update --enable fprintd`.** See "Also want
-  fingerprint for sudo" above — re-run `install.sh`.
-- **Login pauses for several seconds, but auto-unlock works.** You're on the
-  slow TPM path: either a secret sealed before the fast path existed, or the
-  shared primary was evicted by someone else's uninstall (the journal says so
-  explicitly). Fix for both: `bin/seal.sh`, choose Overwrite, same password.
+  `/etc/pam.d/` file needs patching. Re-run `install.sh` and it will offer.
+- **Broke after a reboot, nothing else changed.** Check `journalctl -b 0 |
+  grep -i tpm`, then run
+  `sudo /usr/local/sbin/tpm-keyring-unseal $USER >/dev/null; echo $?`. A
+  non-zero exit usually means PCR7 changed because a Secure Boot setting
+  moved. Re-run `bin/seal.sh`.
+- **Broke after `pam-auth-update --enable fprintd`.** See "Fingerprint for
+  sudo" above, then re-run `install.sh`.
+- **Login pauses for several seconds, but auto-unlock works.** You are on the
+  slow TPM path, either because the secret was sealed before the fast path
+  existed, or because another user's uninstall evicted the shared primary. The
+  journal says which. Either way, run `bin/seal.sh` and choose Overwrite with
+  the same password.
 - **"Can't determine the Secure Boot state."** Install `mokutil`, or confirm
-  Secure Boot is on another way, then re-run.
-- **Anything deeper:** [`JOURNAL.md`](JOURNAL.md) is the full, warts-and-all
-  investigation log — including bugs found after this README was written and
-  exactly how they were root-caused.
+  Secure Boot is on some other way, then re-run.
+- **Anything deeper.** [`JOURNAL.md`](JOURNAL.md) is the full investigation
+  log, including bugs found after this README was written and how each one was
+  root-caused.
 
 ## Compatibility
 
 Built and verified on one real machine: Ubuntu, GNOME, GDM, systemd, TPM 2.0,
 Secure Boot on, no disk encryption.
 
-**Should work** — the logic handles it, but it hasn't been run there: any
-GNOME distro with `gnome-keyring` (Fedora, Debian, Pop!_OS…), other display
-managers if `gnome-keyring` really backs your secrets (detection matches by
-file *content*, not filename), apt/dnf/pacman/zypper, x86_64 and aarch64.
-Arch has one rough edge: no `sg`, so you log out and back in once mid-install.
+Should work, in the sense that the logic handles it but it has not been run
+there: any GNOME distro using `gnome-keyring` such as Fedora, Debian or
+Pop!_OS; other display managers, provided `gnome-keyring` really backs your
+secrets, since detection matches by file content rather than filename; apt,
+dnf, pacman and zypper; x86_64 and aarch64. Arch has no `sg`, so you log out
+and back in once during install.
 
-**Won't work:** KDE with KWallet (different secrets service entirely), no
-TPM 2.0, Secure Boot off, non-systemd init. The installer checks and exits
-cleanly rather than half-working.
+Will not work: KDE with KWallet, which is a different secrets service
+entirely; machines without TPM 2.0; Secure Boot off; a non-systemd init. The
+installer checks for these and exits cleanly rather than half-working.
 
-**Genuinely untested:** any TPM other than this machine's fTPM and the VM's
-software TPM, and any real graphical fingerprint login (the test VM is
-headless). If you hit something broken there, that's a real bug report —
-please open an issue.
+Untested: any TPM other than this machine's fTPM and the VM's software TPM,
+and any real graphical fingerprint login, since the test VM is headless. If
+something breaks for you there, it is a bug report rather than an unsupported
+configuration. Please open an issue.
 
-What *is* covered by automated tests, including a real `swtpm` + OVMF VM:
-see [`test/README.md`](test/README.md) and [`CONTRIBUTING.md`](CONTRIBUTING.md).
+For what the automated tests do cover, including a real `swtpm` and OVMF VM,
+see [`test/README.md`](test/README.md) and
+[`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Security
 
-Found a way to get at a secret you shouldn't? See [`SECURITY.md`](SECURITY.md)
-— private reporting is enabled.
+If you find a way to reach a secret you should not be able to, see
+[`SECURITY.md`](SECURITY.md). Private reporting is enabled.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).
