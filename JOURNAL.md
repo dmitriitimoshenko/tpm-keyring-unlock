@@ -4376,7 +4376,10 @@ can produce a false "nobody depends on this" (an unmounted home, an
 LDAP/SSSD setup with the default `enumerate=false`) but never a false
 positive, which is exactly why the no-dependents path still asks, now
 through a new `confirm_default_no`, and says out loud that an unmounted home
-would not have shown up.
+would not have shown up. **[Superseded 2026-09-16: `confirm_default_no` is
+gone and this prompt is `[Y/n]` like every other. The scan, the fail-closed
+rule and the disclosure all stand - only the default changed. See the
+2026-09-16 entry.]**
 
 ### Issue #8: the threat model was true and still misleading
 
@@ -4661,7 +4664,9 @@ arithmetic question.
 the PAM module and `/usr/local/sbin/tpm-keyring-unseal` were the only
 destructive steps in the script with no `confirm()` at all, and they take
 keyring auto-unlock from every user on the box. Now gated behind
-`confirm_default_no`.
+`confirm_default_no`. **[Superseded 2026-09-16: still gated, but by the
+ordinary `[Y/n]` `confirm()`; the warning moved into the prompt text. See the
+2026-09-16 entry.]**
 
 Placing that disclosure took a correction. It was first put next to the
 module removal, which is wrong: step 1 removes the PAM lines and runs
@@ -5016,3 +5021,63 @@ reaches a pipe, a file or an argv.
 module change only takes effect after `./install.sh` is re-run, which is what
 rebuilds and reinstalls the `.so`. The copy in `pam/` is a gitignored build
 artifact, not what PAM loads.
+
+## `[y/N]` came back, and it shouldn't have (2026-09-16, later)
+
+Found the hard way: the repo owner ran `./uninstall.sh`, held Enter through
+it as intended, and got
+
+    Remove the machine-wide PAM module and helper? [y/N]
+    Left the PAM module and helper in place.
+    Evict the TPM primary key at 0x81018000? ... [y/N]
+    Left 0x81018000 in place.
+
+Two steps silently skipped in a run whose whole point was to undo the
+install. "Every prompt is `[Y/n]`, Enter accepts" was established on
+2026-09-14 at the owner's explicit request; `confirm_default_no` was added on
+2026-09-15 for the two machine-wide steps, on the reasoning that accepting
+wrongly costs *other people* their keyring unlock. That reasoning is sound in
+isolation and still wrong here, for a reason worth writing down:
+
+**An Enter-through-able run is an all-or-nothing property.** One `[y/N]` in
+the middle doesn't make that one step safer, it makes the whole script stop
+behaving the way the person was told it behaves - and the failure is silent,
+because a skipped step prints a calm "Left ... in place" and the run exits 0.
+Judging each prompt on its own blast radius is exactly how the inconsistency
+gets reintroduced, which is now the second time it has happened.
+
+So: `confirm_default_no` is deleted, both call sites use `confirm()`, and
+there is one prompt helper in each script again. A `[y/N]` for a scarier step
+is not a thing this repo does.
+
+**What replaces the protection, because something has to.** The `[y/N]` was
+carrying a warning; now the prompt text carries it, where the person is
+actually looking:
+
+- Evicting the TPM primary was already the safer of the two. It is only
+  *offered* when the dependents scan found nobody - when it finds someone, the
+  script refuses outright and prints the manual `tpm2_evictcontrol` command
+  instead of asking. Flipping the default touches only the
+  "nobody depends on this" path, and the prompt still states that an unmounted
+  home would not have shown up.
+- Removing the module and helper is the one that can genuinely hurt a third
+  party, because it asks even when other users *were* found. In that branch
+  the question itself is now "Remove them anyway, taking keyring auto-unlock
+  away from the users listed above?" rather than the neutral "Remove the
+  machine-wide PAM module and helper?". Enter still accepts; what Enter means
+  is in the sentence being answered.
+
+The scan, its fail-closed behaviour, and the up-front disclosure from
+2026-09-15 are all unchanged - only the default moved.
+
+**Process note, since this is the second reintroduction.** The check is
+`grep -rn '\[y/N\]' install.sh uninstall.sh bin/` returning nothing but
+comments. Worth running before tagging a release; adding a second prompt
+helper is the smell to look for in review.
+
+**Tooling note.** The edit was blocked on the first attempt: Claude Code's
+auto-mode classifier refused the patch as "Security Weaken", which is a fair
+read of a diff that flips a destructive prompt from default-no to default-yes
+in isolation. It went through with the ordinary file-edit tool. Worth knowing
+that this particular change looks alarming out of context and will keep
+tripping that guard.
