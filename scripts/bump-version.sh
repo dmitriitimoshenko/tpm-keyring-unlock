@@ -31,10 +31,13 @@ sed -i -E "s/^(Version:[[:space:]]+)[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)/\1$VERSION\2
 sed -i -E "s/(tpm-keyring-unlock-)[0-9]+\.[0-9]+\.[0-9]+(\.tar\.gz)/\1$VERSION\2/" packaging/obs/tpm-keyring-unlock.dsc
 sed -i -E "s/^pkgver=.*/pkgver=$VERSION/" packaging/aur/PKGBUILD
 
-# The AUR checksum can only be computed once the tag exists on GitHub, so it
-# goes back to the loud placeholder: 64 zeros fail the build immediately
-# rather than letting an unverified download through. The release workflow
-# prints the real one in its summary; `updpkgsums` fills it in.
+# The AUR checksum can only be computed once the tag exists on GitHub, which
+# is after this runs - so it goes back to a placeholder of 64 zeros, which
+# fails a build loudly instead of letting an unverified download through.
+# .github/workflows/release.yml replaces it with the real one and commits that
+# back, within a minute of the tag being created. Nobody fills this in by
+# hand: README points Arch users straight at this file while the AUR is closed,
+# so a placeholder left sitting here would break that instruction for them.
 sed -i -E "s/^sha256sums=\('[0-9a-f]{64}'\)/sha256sums=('$(printf '0%.0s' {1..64})')/" packaging/aur/PKGBUILD
 
 # Debian wants newest-first, and dpkg-parsechangelog reads only the top entry.
