@@ -11,7 +11,7 @@
   <service name="download_url">
     <param name="protocol">https</param>
     <param name="host">github.com</param>
-    <param name="path">/dmitriitimoshenko/tpm-keyring-unlock/archive/refs/tags/v1.4.0.tar.gz</param>
-    <param name="filename">tpm-keyring-unlock-1.4.0.tar.gz</param>
+    <param name="path">/dmitriitimoshenko/tpm-keyring-unlock/archive/refs/tags/v1.4.1.tar.gz</param>
+    <param name="filename">tpm-keyring-unlock-1.4.1.tar.gz</param>
   </service>
 </services>
