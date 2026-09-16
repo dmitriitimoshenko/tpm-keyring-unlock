@@ -737,8 +737,14 @@ if [ "$B1_OK" -eq 1 ]; then
     GUEST_PAMDIR="$(vm_ssh "$B2_SSHPORT" \
       'source ~/tpm-keyring-unlock/bin/lib.sh; find_pam_module_dir' 2>/dev/null)"
 
-    # The enrollment from the checks above is deliberately left in place, so
-    # install.sh reaches seal.sh's "Overwrite? [Y/n]" and this answers `n`.
+    # install.sh does its own sealing here - it answers "yes" to the overwrite
+    # prompt and types a fresh secret - rather than reusing the enrollment from
+    # boot 1. Two reasons. It covers the seal step *through the installer*,
+    # which answering `n` skipped. And it keeps this scenario immune to the
+    # PCR7 drift GitHub-hosted runners show between two boots of the same VM
+    # (see the KNOWN_CI_PCR7_DRIFT note above): sealing and unsealing both
+    # happen on this boot, so a blob from boot 1 is never relied on. That drift
+    # is exactly what failed this check in CI while it passed locally.
     #
     # Why not type a password here: a pty accepts everything written to it at
     # once, and the reads that follow drain that queue in their own time. Feed
@@ -751,10 +757,13 @@ if [ "$B1_OK" -eq 1 ]; then
     #
     # Enter accepts every prompt by design (JOURNAL.md, 2026-09-16), so the
     # plan takes an empty line and seal.sh takes an explicit `n`.
+    INSTALL_SECRET="vm-install-secret-$(date +%s)"
     vm_drive "$B2_SSHPORT" "$WORK/install.out" \
       'cd ~/tpm-keyring-unlock && ./install.sh' \
       'Proceed with all of the above\? \[Y/n\] =' \
-      'Overwrite\? \[Y/n\] =n' 
+      'Overwrite\? \[Y/n\] =' \
+      "Password to seal[^:]*: =$INSTALL_SECRET" \
+      "Confirm: =$INSTALL_SECRET" 
     if [ $? -eq 0 ]; then got=installed; else got=failed; fi
     check "install.sh completes a full run" "$got" "installed" "$WORK/install.out"
 
@@ -777,9 +786,9 @@ if [ "$B1_OK" -eq 1 ]; then
       "$(vm_ssh "$B2_SSHPORT" 'b=$(ls /etc/pam.d/gdm-password.bak-* 2>/dev/null | head -1); [ -n "$b" ] && cmp -s "$b" /tmp/gdm-password.orig && echo identical || echo differs')" \
       "identical" "$WORK/install.out"
 
-    check "the sealed secret unseals through the helper install.sh installed" \
+    check "the secret install.sh sealed unseals through the helper it installed" \
       "$(vm_ssh "$B2_SSHPORT" 'sudo /usr/local/sbin/tpm-keyring-unseal ubuntu' 2>"$WORK/install-unseal.err")" \
-      "$SECRET" "$WORK/install-unseal.err"
+      "$INSTALL_SECRET" "$WORK/install-unseal.err"
 
     echo
     echo "-- uninstall.sh end to end --"

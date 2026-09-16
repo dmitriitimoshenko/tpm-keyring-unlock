@@ -5351,3 +5351,35 @@ mistaken for a defect later: `uninstall.sh` answered with Enter removes the
 user from `tss`, so the next command cannot reach the TPM. A real packaged
 install never sees this - the configure step offers to add the group itself,
 and did exactly that in the transcript. The test puts the group back.
+
+## The new scenario inherited the CI PCR7 drift (2026-09-16, still later)
+
+First CI run of the installer scenario: everything passed except one check,
+and it failed for a reason that was already documented two entries up in this
+file.
+
+    KNOWN LIMITATION - tpm-keyring-unseal.sh survives a real reboot (got: , want: vm-test-...)
+    FAIL - the sealed secret unseals through the helper install.sh installed (got: , want: vm-test-...)
+
+Same empty `got`, same cause: on GitHub-hosted runners PCR7 differs between
+boot 1 and boot 2 of the same VM, deterministically, never reproduced locally.
+The repo already treats the reboot-survival check as informational there via
+`KNOWN_CI_PCR7_DRIFT`. The new scenario runs on boot 2 and was reusing the
+enrollment sealed on boot 1 - so on a runner the policy no longer satisfies
+and nothing unseals. Locally, where PCR7 is stable, all 41 checks passed. A
+test that only passes on the machine it was written on is not much of a test.
+
+**Not silenced - restructured.** The scenario now has `install.sh` do its own
+sealing: the pty driver answers "yes" to the overwrite prompt and types a
+fresh secret, and the check asserts *that* secret comes back. Sealing and
+unsealing then both happen on the same boot, so nothing depends on a blob
+carried across a reboot, and the drift cannot reach it. It also closes a hole
+the previous version had: answering `n` meant the installer's sealing step was
+never exercised at all. Adding a second `KNOWN_CI_PCR7_DRIFT` exemption would
+have hidden the gap instead of removing it.
+
+Worth keeping in mind for anything added to this scenario later: boot 2 is a
+different PCR7 world on CI, so a check that spans the reboot needs either that
+exemption or its own enrollment.
+
+Local result after the change: 41 checks, 0 failures.
