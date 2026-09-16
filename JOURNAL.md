@@ -5081,3 +5081,102 @@ read of a diff that flips a destructive prompt from default-no to default-yes
 in isolation. It went through with the ordinary file-edit tool. Worth knowing
 that this particular change looks alarming out of context and will keep
 tripping that guard.
+
+## `grep -q` + `pipefail` = random PAM verdicts (2026-09-16, issue from a fork)
+
+Reported against the `mtriam/tpm-keyring-unlock` fork as issue #1, by someone
+running 1.3.0 (`821eee2`) on a Framework 13 AMD with Ubuntu 26.04.1. The
+symptom is the worst kind: the printed plan and the executed wiring listed
+*different* PAM stacks in the same run. `gdm-autologin` was planned as refused
+and wired anyway; three `gdm-smartcard-*` stacks were planned as wired and
+refused.
+
+**Cause, exactly as the reporter diagnosed it.** `install.sh` runs under
+`set -o pipefail` and several predicates in `bin/lib.sh` were written as
+
+    _pam_logical_lines "$f" | grep -qE "$SOME_RE"
+
+`_pam_logical_lines` is a shell function that prints one line at a time.
+`grep -q` exits on the first match, the function is still writing, it takes
+SIGPIPE, and the pipeline's status becomes 141 - which `pipefail` hands back
+as a failed predicate. Whether that happens is a race between how fast the
+writer gets through the file and how soon the reader leaves, so the same file
+gets different answers on different calls.
+
+**Confirmed here before changing anything.** On this machine's own short
+`/etc/pam.d` files the race never fired - `0/1000` on `gdm-fingerprint`, even
+pinned to one CPU with `taskset -c 0`, against the reporter's 18/200. Padding
+a stack past the match turns the same bug deterministic:
+
+    400 filler lines after the match -> 300/300 false negatives
+    pipeline status: 141  (writer killed by SIGPIPE)
+
+That is the whole mechanism in one number, and it is why "it works on my
+machine" was never evidence here.
+
+**Fix.** Every one of those predicates now reads
+`grep -qE RE < <(_pam_logical_lines "$f")`. A process substitution's exit
+status is its own business, so an early-leaving reader cannot fail the
+caller. Five call sites: `pam_fprintd_in_shared_stack`,
+`pam_fprintd_services_losing_fingerprint` (twice),
+`pam_shared_stack_is_sane_without_fprintd` (twice) and
+`pam_auth_insertion_point_is_safe`. Same 400-line stack afterwards: 0/300.
+
+The rule is now written next to `_pam_logical_lines` itself, because that is
+where the next person will be when they are about to do it again: never put
+that function on the left of a pipe feeding anything that can exit early.
+
+**Where the reporter's severity note was right.** In
+`pam_auth_insertion_point_is_safe` the error only ever produced false
+"unsafe" verdicts, so it failed closed - it could not wire an unsafe stack,
+only skip safe ones at random. The negated site in
+`pam_shared_stack_is_sane_without_fprintd` is the one that could fail the
+other way, which is why the test below targets it specifically.
+
+**Regression test, and the trap it avoids.** `test/unit-regex-test.sh` now
+runs three predicates 200 times each under `set -euo pipefail` and asserts
+200 identical *and correct* verdicts. The fixtures are padded past the match
+on purpose: on a short file the race is a coin flip that this machine loses
+0% of the time, so a test built on realistic stacks would have passed here
+while the bug was live. Verified against `git show HEAD:bin/lib.sh`, where
+all three fail 200/200.
+
+The third check needed a second look. Pointed at a stack that still carries
+`pam_fprintd.so`, `pam_shared_stack_is_sane_without_fprintd` gave the right
+answer even when broken (its first grep is negated, so the SIGPIPE result
+matched the correct verdict by luck) and the check passed against the unfixed
+code. It only bites when aimed at a stack that *should* come back sane, where
+the damage is in the second grep - the one that has to find a real
+authenticator.
+
+## The installer said too much (2026-09-16, later)
+
+The repo owner, after a run: "слишком много текста в установщике". Fair - a
+single run printed roughly 10KB across ~135 lines before it had changed
+anything, and the fingerprint sections were three or four paragraphs each.
+
+**What was cut, and the rule used.** Explanations of *why* went to README.md,
+which already had all of it - the attempt-stack rationale under "The
+fingerprint reader dropping out mid-prompt", the greeter race under
+"Fingerprint for `sudo`", the `optional` control field under "How it works".
+The installer now states what it will do and points there. Measured, printed
+text only:
+
+    the fingerprint attempts offer   1021 -> 185 chars   (5.5x)
+    the greeter/shared-stack block   2094 -> 430 chars   (4.9x)
+    the plan itself                  4256 -> 1254 chars, 83 -> 23 lines
+    all stdout text in the script    9929 -> 3321 chars, 253 -> 108 echoes
+
+Structural changes, not just shorter sentences: file lists print as bare
+service names with the directory named once, the per-target wiring diff is
+printed once instead of per file, `Wired:`/`Rewritten:` collect into one line
+instead of one per stack, and the fprintd attempt preview elides the repeated
+60-character control field to `[success=N ...die]` (visibly, with the literal
+text in README.md and in the `.bak` diff).
+
+**Where it stopped, and why.** The whole run lands around 3.5-4x smaller, not
+the 5x asked for. What is left is the plan - which files, which lines, which
+steps - plus per-step progress and failure diagnostics. Going further means
+not telling the user what the script touches, and the plan is the one feature
+README promises by name ("the exact PAM diffs it would apply"). That trade is
+the owner's to make, not something to take quietly while chasing a number.
