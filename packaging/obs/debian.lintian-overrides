@@ -1,0 +1,7 @@
+# The unseal helper is 0700 root:root on purpose: PAM runs it as root and it
+# writes an unsealed keyring password to stdout. World-readable would let any
+# local user read the script that does it; world-executable would let them run
+# it. install.sh gives it the same mode. Both tags below are lintian noticing
+# exactly that deviation, which is the point of it.
+tpm-keyring-unlock: executable-is-not-world-readable 0700 [usr/libexec/tpm-keyring-unlock/tpm-keyring-unseal]
+tpm-keyring-unlock: non-standard-executable-perm 0700 != 0755 [usr/libexec/tpm-keyring-unlock/tpm-keyring-unseal]

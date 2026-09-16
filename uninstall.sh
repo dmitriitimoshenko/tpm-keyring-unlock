@@ -3,11 +3,37 @@
 set -euo pipefail
 
 DATA_DIR="$HOME/.local/share/tpm-keyring-unlock"
-HELPER_DST="/usr/local/sbin/tpm-keyring-unseal"
+HELPER_DST="${TPM_KEYRING_HELPER:-/usr/local/sbin/tpm-keyring-unseal}"
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# readlink -f and the two-layout fallback, for the same reason install.sh has
+# them: an installed copy is reached through a symlink and keeps lib.sh flat
+# beside itself rather than under bin/.
+REPO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+LIB_SH="$REPO_DIR/bin/lib.sh"
+[ -f "$LIB_SH" ] || LIB_SH="$REPO_DIR/lib.sh"
 # shellcheck source=bin/lib.sh
-source "$REPO_DIR/bin/lib.sh"
+source "$LIB_SH"
+
+# --no-build: the module and the helper belong to a distribution package, so
+# this script must not delete them - that is what `dnf remove` / `apt remove`
+# is for, and deleting a packaged file behind the package manager's back
+# leaves it convinced the file is still there.
+KEEP_PACKAGED_FILES=false
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --no-build) KEEP_PACKAGED_FILES=true ;;
+    -h | --help)
+      echo "usage: ${0##*/} [--no-build]"
+      echo "  --no-build  leave the packaged module and helper to the package manager"
+      exit 0
+      ;;
+    *)
+      echo "${0##*/}: unknown option '$1'" >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
 
 # ONE prompt helper, and it defaults to yes. Every question in this script and
 # in install.sh is [Y/n]: an empty answer accepts, so both can be run by
@@ -287,7 +313,11 @@ done
 # auto-unlock away from everyone on the box - a wider blast radius than the
 # TPM handle eviction further down, which does ask. Same disclosure as there:
 # name who else is relying on this before asking. See JOURNAL.md, 2026-09-15.
-if [ -n "$found_module" ] || [ -f "$HELPER_DST" ]; then
+if [ "$KEEP_PACKAGED_FILES" = true ]; then
+  echo
+  echo "The PAM module and helper came from a package - remove it with your"
+  echo "package manager if you want them gone."
+elif [ -n "$found_module" ] || [ -f "$HELPER_DST" ]; then
   echo
   REMOVE_PROMPT="Remove the machine-wide PAM module and helper?"
   if [ -n "$OTHER_SEALED" ]; then

@@ -214,6 +214,12 @@ package_update: true
 packages:
   - tpm2-tools
   - mokutil
+  # install.sh would apt-install these itself; pre-installing keeps this test
+  # off the network mid-run. Its package-manager branch is covered per distro
+  # by test/distro/, so nothing is lost by making it a no-op here.
+  - gcc
+  - libpam0g-dev
+  - make
 EOF
 }
 
@@ -684,6 +690,126 @@ if [ "$B1_OK" -eq 1 ]; then
       check "tpm-keyring-unseal.sh survives a real reboot (fresh primary, same sealed blob)" \
         "$GOT_SECRET2" "$SECRET" "$WORK/unseal2.err"
     fi
+    # === install.sh / uninstall.sh, end to end =========================
+    #
+    # The gap this closes: until now nothing in this repo ever *ran* the
+    # installer. The distro tests mirror its package/detection logic, the
+    # runtime test exercises the compiled module, and the checks above cover
+    # seal/unseal - but the script that wires a login-critical file was only
+    # ever read, never executed. Everything it needs is already here: a real
+    # TPM, Secure Boot on, and a machine that can be thrown away.
+    echo
+    echo "-- install.sh end to end (real TPM, fixture PAM stack) --"
+    vm_scp "$B2_SSHPORT" "$REPO_DIR/install.sh" "$REPO_DIR/uninstall.sh" \
+      "$REPO_DIR/Makefile" "ubuntu@127.0.0.1:~/tpm-keyring-unlock/"
+    vm_scp "$B2_SSHPORT" "$REPO_DIR/test/fixtures/pam.d/shared/gdm-password" \
+      "ubuntu@127.0.0.1:~/gdm-password.fixture"
+
+    # A stack to wire into: a server cloud image has no gdm. This fixture is
+    # the shape Ubuntu actually ships (@include common-auth, then an
+    # auth-phase pam_gnome_keyring.so), and both @includes resolve against
+    # the VM's own real common-* files.
+    vm_ssh "$B2_SSHPORT" 'sudo cp ~/gdm-password.fixture /etc/pam.d/gdm-password \
+      && sudo cp /etc/pam.d/gdm-password /tmp/gdm-password.orig'
+
+    # Start from no enrollment, so the seal step is the fresh-seal path and
+    # the input below lines up with the prompts every time: one Enter for the
+    # plan, then the password twice. With a leftover enrollment seal.sh would
+    # ask to overwrite first and the password would land on the wrong prompt.
+    vm_ssh "$B2_SSHPORT" 'rm -rf ~/.local/share/tpm-keyring-unlock'
+
+    INSTALL_SECRET="vm-install-secret-$(date +%s)"
+    GUEST_PAMDIR="$(vm_ssh "$B2_SSHPORT" \
+      'source ~/tpm-keyring-unlock/bin/lib.sh; find_pam_module_dir' 2>/dev/null)"
+
+    # Enter accepts every prompt by design (JOURNAL.md, 2026-09-16), which is
+    # exactly what makes the installer drivable from a pty here.
+    printf '\n%s\n%s\n' "$INSTALL_SECRET" "$INSTALL_SECRET" \
+      | vm_ssh_tty "$B2_SSHPORT" 'cd ~/tpm-keyring-unlock && ./install.sh' \
+        >"$WORK/install.out" 2>&1
+    if [ $? -eq 0 ]; then got=installed; else got=failed; fi
+    check "install.sh completes a full run" "$got" "installed" "$WORK/install.out"
+
+    check "install.sh installed the PAM module" \
+      "$(vm_ssh "$B2_SSHPORT" "test -f $GUEST_PAMDIR/pam_tpm_keyring_authtok.so && echo present || echo missing")" \
+      "present" "$WORK/install.out"
+    check "install.sh installed the helper 0700 root:root" \
+      "$(vm_ssh "$B2_SSHPORT" 'stat -Lc "%U %G %a" /usr/local/sbin/tpm-keyring-unseal 2>/dev/null')" \
+      "root root 700" "$WORK/install.out"
+
+    # The whole point of the edit: our line immediately above the keyring
+    # line, not merely somewhere in the file.
+    check "the module line sits directly above pam_gnome_keyring.so" \
+      "$(vm_ssh "$B2_SSHPORT" 'awk "/pam_tpm_keyring_authtok\.so/{f=NR} /pam_gnome_keyring\.so/{if (f && NR==f+1) print \"adjacent\"}" /etc/pam.d/gdm-password')" \
+      "adjacent" "$WORK/install.out"
+
+    # Login-critical file: the backup has to be the pre-edit content, byte
+    # for byte, or the documented undo is a lie.
+    check "the backup holds the original file byte for byte" \
+      "$(vm_ssh "$B2_SSHPORT" 'b=$(ls /etc/pam.d/gdm-password.bak-* 2>/dev/null | head -1); [ -n "$b" ] && cmp -s "$b" /tmp/gdm-password.orig && echo identical || echo differs')" \
+      "identical" "$WORK/install.out"
+
+    check "the secret install.sh sealed unseals through the installed helper" \
+      "$(vm_ssh "$B2_SSHPORT" 'sudo /usr/local/sbin/tpm-keyring-unseal ubuntu' 2>"$WORK/install-unseal.err")" \
+      "$INSTALL_SECRET" "$WORK/install-unseal.err"
+
+    echo
+    echo "-- uninstall.sh end to end --"
+    # Every prompt defaults to yes here too, so a stream of Enters accepts all
+    # of them; extra ones are discarded when the script exits.
+    printf '\n\n\n\n\n\n\n\n\n\n\n\n' \
+      | vm_ssh_tty "$B2_SSHPORT" 'cd ~/tpm-keyring-unlock && ./uninstall.sh' \
+        >"$WORK/uninstall.out" 2>&1
+    if [ $? -eq 0 ]; then got=uninstalled; else got=failed; fi
+    check "uninstall.sh completes a full run" "$got" "uninstalled" "$WORK/uninstall.out"
+
+    check "uninstall.sh restored the PAM stack byte for byte" \
+      "$(vm_ssh "$B2_SSHPORT" 'cmp -s /etc/pam.d/gdm-password /tmp/gdm-password.orig && echo identical || echo differs')" \
+      "identical" "$WORK/uninstall.out"
+    check "uninstall.sh removed the module and the helper" \
+      "$(vm_ssh "$B2_SSHPORT" "test ! -f $GUEST_PAMDIR/pam_tpm_keyring_authtok.so && test ! -e /usr/local/sbin/tpm-keyring-unseal && echo gone || echo left")" \
+      "gone" "$WORK/uninstall.out"
+    check "uninstall.sh deleted the sealed secret" \
+      "$(vm_ssh "$B2_SSHPORT" 'test ! -e ~/.local/share/tpm-keyring-unlock/seal.priv && echo gone || echo left')" \
+      "gone" "$WORK/uninstall.out"
+
+    echo
+    echo "-- the packaged path: make install + tpm-keyring-unlock-configure --"
+    # The same machine, now driven the way a distribution package drives it:
+    # files placed by `make install`, then a configure step that must not
+    # rebuild or reinstall anything it was given.
+    vm_ssh "$B2_SSHPORT" "cd ~/tpm-keyring-unlock && sudo make install PREFIX=/usr PAMDIR=$GUEST_PAMDIR" \
+      >"$WORK/make-install.out" 2>&1
+    if [ $? -eq 0 ]; then got=installed; else got=failed; fi
+    check "make install places the files" "$got" "installed" "$WORK/make-install.out"
+    check "the packaged helper is 0700 root:root" \
+      "$(vm_ssh "$B2_SSHPORT" 'stat -Lc "%U %G %a" /usr/libexec/tpm-keyring-unlock/tpm-keyring-unseal 2>/dev/null')" \
+      "root root 700" "$WORK/make-install.out"
+
+    PKG_SECRET="vm-packaged-secret-$(date +%s)"
+    printf '\n%s\n%s\n' "$PKG_SECRET" "$PKG_SECRET" \
+      | vm_ssh_tty "$B2_SSHPORT" 'tpm-keyring-unlock-configure' \
+        >"$WORK/configure.out" 2>&1
+    if [ $? -eq 0 ]; then got=configured; else got=failed; fi
+    check "tpm-keyring-unlock-configure completes without rebuilding" "$got" "configured" "$WORK/configure.out"
+    # --no-build means it must not have run the compiler at all.
+    check "the configure step did not compile anything" \
+      "$(grep -c -- '-- Build + install --' "$WORK/configure.out")" "0" "$WORK/configure.out"
+    check "the packaged module unseals through the packaged helper path" \
+      "$(vm_ssh "$B2_SSHPORT" 'sudo /usr/libexec/tpm-keyring-unlock/tpm-keyring-unseal ubuntu' 2>"$WORK/pkg-unseal.err")" \
+      "$PKG_SECRET" "$WORK/pkg-unseal.err"
+
+    printf '\n\n\n\n\n\n\n\n\n\n\n\n' \
+      | vm_ssh_tty "$B2_SSHPORT" 'tpm-keyring-unlock-deconfigure' \
+        >"$WORK/deconfigure.out" 2>&1
+    check "tpm-keyring-unlock-deconfigure restores the PAM stack" \
+      "$(vm_ssh "$B2_SSHPORT" 'cmp -s /etc/pam.d/gdm-password /tmp/gdm-password.orig && echo identical || echo differs')" \
+      "identical" "$WORK/deconfigure.out"
+    # It must leave what the package owns alone - that is the package
+    # manager's job, and deleting behind its back leaves it out of step.
+    check "deconfigure left the packaged module and helper in place" \
+      "$(vm_ssh "$B2_SSHPORT" "test -f $GUEST_PAMDIR/pam_tpm_keyring_authtok.so && test -e /usr/libexec/tpm-keyring-unlock/tpm-keyring-unseal && echo kept || echo removed")" \
+      "kept" "$WORK/deconfigure.out"
   else
     check "VM B reachable over SSH (boot 2, post-reboot)" "unreachable" "reachable"
   fi

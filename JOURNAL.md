@@ -5180,3 +5180,101 @@ steps - plus per-step progress and failure diagnostics. Going further means
 not telling the user what the script touches, and the plan is the one feature
 README promises by name ("the exact PAM diffs it would apply"). That trade is
 the owner's to make, not something to take quietly while chasing a number.
+
+## Making the tool packageable without giving up the hand-rolled install (2026-09-16, 1.4.0)
+
+Goal: get into OBS (openSUSE, Fedora, Debian, Ubuntu from one place) and the
+AUR, while `git clone && ./install.sh` keeps working exactly as it does today.
+Both had to stay, so nothing here removes a path - it adds a second one.
+
+**Version 1.4.0, not 1.3.2 or 2.0.0.** New capability (a build/install
+contract, two new commands, a new flag), no behaviour change for anyone
+already installed: same file locations on the hand-rolled path, no migration,
+no removed options. A patch release would have been wrong for a feature, and a
+major release would have claimed a break that does not exist.
+
+**What a distribution package is not allowed to do**, and why the split falls
+where it does:
+
+- Maintainer scripts must not prompt, and sealing is *defined* by prompting -
+  the keyring password is typed by its owner on a terminal and goes nowhere
+  else. debconf is not an answer; it stores what it collects.
+- `/etc/pam.d/gdm-*` belong to gdm. A package editing another package's
+  conffiles in a scriptlet is a policy violation everywhere. An admin running
+  a command afterwards is not.
+
+So: the package installs files, and `tpm-keyring-unlock-configure` (which is
+`install.sh --no-build`) does everything else. That is the same two-step the
+tool already had - clone, then run the installer - just with the first step
+done by the package manager.
+
+**Changes, and the reasoning behind the awkward ones:**
+
+- `Makefile` grew `install`/`uninstall` with `DESTDIR`, `PREFIX`, `BINDIR`,
+  `LIBEXECDIR`, `PAMDIR`, `HELPER_PATH`. `PAMDIR`'s fallback shells out to
+  `bin/lib.sh`'s own `find_pam_module_dir` rather than repeating the candidate
+  list, which is the rule CONTRIBUTING.md already states for that file.
+- `HELPER_PATH` is compiled in (`-DHELPER_PATH`), so build and install must be
+  handed the same value or the module looks for a helper that is not there.
+  Both recipes pass them together for that reason.
+- The helper keeps `0700 root:root` under packaging too. `dh_fixperms` would
+  quietly relax it to 0755, so `debian.rules` excludes it by name and the spec
+  uses `%attr`. A world-readable unseal helper is exactly the kind of quiet
+  loosening CLAUDE.md is about.
+- `install.sh`, `uninstall.sh` and `bin/seal.sh` now resolve their own
+  location with `readlink -f`. An installed copy is reached through a symlink
+  in `$PATH`, and `dirname` of the *link* would look for `lib.sh` in
+  `/usr/bin`. They also accept two layouts: `bin/lib.sh` in a checkout,
+  `lib.sh` flat beside the script when installed.
+- `uninstall.sh --no-build` refuses to delete the module and the helper: those
+  belong to the package manager, and deleting a packaged file behind its back
+  leaves it believing the file is still there.
+- `install.sh --no-build` *verifies* the module and helper exist instead of
+  building them. Wiring a PAM stack to a module that is not on disk would log
+  a failure on every login for a file that is hard to fix without a working
+  shell.
+
+**Verified, not assumed:** `make install DESTDIR=...` into a staging tree gives
+the expected modes (helper `-rwx------`), the generated wrapper runs
+`configure.sh --no-build`, and `tpm-keyring-seal` invoked through its symlink
+finds `lib.sh` and reaches its terminal check - which is the thing `readlink
+-f` was added for.
+
+**Four things only a real package build could have found.** The recipes were
+not written and filed; they were built in containers (Fedora 42 with
+`rpmbuild`, Debian 13 with `dpkg-buildpackage` + `lintian`), which turned up:
+
+1. **The Makefile had no default target.** The first rule was `test`, so
+   rpm's `%make_build` and `dh_auto_build` ran the *test suite* and the module
+   got compiled later, during `%install`, with the Makefile's own flags
+   instead of the distribution's. Fixed with `all: build` as the first rule,
+   and that rule must stay first.
+2. **`find-debuginfo` only looks at files with an execute bit.** The module
+   was installed 0644, so rpm extracted debug info from "0 files", produced an
+   empty `debugsource` package and failed the build outright -
+   `error: Empty %files file ... debugsourcefiles.list`. Fedora and openSUSE
+   ship PAM modules 0755; `make install` now does the same, and Debian's
+   `dh_fixperms` puts it back to 0644 there. The bit is meaningless for a
+   `dlopen`ed object, so nothing is loosened by it.
+3. **`/usr/bin/tpm-keyring-seal` was a symlink into `%{_libexecdir}`**, which
+   rpm flags (`absolute symlink`). All three commands are now generated
+   wrappers, which also avoids hard-coding how `BINDIR` and `LIBEXECDIR` sit
+   relative to each other.
+4. **`Depends: bash, coreutils` is a lintian *error*** (`depends-on-essential-
+   package-without-using-version`) - both are Essential, so an unversioned
+   dependency on them is wrong. Dropped from `debian.control`; the rpm side
+   keeps them, where they are ordinary packages.
+
+The 0700 helper survives both toolchains, which was the thing worth checking:
+`dh_fixperms` would have relaxed it to 0755, so `debian.rules` excludes it by
+name, and the spec sets `%attr(0700,root,root)`. Verified in the built
+artifacts, not in the recipe: `-rwx------ root/root
+./usr/libexec/tpm-keyring-unlock/tpm-keyring-unseal` in the .deb, same in the
+.rpm. The two lintian tags that flags are recorded as deliberate in
+`debian.lintian-overrides` rather than silenced by changing the mode.
+
+**Deliberately not done yet:** no man pages, so `lintian` still prints three
+`no-manual-page` warnings. They are warnings, not errors, and they matter for
+Debian proper rather than for OBS or the AUR - worth adding before any attempt
+at official inclusion. OBS's Arch support is weak enough that Arch goes
+through the AUR instead of pretending one service covers everything.

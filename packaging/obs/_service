@@ -1,0 +1,20 @@
+<!--
+  OBS pulls the sources itself: bump `revision` to the new tag and every
+  target distribution rebuilds. Nothing is uploaded by hand.
+-->
+<services>
+  <service name="obs_scm">
+    <param name="scm">git</param>
+    <param name="url">https://github.com/dmitriitimoshenko/tpm-keyring-unlock.git</param>
+    <param name="revision">v1.4.0</param>
+    <param name="versionformat">@PARENT_TAG@</param>
+    <param name="versionrewrite-pattern">v(.*)</param>
+    <param name="versionrewrite-replacement">\1</param>
+  </service>
+  <service name="tar" mode="buildtime"/>
+  <service name="recompress" mode="buildtime">
+    <param name="file">*.tar</param>
+    <param name="compression">gz</param>
+  </service>
+  <service name="set_version" mode="buildtime"/>
+</services>

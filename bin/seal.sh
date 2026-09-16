@@ -8,8 +8,10 @@ set -euo pipefail
 DATA_DIR="$HOME/.local/share/tpm-keyring-unlock"
 PCR_BANK="sha256:7"
 
+# readlink -f: a packaged copy is reached through a symlink in $PATH, and
+# dirname of the link would look for lib.sh in /usr/bin.
 # shellcheck source=lib.sh
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
+source "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/lib.sh"
 
 command -v tpm2_createprimary >/dev/null || {
   echo "tpm2-tools not found. Install it: sudo apt install tpm2-tools" >&2

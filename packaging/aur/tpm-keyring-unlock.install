@@ -1,0 +1,18 @@
+# Prints only. A package must not seal secrets or edit /etc/pam.d by itself:
+# sealing needs the user's keyring password typed on a terminal, and the PAM
+# edits need consent for a login-critical file.
+post_install() {
+  cat <<'EOF'
+==> Files are installed. Nothing is configured yet.
+==> Run, as your own user:
+==>     tpm-keyring-unlock-configure
+==> It seals your keyring password into the TPM and wires up PAM, asking
+==> before each change. Undo with tpm-keyring-unlock-deconfigure.
+EOF
+}
+
+post_upgrade() {
+  echo "==> If PAM stacks were already wired, nothing needs re-running."
+  echo "==> Re-seal only after a Secure Boot or keyring password change:"
+  echo "==>     tpm-keyring-seal"
+}
