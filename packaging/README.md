@@ -64,9 +64,23 @@ Files in `obs/`. One OBS package directory holds both recipes - OBS picks the
    `https://software.opensuse.org/download/package?package=tpm-keyring-unlock&project=home:<login>`.
    OBS signs the repository itself.
 
-New release: change `revision` in `_service` to the new tag, bump `Version:`
-in the spec and add a `debian.changelog` entry. OBS pulls the tarball from git
-on its own - nothing is uploaded by hand.
+New release: change the tag in `_service`'s `path`, bump `Version:` in the
+spec and add a `debian.changelog` entry. OBS fetches the tarball itself -
+nothing is uploaded by hand.
+
+**Why `download_url` and not `obs_scm`.** The first attempt used `obs_scm`
+with `tar`, `recompress` and `set_version` in `mode="buildtime"`, which is the
+arrangement the OBS documentation leads with. Every rpm target built; every
+deb target came back `unresolvable`:
+
+    nothing provides obs-service-tar, obs-service-recompress, obs-service-set-version
+
+Those services run *inside the build root* in buildtime mode, and the Debian
+and Ubuntu base projects do not carry the packages that provide them (Fedora
+tripped over a `wget` ambiguity pulling `obs-service-download_files` for the
+same reason). Fetching the release tarball server-side at commit time sidesteps
+all of it, and has the side benefit that every target consumes the exact file
+GitHub publishes for the tag - the same artifact the AUR checksum pins.
 
 ## AUR (Arch)
 

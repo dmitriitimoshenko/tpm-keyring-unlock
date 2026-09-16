@@ -5383,3 +5383,53 @@ different PCR7 world on CI, so a check that spans the reboot needs either that
 exemption or its own enrollment.
 
 Local result after the change: 41 checks, 0 failures.
+
+## Published to OBS: seven targets, and the one thing that broke (2026-09-16, evening)
+
+`home:dmitrii.timoshenko` on build.opensuse.org now builds and publishes
+`tpm-keyring-unlock` 1.4.0 for openSUSE Tumbleweed, openSUSE Leap 16.0,
+Fedora 43, Fedora 42, Debian 13, Ubuntu 26.04 and Ubuntu 24.04. All x86_64.
+
+**aarch64 deliberately left out of the first publish.** `openSUSE:Factory`'s
+`snapshot` repository lists `armv6l i586 ppc ppc64 ppc64le x86_64` - no
+aarch64, which lives in separate ARM base projects. Enabling it blindly would
+have put half the matrix in the red on day one. It is a follow-up, not a
+skipped step.
+
+**What broke, and why it is worth writing down.** The first `_service` used
+`obs_scm` plus `tar`, `recompress` and `set_version` in `mode="buildtime"` -
+the arrangement OBS documentation leads with. Result:
+
+    Debian 13, Ubuntu 24.04/26.04: nothing provides obs-service-tar,
+      obs-service-recompress, obs-service-set-version
+    Fedora 42/43: have choice for wget needed by obs-service-download_files
+    openSUSE: building fine
+
+Buildtime services run *inside the build root*, so they need those
+`obs-service-*` packages to exist in the target distribution. openSUSE has
+them; Debian and Ubuntu do not, and Fedora hit a dependency ambiguity reaching
+for the same family. Replaced with a single server-side `download_url` that
+fetches the tarball GitHub publishes for the tag. Every target then consumes
+one identical file - and it is the same artifact the AUR checksum pins, so the
+two channels cannot drift.
+
+**Verified as a user, not as a maintainer.** Both published repositories were
+added in throwaway containers and installed from:
+
+    Debian 13:  tpm-keyring-unlock 1.4.0-1 amd64, helper root root 700,
+                module in /usr/lib/x86_64-linux-gnu/security
+    Fedora 42:  tpm-keyring-unlock-1.4.0-2.1.x86_64, tpm2-tools pulled in as a
+                dependency, module in /usr/lib64/security
+
+`tpm-keyring-unlock-configure` runs in both. `tpm-keyring-seal` correctly
+refuses in a container with "No /dev/tpmrm0 found", which is the right answer
+there.
+
+**AUR is blocked from outside.** New account registration is paused while Arch
+deals with a wave of automated account creation (HTTP 503 on the signup page;
+context is the 2026-06-12 "Active AUR malicious packages incident" news item).
+There is no manual queue and no announced date. The `PKGBUILD` is finished,
+checksum pinned to v1.4.0 and build-tested against the real tag, so publishing
+is a five-minute job whenever registration reopens. Until then README documents
+`makepkg -si` straight from `packaging/aur/`, which needs no AUR at all - AUR
+distributes PKGBUILDs, and ours is in the repository.

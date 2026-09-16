@@ -1,20 +1,17 @@
 <!--
-  OBS pulls the sources itself: bump `revision` to the new tag and every
-  target distribution rebuilds. Nothing is uploaded by hand.
+  Runs on the OBS server at commit time, not inside the build root: the
+  buildtime variants need obs-service-* packages that Debian and Ubuntu base
+  projects do not carry, which left every deb target "unresolvable".
+
+  This fetches exactly the tarball GitHub publishes for the tag - the same
+  artifact the AUR checksum pins - so all targets consume one identical file.
+  New release: change the tag in <path> and in the spec/changelog.
 -->
 <services>
-  <service name="obs_scm">
-    <param name="scm">git</param>
-    <param name="url">https://github.com/dmitriitimoshenko/tpm-keyring-unlock.git</param>
-    <param name="revision">v1.4.0</param>
-    <param name="versionformat">@PARENT_TAG@</param>
-    <param name="versionrewrite-pattern">v(.*)</param>
-    <param name="versionrewrite-replacement">\1</param>
+  <service name="download_url">
+    <param name="protocol">https</param>
+    <param name="host">github.com</param>
+    <param name="path">/dmitriitimoshenko/tpm-keyring-unlock/archive/refs/tags/v1.4.0.tar.gz</param>
+    <param name="filename">tpm-keyring-unlock-1.4.0.tar.gz</param>
   </service>
-  <service name="tar" mode="buildtime"/>
-  <service name="recompress" mode="buildtime">
-    <param name="file">*.tar</param>
-    <param name="compression">gz</param>
-  </service>
-  <service name="set_version" mode="buildtime"/>
 </services>

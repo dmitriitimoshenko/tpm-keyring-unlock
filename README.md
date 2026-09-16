@@ -52,18 +52,53 @@ after a logout.
 
 ### From a distribution package
 
-Packaging recipes live in `packaging/` (OBS for openSUSE, Fedora, Debian and
-Ubuntu; AUR for Arch). A package installs the files only - sealing needs your
-password typed on a terminal, and the PAM edits need your consent, so neither
-happens behind a package manager's back:
+Prebuilt `x86_64` packages for openSUSE, Fedora, Debian and Ubuntu are
+published from the Open Build Service. A package installs the files only -
+sealing needs your password typed on a terminal and the PAM edits need your
+consent, so neither happens behind a package manager's back.
+
+**openSUSE** (Tumbleweed, Leap 16.0 - swap the repository name):
+
+```bash
+sudo zypper addrepo https://download.opensuse.org/repositories/home:/dmitrii.timoshenko/openSUSE_Tumbleweed/home:dmitrii.timoshenko.repo
+sudo zypper refresh && sudo zypper install tpm-keyring-unlock
+```
+
+**Fedora** (42, 43 - swap the repository name):
+
+```bash
+sudo dnf config-manager addrepo --from-repofile=https://download.opensuse.org/repositories/home:/dmitrii.timoshenko/Fedora_42/home:dmitrii.timoshenko.repo
+sudo dnf install tpm-keyring-unlock
+```
+
+**Debian 13, Ubuntu 24.04 / 26.04** (swap `Debian_13` for `xUbuntu_24.04` or
+`xUbuntu_26.04`):
+
+```bash
+B=https://download.opensuse.org/repositories/home:/dmitrii.timoshenko/Debian_13
+curl -fsSL "$B/Release.key" | gpg --dearmor | sudo tee /usr/share/keyrings/tpm-keyring-unlock.gpg >/dev/null
+echo "deb [signed-by=/usr/share/keyrings/tpm-keyring-unlock.gpg] $B/ /" | sudo tee /etc/apt/sources.list.d/tpm-keyring-unlock.list
+sudo apt update && sudo apt install tpm-keyring-unlock
+```
+
+**Arch**: AUR registration is closed for new accounts at the moment, so there
+is no AUR package yet. The recipe works today without it:
+
+```bash
+git clone https://github.com/dmitriitimoshenko/tpm-keyring-unlock.git
+cd tpm-keyring-unlock/packaging/aur && makepkg -si
+```
+
+Then, on any of them:
 
 ```bash
 tpm-keyring-unlock-configure     # seal + wire up PAM, asks before each change
 tpm-keyring-seal                 # re-seal later, on its own
 ```
 
-Use one method or the other on a given machine, not both: they write the same
-PAM module filename, so whichever ran last wins. See `packaging/README.md`.
+Use one method or the other on a given machine, not both: `./install.sh` and a
+package write the same PAM module filename, so whichever ran last wins. See
+`packaging/README.md`.
 
 ## What this protects, and what it doesn't
 
