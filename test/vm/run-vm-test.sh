@@ -287,8 +287,30 @@ vm_ssh() { local port="$1"; shift; ssh "${SSH_OPTS[@]}" -i "$WORK/id_test" -p "$
 # throwaway test secret. Note the pty merges the remote's stderr into its
 # stdout, so callers capture one combined stream, and the line discipline
 # echoes what we write back into it.
-vm_ssh_tty() { local port="$1"; shift; ssh "${SSH_OPTS[@]}" -tt -i "$WORK/id_test" -p "$port" ubuntu@127.0.0.1 "$@"; }
+# Wrapped in `timeout` because everything driven through this function is fed
+# a fixed script of keystrokes: if the remote ever asks one more question than
+# expected, the input runs out and the read blocks forever. That is not
+# hypothetical - it stalled a CI run for an hour (JOURNAL.md, 2026-09-16). A
+# timeout turns that into a failed check with the captured transcript.
+VM_TTY_TIMEOUT="${VM_TTY_TIMEOUT:-420}"
+vm_ssh_tty() { local port="$1"; shift; timeout "$VM_TTY_TIMEOUT" ssh "${SSH_OPTS[@]}" -tt -i "$WORK/id_test" -p "$port" ubuntu@127.0.0.1 "$@"; }
 vm_scp() { local port="$1"; shift; scp "${SSH_OPTS[@]}" -i "$WORK/id_test" -P "$port" "$@"; }
+
+# Runs an interactive remote command, answering each prompt only once it has
+# actually appeared. vm_ssh_tty + a pre-filled pipe cannot do this: sudo wipes
+# the terminal's pending input before it runs, so anything queued ahead of an
+# install step is gone by the time a later prompt wants it. See
+# test/vm/pty-drive.py's docstring for the demonstration, and JOURNAL.md.
+#   vm_drive PORT LOGFILE 'remote command' 'REGEX=ANSWER' ['REGEX=ANSWER'...]
+vm_drive() {
+  local port="$1" logfile="$2" cmd="$3"
+  shift 3
+  local expects=() e
+  for e in "$@"; do expects+=(--expect "$e"); done
+  python3 "$REPO_DIR/test/vm/pty-drive.py" \
+    --timeout "$VM_TTY_TIMEOUT" --log "$logfile" "${expects[@]}" \
+    -- ssh "${SSH_OPTS[@]}" -tt -i "$WORK/id_test" -p "$port" ubuntu@127.0.0.1 "$cmd"
+}
 
 wait_for_ssh() {
   local port="$1" timeout="${2:-240}" waited=0
@@ -712,21 +734,27 @@ if [ "$B1_OK" -eq 1 ]; then
     vm_ssh "$B2_SSHPORT" 'sudo cp ~/gdm-password.fixture /etc/pam.d/gdm-password \
       && sudo cp /etc/pam.d/gdm-password /tmp/gdm-password.orig'
 
-    # Start from no enrollment, so the seal step is the fresh-seal path and
-    # the input below lines up with the prompts every time: one Enter for the
-    # plan, then the password twice. With a leftover enrollment seal.sh would
-    # ask to overwrite first and the password would land on the wrong prompt.
-    vm_ssh "$B2_SSHPORT" 'rm -rf ~/.local/share/tpm-keyring-unlock'
-
-    INSTALL_SECRET="vm-install-secret-$(date +%s)"
     GUEST_PAMDIR="$(vm_ssh "$B2_SSHPORT" \
       'source ~/tpm-keyring-unlock/bin/lib.sh; find_pam_module_dir' 2>/dev/null)"
 
-    # Enter accepts every prompt by design (JOURNAL.md, 2026-09-16), which is
-    # exactly what makes the installer drivable from a pty here.
-    printf '\n%s\n%s\n' "$INSTALL_SECRET" "$INSTALL_SECRET" \
-      | vm_ssh_tty "$B2_SSHPORT" 'cd ~/tpm-keyring-unlock && ./install.sh' \
-        >"$WORK/install.out" 2>&1
+    # The enrollment from the checks above is deliberately left in place, so
+    # install.sh reaches seal.sh's "Overwrite? [Y/n]" and this answers `n`.
+    #
+    # Why not type a password here: a pty accepts everything written to it at
+    # once, and the reads that follow drain that queue in their own time. Feed
+    # a password up front and it is consumed by whatever reads next - which,
+    # across a run that compiles and sudo-installs in between, is not the
+    # prompt it was meant for. The password then never arrives and seal.sh
+    # waits forever; that is exactly how a CI run sat for an hour. Sealing
+    # through a pty is already covered directly, a few checks above, where the
+    # interaction is two reads with nothing in between.
+    #
+    # Enter accepts every prompt by design (JOURNAL.md, 2026-09-16), so the
+    # plan takes an empty line and seal.sh takes an explicit `n`.
+    vm_drive "$B2_SSHPORT" "$WORK/install.out" \
+      'cd ~/tpm-keyring-unlock && ./install.sh' \
+      'Proceed with all of the above\? \[Y/n\] =' \
+      'Overwrite\? \[Y/n\] =n' 
     if [ $? -eq 0 ]; then got=installed; else got=failed; fi
     check "install.sh completes a full run" "$got" "installed" "$WORK/install.out"
 
@@ -749,17 +777,18 @@ if [ "$B1_OK" -eq 1 ]; then
       "$(vm_ssh "$B2_SSHPORT" 'b=$(ls /etc/pam.d/gdm-password.bak-* 2>/dev/null | head -1); [ -n "$b" ] && cmp -s "$b" /tmp/gdm-password.orig && echo identical || echo differs')" \
       "identical" "$WORK/install.out"
 
-    check "the secret install.sh sealed unseals through the installed helper" \
+    check "the sealed secret unseals through the helper install.sh installed" \
       "$(vm_ssh "$B2_SSHPORT" 'sudo /usr/local/sbin/tpm-keyring-unseal ubuntu' 2>"$WORK/install-unseal.err")" \
-      "$INSTALL_SECRET" "$WORK/install-unseal.err"
+      "$SECRET" "$WORK/install-unseal.err"
 
     echo
     echo "-- uninstall.sh end to end --"
-    # Every prompt defaults to yes here too, so a stream of Enters accepts all
-    # of them; extra ones are discarded when the script exits.
-    printf '\n\n\n\n\n\n\n\n\n\n\n\n' \
-      | vm_ssh_tty "$B2_SSHPORT" 'cd ~/tpm-keyring-unlock && ./uninstall.sh' \
-        >"$WORK/uninstall.out" 2>&1
+    # Every prompt here defaults to yes, so one repeating rule - answer Enter
+    # to anything ending in [Y/n] - accepts the whole run, however many
+    # questions this machine's state produces.
+    vm_drive "$B2_SSHPORT" "$WORK/uninstall.out" \
+      'cd ~/tpm-keyring-unlock && ./uninstall.sh' \
+      '*\[Y/n\] ='  
     if [ $? -eq 0 ]; then got=uninstalled; else got=failed; fi
     check "uninstall.sh completes a full run" "$got" "uninstalled" "$WORK/uninstall.out"
 
@@ -782,14 +811,32 @@ if [ "$B1_OK" -eq 1 ]; then
       >"$WORK/make-install.out" 2>&1
     if [ $? -eq 0 ]; then got=installed; else got=failed; fi
     check "make install places the files" "$got" "installed" "$WORK/make-install.out"
+    check "make install placed the PAM module" \
+      "$(vm_ssh "$B2_SSHPORT" "test -f $GUEST_PAMDIR/pam_tpm_keyring_authtok.so && echo present || echo missing")" \
+      "present" "$WORK/make-install.out"
     check "the packaged helper is 0700 root:root" \
       "$(vm_ssh "$B2_SSHPORT" 'stat -Lc "%U %G %a" /usr/libexec/tpm-keyring-unlock/tpm-keyring-unseal 2>/dev/null')" \
       "root root 700" "$WORK/make-install.out"
 
+    # uninstall.sh above accepted every prompt, which included removing this
+    # user from the 'tss' group - so nothing here could reach the TPM until it
+    # is put back. A real packaged install never hits this (the configure step
+    # offers to add the group itself, and did so here), it is purely an
+    # artefact of running the two paths back to back on one machine.
+    vm_ssh "$B2_SSHPORT" 'sudo usermod -aG tss ubuntu'
+
+    # uninstall.sh also deleted the enrollment - so seal first. Its own short
+    # pty session, two reads and nothing in between.
     PKG_SECRET="vm-packaged-secret-$(date +%s)"
-    printf '\n%s\n%s\n' "$PKG_SECRET" "$PKG_SECRET" \
-      | vm_ssh_tty "$B2_SSHPORT" 'tpm-keyring-unlock-configure' \
-        >"$WORK/configure.out" 2>&1
+    vm_drive "$B2_SSHPORT" "$WORK/pkg-seal.out" 'tpm-keyring-seal' \
+      "Password to seal[^:]*: =$PKG_SECRET" \
+      "Confirm: =$PKG_SECRET" 
+    if [ $? -eq 0 ]; then got=sealed; else got=failed; fi
+    check "tpm-keyring-seal (the packaged command) seals" "$got" "sealed" "$WORK/pkg-seal.out"
+
+    vm_drive "$B2_SSHPORT" "$WORK/configure.out" 'tpm-keyring-unlock-configure' \
+      'Proceed with all of the above\? \[Y/n\] =' \
+      'Overwrite\? \[Y/n\] =n' 
     if [ $? -eq 0 ]; then got=configured; else got=failed; fi
     check "tpm-keyring-unlock-configure completes without rebuilding" "$got" "configured" "$WORK/configure.out"
     # --no-build means it must not have run the compiler at all.
@@ -799,9 +846,8 @@ if [ "$B1_OK" -eq 1 ]; then
       "$(vm_ssh "$B2_SSHPORT" 'sudo /usr/libexec/tpm-keyring-unlock/tpm-keyring-unseal ubuntu' 2>"$WORK/pkg-unseal.err")" \
       "$PKG_SECRET" "$WORK/pkg-unseal.err"
 
-    printf '\n\n\n\n\n\n\n\n\n\n\n\n' \
-      | vm_ssh_tty "$B2_SSHPORT" 'tpm-keyring-unlock-deconfigure' \
-        >"$WORK/deconfigure.out" 2>&1
+    vm_drive "$B2_SSHPORT" "$WORK/deconfigure.out" 'tpm-keyring-unlock-deconfigure' \
+      '*\[Y/n\] ='  
     check "tpm-keyring-unlock-deconfigure restores the PAM stack" \
       "$(vm_ssh "$B2_SSHPORT" 'cmp -s /etc/pam.d/gdm-password /tmp/gdm-password.orig && echo identical || echo differs')" \
       "identical" "$WORK/deconfigure.out"

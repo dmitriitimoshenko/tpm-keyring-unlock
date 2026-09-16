@@ -486,11 +486,13 @@ else
   # Checked, not assumed: wiring a PAM stack to a module that is not there
   # would leave every login logging "module not found" on a file that cannot
   # be fixed without a working shell.
-  if [ ! -f "$PAM_MODULE_DIR/pam_tpm_keyring_authtok.so" ] || [ ! -e "$HELPER_DST" ]; then
-    echo "--no-build was given, but the module or the helper is missing:" >&2
-    echo "  $PAM_MODULE_DIR/pam_tpm_keyring_authtok.so" >&2
-    echo "  $HELPER_DST" >&2
-    echo "Install the package properly, or run this script without --no-build." >&2
+  missing_parts=()
+  [ -f "$PAM_MODULE_DIR/pam_tpm_keyring_authtok.so" ] \
+    || missing_parts+=("$PAM_MODULE_DIR/pam_tpm_keyring_authtok.so")
+  [ -e "$HELPER_DST" ] || missing_parts+=("$HELPER_DST")
+  if [ "${#missing_parts[@]}" -gt 0 ]; then
+    echo "--no-build was given, but this is missing: ${missing_parts[*]}" >&2
+    echo "Install the package properly, or run without --no-build." >&2
     exit 1
   fi
 fi

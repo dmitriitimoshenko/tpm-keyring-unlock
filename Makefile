@@ -106,9 +106,15 @@ install: build
 	# step must not rebuild or reinstall them).
 	printf '#!/bin/sh\nexec %s/seal.sh "$$@"\n' '$(LIBEXECDIR)' \
 		>$(DESTDIR)$(BINDIR)/tpm-keyring-seal
-	printf '#!/bin/sh\nexec %s/configure.sh --no-build "$$@"\n' '$(LIBEXECDIR)' \
+	# TPM_KEYRING_HELPER, or the scripts fall back to the hand-rolled
+	# /usr/local/sbin path and refuse to run because the helper "is missing" -
+	# it is simply somewhere else in a packaged install. Caught by the VM
+	# test's packaged-path scenario; see JOURNAL.md, 2026-09-16.
+	printf '#!/bin/sh\nexec env TPM_KEYRING_HELPER=%s %s/configure.sh --no-build "$$@"\n' \
+		'$(HELPER_PATH)' '$(LIBEXECDIR)' \
 		>$(DESTDIR)$(BINDIR)/tpm-keyring-unlock-configure
-	printf '#!/bin/sh\nexec %s/deconfigure.sh --no-build "$$@"\n' '$(LIBEXECDIR)' \
+	printf '#!/bin/sh\nexec env TPM_KEYRING_HELPER=%s %s/deconfigure.sh --no-build "$$@"\n' \
+		'$(HELPER_PATH)' '$(LIBEXECDIR)' \
 		>$(DESTDIR)$(BINDIR)/tpm-keyring-unlock-deconfigure
 	chmod 0755 $(DESTDIR)$(BINDIR)/tpm-keyring-seal \
 		$(DESTDIR)$(BINDIR)/tpm-keyring-unlock-configure \
