@@ -73,12 +73,17 @@ actually runs there, never skips.
   compiled PAM module's actual fork/exec/pipe/timeout/`PAM_AUTHTOK` logic,
   using `pamtester` + a fake helper script standing in for
   `/usr/local/sbin/tpm-keyring-unseal` (swapped in at compile time via
-  `-DHELPER_PATH`). Covers three real code paths: helper succeeds (password
-  lands in `PAM_AUTHTOK`, captured via `pam_exec.so expose_authtok`), helper
-  exits with no output (`PAM_AUTHTOK` stays empty), and helper hangs past
-  the timeout (`-DHELPER_TIMEOUT_SECS=2` for the test, instead of waiting
-  out the real 25s - asserts the process actually gets killed and the call
-  returns promptly instead of hanging).
+  `-DHELPER_PATH`). Covers four real code paths: helper succeeds (password
+  lands in `PAM_AUTHTOK`, read back by `pam_spy_authtok.so` with the same
+  `pam_get_item()` call `pam_gnome_keyring.so` makes), helper exits with no
+  output (`PAM_AUTHTOK` stays empty), helper hangs past the timeout
+  (`-DHELPER_TIMEOUT_SECS=2` for the test, instead of waiting out the real
+  25s - asserts the process actually gets killed and the call returns
+  promptly instead of hanging), and the host process reaping the helper
+  behind the module's back (`pam_autoreap_children.so` sets `SIGCHLD` to
+  `SIG_IGN` above it in the stack, so `waitpid()` fails with `ECHILD`;
+  asserts output with no confirmable exit status is left unused rather than
+  injected - see JOURNAL.md, 2026-09-16).
   Plus the control flow of the fingerprint attempt stack `install.sh`
   writes, with `pam_flow_stub.so` standing in for `pam_fprintd.so`: that a
   match on any attempt still reaches the keyring lines (a jump that failed

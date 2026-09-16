@@ -628,6 +628,78 @@ else
 fi
 check "a stack with no keyring auth line is not called safe" "$got" "refused"
 
+# --- the predicates have to give the SAME answer every time ---------------
+#
+# Reported as mtriam/tpm-keyring-unlock#1: under `set -o pipefail` (which
+# install.sh sets), a predicate written as `_pam_logical_lines "$f" | grep -q`
+# returns a random verdict. grep -q exits on the first match, the shell
+# function feeding it dies of SIGPIPE, and pipefail promotes that 141 to a
+# failed predicate - so the same file was called safe on one call and unsafe
+# on the next, and install.sh's printed plan stopped matching what it wired.
+#
+# The stack below is padded past the match on purpose. On a short file the
+# race is a coin flip that depends on the machine (the reporter saw 5-10% of
+# runs, this repo's own machine 0/1000), which would make this test pass by
+# luck; with several hundred lines after the match the writer is still going
+# when grep leaves, so the old code fails every single iteration and the test
+# has teeth anywhere it runs.
+STABILITY_DIR="$(mktemp -d)"
+trap 'rm -rf -- "$STABILITY_DIR"' EXIT
+{
+  echo "auth    optional    pam_gnome_keyring.so"
+  for i in $(seq 1 400); do echo "auth    optional    pam_filler_$i.so"; done
+} >"$STABILITY_DIR/padded-stack"
+
+verdicts=""
+for _ in $(seq 1 200); do
+  if pam_auth_insertion_point_is_safe "$STABILITY_DIR/padded-stack" "$STABILITY_DIR"; then
+    verdicts="${verdicts}s"
+  else
+    verdicts="${verdicts}u"
+  fi
+done
+check "pam_auth_insertion_point_is_safe: 200 identical verdicts under pipefail" \
+  "$(printf '%s' "$verdicts" | tr -d 's' | wc -c)" "0"
+
+{
+  echo "auth    [success=1 default=ignore]    pam_fprintd.so"
+  for i in $(seq 1 400); do echo "auth    optional    pam_filler_$i.so"; done
+} >"$STABILITY_DIR/padded-shared"
+
+verdicts=""
+for _ in $(seq 1 200); do
+  if pam_fprintd_in_shared_stack "$STABILITY_DIR/padded-shared"; then
+    verdicts="${verdicts}y"
+  else
+    verdicts="${verdicts}n"
+  fi
+done
+check "pam_fprintd_in_shared_stack: 200 identical verdicts under pipefail" \
+  "$(printf '%s' "$verdicts" | tr -d 'y' | wc -c)" "0"
+
+# This one needs a stack that should come back SANE, not the one above. Its
+# first grep is negated, so a SIGPIPE there reads as "no fprintd line" - the
+# answer it was going to give anyway on a clean file. The damage is in its
+# second grep, the one that has to find a real authenticator: that match is on
+# line 1 here, so the old code left the writer mid-file, took 141, and declared
+# a perfectly good post-fprintd stack insane - which is what install.sh checks
+# before putting the file back.
+{
+  echo "auth    [success=1 default=ignore]    pam_unix.so nullok"
+  for i in $(seq 1 400); do echo "auth    optional    pam_filler_$i.so"; done
+} >"$STABILITY_DIR/padded-clean"
+
+verdicts=""
+for _ in $(seq 1 200); do
+  if pam_shared_stack_is_sane_without_fprintd "$STABILITY_DIR/padded-clean"; then
+    verdicts="${verdicts}y"
+  else
+    verdicts="${verdicts}n"
+  fi
+done
+check "pam_shared_stack_is_sane_without_fprintd: 200 identical verdicts under pipefail" \
+  "$(printf '%s' "$verdicts" | tr -d 'y' | wc -c)" "0"
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "All regex/detection tests passed."

@@ -56,6 +56,14 @@ gcc -Wall -Wextra -fPIC -shared \
 install -o root -g root -m 0644 /tmp/pam_spy_authtok.so \
   "$PAM_MODULE_DIR/pam_spy_authtok.so"
 
+echo "-- building the auto-reap module (SIGCHLD to SIG_IGN, like a login" \
+     "process that doesn't collect its own children) --"
+gcc -Wall -Wextra -fPIC -shared \
+  -o /tmp/pam_autoreap_children.so \
+  "$REPO_DIR/test/fixtures/pam_autoreap_children.c" -lpam
+install -o root -g root -m 0644 /tmp/pam_autoreap_children.so \
+  "$PAM_MODULE_DIR/pam_autoreap_children.so"
+
 echo "-- fake helper: branches on username, mimicking three real outcomes --"
 cat > "$FAKE_HELPER" <<EOF
 #!/bin/sh
@@ -64,13 +72,14 @@ case "\$1" in
   testsuccess) echo "$FAKE_PASSWORD" ;;
   testfail) exit 1 ;;
   testtimeout) sleep 10 ;;
+  testautoreap) echo "$FAKE_PASSWORD" ;;
 esac
 EOF
 chmod 0700 "$FAKE_HELPER"
 chown root:root "$FAKE_HELPER"
 
 echo "-- test users (no real login capability, just for getpwnam() to work) --"
-for u in testsuccess testfail testtimeout; do
+for u in testsuccess testfail testtimeout testautoreap; do
   id "$u" >/dev/null 2>&1 || useradd -M -N -s /bin/false "$u"
 done
 
@@ -80,12 +89,20 @@ auth	optional	pam_spy_authtok.so
 auth	required	pam_permit.so
 EOF
 
+# Same stack, but the process running it reaps its children behind our back.
+cat > /etc/pam.d/tpmtest-autoreap <<EOF
+auth	optional	pam_autoreap_children.so
+auth	optional	pam_tpm_keyring_authtok.so
+auth	optional	pam_spy_authtok.so
+auth	required	pam_permit.so
+EOF
+
 run_case() {
-  local user="$1"
+  local user="$1" service="${2:-tpmtest}"
   rm -f "$CAPTURE_FILE"
   local start end
   start=$(date +%s)
-  pamtester tpmtest "$user" authenticate >/dev/null 2>&1 || true
+  pamtester "$service" "$user" authenticate >/dev/null 2>&1 || true
   end=$(date +%s)
   echo "$((end - start))"
 }
@@ -109,6 +126,19 @@ got_pw="$(cat "$CAPTURE_FILE" 2>/dev/null || echo "<none>")"
 check "PAM_AUTHTOK stays empty when helper times out" "$got_pw" ""
 if [ "$elapsed" -le 5 ]; then got_timing=bounded; else got_timing=unbounded; fi
 check "timeout actually interrupted the hang (took ${elapsed}s, helper sleeps 10s)" "$got_timing" "bounded"
+
+echo
+echo "-- case: the host process auto-reaps children (waitpid gives ECHILD) --"
+# The helper here succeeds and prints the password: what's under test is that
+# the module refuses output it cannot pair with a confirmed exit status. Before
+# this check existed, `status` was left at its initial 0 on a failed waitpid()
+# and 0 decodes as a clean exit, so a helper killed mid-write would have had
+# its partial output injected as the keyring password. Auto-unlock switching
+# itself off on such a host is the intended trade (it is `optional`, so login
+# is unaffected, and the module logs the waitpid() error).
+elapsed=$(run_case testautoreap tpmtest-autoreap)
+got_pw="$(cat "$CAPTURE_FILE" 2>/dev/null || echo "<none>")"
+check "PAM_AUTHTOK stays empty when the child's exit status is unknowable" "$got_pw" ""
 
 echo
 echo

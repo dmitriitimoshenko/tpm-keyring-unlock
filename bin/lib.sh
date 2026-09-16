@@ -155,6 +155,16 @@ PAM_AUTHLESS_INCLUDE_RE='^common-(account|session|session-noninteractive|passwor
 #
 # The trailing backslash is dropped and the next physical line appended as-is,
 # which is what libpam's own parser does.
+# NEVER put this on the left of a pipe feeding `grep -q` (or anything else
+# that exits early): this is a shell function writing one line at a time, so
+# when the reader leaves first the writer dies of SIGPIPE, the pipeline's
+# status becomes 141, and `set -o pipefail` - which install.sh sets - turns
+# that into a failed predicate. The failure is a race against how much the
+# writer got through before the reader matched, so the same file gets
+# different verdicts on different calls, and the printed plan stops matching
+# what gets wired. Feed the reader with `< <(_pam_logical_lines "$f")`
+# instead: the process substitution's exit status is nobody's business but
+# its own. See JOURNAL.md, 2026-09-16, and mtriam/tpm-keyring-unlock#1.
 _pam_logical_lines() {
   local f="$1" line acc=""
   while IFS= read -r line || [ -n "$line" ]; do
@@ -686,7 +696,7 @@ PAM_FPRINTD_PROFILE_MARKER="fprintd-pam-config-disabled"
 pam_fprintd_in_shared_stack() {
   local shared="${1:-$PAM_SHARED_AUTH_STACK}"
   [ -f "$shared" ] || return 1
-  _pam_logical_lines "$shared" | grep -qE "$PAM_FPRINTD_AUTH_RE"
+  grep -qE "$PAM_FPRINTD_AUTH_RE" < <(_pam_logical_lines "$shared")
 }
 
 # Prints the /etc/pam.d/ services that @include $1 and have no pam_fprintd
@@ -707,10 +717,11 @@ pam_fprintd_services_losing_fingerprint() {
     [ -f "$f" ] || continue
     if [ "$f" = "$shared" ]; then continue; fi
     if [[ "$f" =~ $PAM_NON_SERVICE_RE ]]; then continue; fi
-    if ! _pam_logical_lines "$f" | grep -qE "^[[:space:]]*@include[[:space:]]+${base}[[:space:]]*$"; then
+    if ! grep -qE "^[[:space:]]*@include[[:space:]]+${base}[[:space:]]*$" \
+         < <(_pam_logical_lines "$f"); then
       continue
     fi
-    if _pam_logical_lines "$f" | grep -qE "$PAM_FPRINTD_AUTH_RE"; then continue; fi
+    if grep -qE "$PAM_FPRINTD_AUTH_RE" < <(_pam_logical_lines "$f"); then continue; fi
     echo "$f"
   done
   return 0
@@ -746,9 +757,9 @@ pam_auth_update_owns_fprintd() {
 pam_shared_stack_is_sane_without_fprintd() {
   local shared="${1:-$PAM_SHARED_AUTH_STACK}"
   [ -f "$shared" ] || return 1
-  ! _pam_logical_lines "$shared" | grep -qE "$PAM_FPRINTD_AUTH_RE" || return 1
-  _pam_logical_lines "$shared" \
-    | grep -qE '^[[:space:]]*-?auth[[:space:]]+(\[[^]]*\]|[^[:space:]]+)[[:space:]]+pam_(unix|sss|ldap|krb5|winbind|sssd)\.so'
+  ! grep -qE "$PAM_FPRINTD_AUTH_RE" < <(_pam_logical_lines "$shared") || return 1
+  grep -qE '^[[:space:]]*-?auth[[:space:]]+(\[[^]]*\]|[^[:space:]]+)[[:space:]]+pam_(unix|sss|ldap|krb5|winbind|sssd)\.so' \
+    < <(_pam_logical_lines "$shared")
 }
 
 # --- the machine-wide TPM primary handle ---------------------------------
@@ -904,7 +915,7 @@ pam_auth_insertion_point_is_safe() {
   local f="$1" dir="${2:-/etc/pam.d}"
   local line inc seen_keyring=0
   [ -f "$f" ] || return 1
-  _pam_logical_lines "$f" | grep -qE "$PAM_GNOME_KEYRING_AUTH_RE" || return 1
+  grep -qE "$PAM_GNOME_KEYRING_AUTH_RE" < <(_pam_logical_lines "$f") || return 1
   while IFS= read -r line; do
     if [ "$seen_keyring" -eq 0 ]; then
       # Everything up to and including the keyring line runs before our

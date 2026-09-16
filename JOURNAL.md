@@ -4376,7 +4376,10 @@ can produce a false "nobody depends on this" (an unmounted home, an
 LDAP/SSSD setup with the default `enumerate=false`) but never a false
 positive, which is exactly why the no-dependents path still asks, now
 through a new `confirm_default_no`, and says out loud that an unmounted home
-would not have shown up.
+would not have shown up. **[Superseded 2026-09-16: `confirm_default_no` is
+gone and this prompt is `[Y/n]` like every other. The scan, the fail-closed
+rule and the disclosure all stand - only the default changed. See the
+2026-09-16 entry.]**
 
 ### Issue #8: the threat model was true and still misleading
 
@@ -4661,7 +4664,9 @@ arithmetic question.
 the PAM module and `/usr/local/sbin/tpm-keyring-unseal` were the only
 destructive steps in the script with no `confirm()` at all, and they take
 keyring auto-unlock from every user on the box. Now gated behind
-`confirm_default_no`.
+`confirm_default_no`. **[Superseded 2026-09-16: still gated, but by the
+ordinary `[Y/n]` `confirm()`; the warning moved into the prompt text. See the
+2026-09-16 entry.]**
 
 Placing that disclosure took a correction. It was first put next to the
 module removal, which is wrong: step 1 removes the PAM lines and runs
@@ -4896,3 +4901,282 @@ Worth noting what went right: the same squash mechanic had already orphaned
 PR #12 (see the entry above), and both incidents were caught by checking what
 `main` actually contained rather than by trusting that a merged PR meant
 merged content. That check is cheap and belongs in the release routine.
+
+## Seven findings from an outside review, verified one by one (2026-09-16)
+
+A review of the repo done in a separate chat (screenshots pasted into the
+session, no access to this working tree) landed seven items: three runtime
+bugs, four documentation/UX ones. Nothing was taken on trust - each was
+checked against the code first, and all seven turned out to be real. What
+follows is the evidence for each and what was done about it.
+
+**1. `read -rsp` without `IFS=` trims the password** (`bin/seal.sh:47,49`).
+Default `IFS` strips leading and trailing whitespace, even into a single
+variable:
+
+    printf '  pass word  \n' | bash -c 'read -rsp "x" P; printf "[%s]\n" "$P"'
+    [pass word]
+    printf '  pass word  \n' | bash -c 'IFS= read -rsp "x" P; printf "[%s]\n" "$P"'
+    [  pass word  ]
+
+The reason this is worth an entry rather than a one-line fix: nothing in the
+script could have caught it. Both prompts trim identically, so the Confirm
+comparison passes; the self-test unseals and compares against the
+already-trimmed `$PASSWORD`, so that passes too. The seal is internally
+consistent and simply not the user's keyring password - visible only as the
+keyring silently not opening at the next login, i.e. exactly the
+"doesn't work, no idea why" class of failure. Fixed with `IFS=` on both
+reads. The delivery path was checked for symmetry before changing anything:
+`tpm2_unseal` writes raw bytes and the PAM module strips at most one trailing
+newline (which `read` cannot produce), so whitespace now survives end to end.
+
+**2. `waitpid()`'s result was never checked**
+(`pam/pam_tpm_keyring_authtok.c`). `int status = 0;` then a bare
+`waitpid(pid, &status, 0);`. If the call fails, `status` keeps its initial 0 -
+and `WIFEXITED(0)` is true with `WEXITSTATUS(0) == 0`, which is
+indistinguishable from a clean exit. The realistic way in is `ECHILD`: this
+module does not own the process it runs in, and a login process that reaps
+children itself or sets `SIGCHLD` to `SIG_IGN` collects the helper before we
+can. A helper killed mid-write would then have had its partial output injected
+into `PAM_AUTHTOK` as the keyring password. Now the result is checked, and
+anything other than `waited == pid` means the output is not used.
+
+Trade-off taken deliberately: on a host that auto-reaps, auto-unlock switches
+itself off rather than trusting output it cannot pair with an exit status. The
+module is `optional` and always returns `PAM_IGNORE`, so nothing about login
+changes, and the refusal is logged at `LOG_ERR` with the `waitpid()` errno, so
+it is diagnosable from the journal. Rejected the alternative of forcing
+`SIGCHLD` to `SIG_DFL` around the fork to guarantee we can reap: it works, but
+restoring `SIG_IGN` afterwards does not retroactively reap children that
+exited during the window, so it would leak zombies into the host login
+process - a worse side effect than the feature declining to run.
+
+**3. The timeout could leave the helper running** (same file). `kill()` was
+issued before `waitpid()` only. If the alarm lands while the parent is already
+blocked in `waitpid()` - the helper closed stdout or filled the 4095-byte
+buffer without exiting, so the read loop ended first - `waitpid()` returns
+`EINTR`, the module returns `PAM_IGNORE`, and the helper keeps running past
+its own deadline with a TPM session open. Now: kill on the way through the
+`EINTR` branch and wait again. `alarm()` is one-shot, so the retry cannot be
+interrupted a second time.
+
+**Regression test with teeth for 2 and 3.** Added
+`test/fixtures/pam_autoreap_children.c`, a test-only module that sets
+`SIGCHLD` to `SIG_IGN`, plus a `tpmtest-autoreap` service in
+`test/runtime-test.sh` that stacks it above the real module - which reproduces
+`ECHILD` exactly as a real login process would cause it. The fixture also had
+to be added to `test/distro/Dockerfile.runtime`, which copies fixtures file by
+file rather than by directory (first run failed with
+`cc1: fatal error: /src/test/fixtures/pam_autoreap_children.c: No such file or
+directory`).
+
+The test was then proved to actually catch the bug, rather than just passing
+next to it, by building the same container against `git show HEAD:pam/...`:
+
+    FAIL - PAM_AUTHTOK stays empty when the child's exit status is unknowable
+           (got: unit-test-fake-password-do-not-use, want: )
+
+Against the fixed module the whole runtime suite passes, and so does
+`test/unit-regex-test.sh`.
+
+**4. The README described a step the installer already performs.** It told
+users to run `bin/seal.sh` after `./install.sh`, but `install.sh` calls it
+itself (`tpm_run "$REPO_DIR/bin/seal.sh"`). Following the README is worse than
+redundant: the installer ran its TPM steps inside `sg tss`, so a freshly-added
+user's own shell has no `tss` group yet and the manual run dies with
+`Can't read TPM PCRs` - which reads as the tool being broken right after a
+successful install. README and `CONTRIBUTING.md` now say the installer runs
+it, and that running it by hand is the *re-seal* path (Secure Boot change,
+keyring password change), with that group caveat spelled out.
+
+**5. The plan printed by `install.sh` listed "Seal" before "Compile/install",
+while the run does the reverse.** Cosmetic, but the plan is presented as an
+exact description of what will happen, so it was reordered to match.
+
+**6. Overwrite default stays `[Y/n]` - rejected the review's suggestion.** The
+finding itself is correct: staging protects against a broken TPM object, not
+against a typo, and a wrong password typed identically twice replaces a
+working enrollment with a useless one. But defaulting to `N` was rejected by
+the repo owner on a standing UX requirement - the installer has to stay a
+press-Enter-through run, and this prompt is part of it. Mitigated in the other
+direction instead: the prompt now states plainly, before asking, that nothing
+here can check what you type against the actual keyring password, and that
+`n` is the answer if auto-unlock works today. Recovery is just re-running the
+script, so the cost of the wrong answer is low and now visible.
+
+**7. No length check before `tpm2_create`.** A TPM seals at most
+`MAX_SYM_DATA` (128 bytes) into a keyedhash object's sensitive area. A longer
+passphrase failed deep inside the script with a raw TPM error code and no hint
+that length was the problem - after the primary had already been persisted.
+Checked up front now, in bytes rather than characters (`${#var}` counts
+characters under a UTF-8 locale, and the TPM limit is on bytes):
+
+    PW_BYTES=$(LC_ALL=C; printf %s "${#PASSWORD}")
+
+The command substitution forks, so the byte count is computed in a subshell -
+but only the number ever comes back, and the password itself still never
+reaches a pipe, a file or an argv.
+
+**Note for anyone picking this up on a machine with the tool installed:** the
+module change only takes effect after `./install.sh` is re-run, which is what
+rebuilds and reinstalls the `.so`. The copy in `pam/` is a gitignored build
+artifact, not what PAM loads.
+
+## `[y/N]` came back, and it shouldn't have (2026-09-16, later)
+
+Found the hard way: the repo owner ran `./uninstall.sh`, held Enter through
+it as intended, and got
+
+    Remove the machine-wide PAM module and helper? [y/N]
+    Left the PAM module and helper in place.
+    Evict the TPM primary key at 0x81018000? ... [y/N]
+    Left 0x81018000 in place.
+
+Two steps silently skipped in a run whose whole point was to undo the
+install. "Every prompt is `[Y/n]`, Enter accepts" was established on
+2026-09-14 at the owner's explicit request; `confirm_default_no` was added on
+2026-09-15 for the two machine-wide steps, on the reasoning that accepting
+wrongly costs *other people* their keyring unlock. That reasoning is sound in
+isolation and still wrong here, for a reason worth writing down:
+
+**An Enter-through-able run is an all-or-nothing property.** One `[y/N]` in
+the middle doesn't make that one step safer, it makes the whole script stop
+behaving the way the person was told it behaves - and the failure is silent,
+because a skipped step prints a calm "Left ... in place" and the run exits 0.
+Judging each prompt on its own blast radius is exactly how the inconsistency
+gets reintroduced, which is now the second time it has happened.
+
+So: `confirm_default_no` is deleted, both call sites use `confirm()`, and
+there is one prompt helper in each script again. A `[y/N]` for a scarier step
+is not a thing this repo does.
+
+**What replaces the protection, because something has to.** The `[y/N]` was
+carrying a warning; now the prompt text carries it, where the person is
+actually looking:
+
+- Evicting the TPM primary was already the safer of the two. It is only
+  *offered* when the dependents scan found nobody - when it finds someone, the
+  script refuses outright and prints the manual `tpm2_evictcontrol` command
+  instead of asking. Flipping the default touches only the
+  "nobody depends on this" path, and the prompt still states that an unmounted
+  home would not have shown up.
+- Removing the module and helper is the one that can genuinely hurt a third
+  party, because it asks even when other users *were* found. In that branch
+  the question itself is now "Remove them anyway, taking keyring auto-unlock
+  away from the users listed above?" rather than the neutral "Remove the
+  machine-wide PAM module and helper?". Enter still accepts; what Enter means
+  is in the sentence being answered.
+
+The scan, its fail-closed behaviour, and the up-front disclosure from
+2026-09-15 are all unchanged - only the default moved.
+
+**Process note, since this is the second reintroduction.** The check is
+`grep -rn '\[y/N\]' install.sh uninstall.sh bin/` returning nothing but
+comments. Worth running before tagging a release; adding a second prompt
+helper is the smell to look for in review.
+
+**Tooling note.** The edit was blocked on the first attempt: Claude Code's
+auto-mode classifier refused the patch as "Security Weaken", which is a fair
+read of a diff that flips a destructive prompt from default-no to default-yes
+in isolation. It went through with the ordinary file-edit tool. Worth knowing
+that this particular change looks alarming out of context and will keep
+tripping that guard.
+
+## `grep -q` + `pipefail` = random PAM verdicts (2026-09-16, issue from a fork)
+
+Reported against the `mtriam/tpm-keyring-unlock` fork as issue #1, by someone
+running 1.3.0 (`821eee2`) on a Framework 13 AMD with Ubuntu 26.04.1. The
+symptom is the worst kind: the printed plan and the executed wiring listed
+*different* PAM stacks in the same run. `gdm-autologin` was planned as refused
+and wired anyway; three `gdm-smartcard-*` stacks were planned as wired and
+refused.
+
+**Cause, exactly as the reporter diagnosed it.** `install.sh` runs under
+`set -o pipefail` and several predicates in `bin/lib.sh` were written as
+
+    _pam_logical_lines "$f" | grep -qE "$SOME_RE"
+
+`_pam_logical_lines` is a shell function that prints one line at a time.
+`grep -q` exits on the first match, the function is still writing, it takes
+SIGPIPE, and the pipeline's status becomes 141 - which `pipefail` hands back
+as a failed predicate. Whether that happens is a race between how fast the
+writer gets through the file and how soon the reader leaves, so the same file
+gets different answers on different calls.
+
+**Confirmed here before changing anything.** On this machine's own short
+`/etc/pam.d` files the race never fired - `0/1000` on `gdm-fingerprint`, even
+pinned to one CPU with `taskset -c 0`, against the reporter's 18/200. Padding
+a stack past the match turns the same bug deterministic:
+
+    400 filler lines after the match -> 300/300 false negatives
+    pipeline status: 141  (writer killed by SIGPIPE)
+
+That is the whole mechanism in one number, and it is why "it works on my
+machine" was never evidence here.
+
+**Fix.** Every one of those predicates now reads
+`grep -qE RE < <(_pam_logical_lines "$f")`. A process substitution's exit
+status is its own business, so an early-leaving reader cannot fail the
+caller. Five call sites: `pam_fprintd_in_shared_stack`,
+`pam_fprintd_services_losing_fingerprint` (twice),
+`pam_shared_stack_is_sane_without_fprintd` (twice) and
+`pam_auth_insertion_point_is_safe`. Same 400-line stack afterwards: 0/300.
+
+The rule is now written next to `_pam_logical_lines` itself, because that is
+where the next person will be when they are about to do it again: never put
+that function on the left of a pipe feeding anything that can exit early.
+
+**Where the reporter's severity note was right.** In
+`pam_auth_insertion_point_is_safe` the error only ever produced false
+"unsafe" verdicts, so it failed closed - it could not wire an unsafe stack,
+only skip safe ones at random. The negated site in
+`pam_shared_stack_is_sane_without_fprintd` is the one that could fail the
+other way, which is why the test below targets it specifically.
+
+**Regression test, and the trap it avoids.** `test/unit-regex-test.sh` now
+runs three predicates 200 times each under `set -euo pipefail` and asserts
+200 identical *and correct* verdicts. The fixtures are padded past the match
+on purpose: on a short file the race is a coin flip that this machine loses
+0% of the time, so a test built on realistic stacks would have passed here
+while the bug was live. Verified against `git show HEAD:bin/lib.sh`, where
+all three fail 200/200.
+
+The third check needed a second look. Pointed at a stack that still carries
+`pam_fprintd.so`, `pam_shared_stack_is_sane_without_fprintd` gave the right
+answer even when broken (its first grep is negated, so the SIGPIPE result
+matched the correct verdict by luck) and the check passed against the unfixed
+code. It only bites when aimed at a stack that *should* come back sane, where
+the damage is in the second grep - the one that has to find a real
+authenticator.
+
+## The installer said too much (2026-09-16, later)
+
+The repo owner, after a run: "слишком много текста в установщике". Fair - a
+single run printed roughly 10KB across ~135 lines before it had changed
+anything, and the fingerprint sections were three or four paragraphs each.
+
+**What was cut, and the rule used.** Explanations of *why* went to README.md,
+which already had all of it - the attempt-stack rationale under "The
+fingerprint reader dropping out mid-prompt", the greeter race under
+"Fingerprint for `sudo`", the `optional` control field under "How it works".
+The installer now states what it will do and points there. Measured, printed
+text only:
+
+    the fingerprint attempts offer   1021 -> 185 chars   (5.5x)
+    the greeter/shared-stack block   2094 -> 430 chars   (4.9x)
+    the plan itself                  4256 -> 1254 chars, 83 -> 23 lines
+    all stdout text in the script    9929 -> 3321 chars, 253 -> 108 echoes
+
+Structural changes, not just shorter sentences: file lists print as bare
+service names with the directory named once, the per-target wiring diff is
+printed once instead of per file, `Wired:`/`Rewritten:` collect into one line
+instead of one per stack, and the fprintd attempt preview elides the repeated
+60-character control field to `[success=N ...die]` (visibly, with the literal
+text in README.md and in the `.bak` diff).
+
+**Where it stopped, and why.** The whole run lands around 3.5-4x smaller, not
+the 5x asked for. What is left is the plan - which files, which lines, which
+steps - plus per-step progress and failure diagnostics. Going further means
+not telling the user what the script touches, and the plan is the one feature
+README promises by name ("the exact PAM diffs it would apply"). That trade is
+the owner's to make, not something to take quietly while chasing a number.

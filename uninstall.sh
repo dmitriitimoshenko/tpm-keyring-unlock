@@ -9,26 +9,21 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=bin/lib.sh
 source "$REPO_DIR/bin/lib.sh"
 
+# ONE prompt helper, and it defaults to yes. Every question in this script and
+# in install.sh is [Y/n]: an empty answer accepts, so both can be run by
+# holding Enter. That is a standing requirement from the repo owner, not a
+# default that happened to end up this way - a [y/N] added later for a step
+# that felt scarier breaks the property, because a run is only
+# Enter-through-able if *every* prompt behaves the same. A step whose
+# consequences need weighing says so in its own prompt text, right where it
+# is asked, instead of hiding the warning in the default. A failed read (EOF,
+# i.e. no terminal) is still a "no", so nothing here can be auto-approved by
+# a pipe. See JOURNAL.md, 2026-09-14 and 2026-09-16.
 confirm() {
   local prompt="$1"
   local ans
-  # Defaults to yes: an empty answer accepts. A failed read (EOF, i.e. no
-  # terminal) is a "no", so nothing here can be auto-approved by a pipe.
   read -rp "$prompt [Y/n] " ans || return 1
   [[ ! "$ans" =~ ^[Nn][Oo]?$ ]]
-}
-
-# Same, but an empty answer DECLINES. Used for evicting the TPM primary,
-# which is the one step in this script whose blast radius is the whole
-# machine rather than this account, and which nothing can undo without every
-# affected user re-running bin/seal.sh. Declining costs one TPM NV slot;
-# accepting wrongly costs other people their keyring unlock, so the default
-# belongs on "don't". See JOURNAL.md, 2026-09-15.
-confirm_default_no() {
-  local prompt="$1"
-  local ans
-  read -rp "$prompt [y/N] " ans || return 1
-  [[ "$ans" =~ ^[Yy]([Ee][Ss])?$ ]]
 }
 
 # One timestamp for the whole run, so a file touched by two different steps
@@ -294,9 +289,15 @@ done
 # name who else is relying on this before asking. See JOURNAL.md, 2026-09-15.
 if [ -n "$found_module" ] || [ -f "$HELPER_DST" ]; then
   echo
+  REMOVE_PROMPT="Remove the machine-wide PAM module and helper?"
   if [ -n "$OTHER_SEALED" ]; then
     echo "Reminder: these users still depend on the module and helper:"
     echo "$OTHER_SEALED" | sed 's/^/  /'
+    # Enter accepts, here as everywhere else in this script, so the one case
+    # where that costs someone other than the person answering has to say so
+    # in the question itself rather than rely on the default to hold them
+    # back. Reinstallable (run install.sh again), but not by them.
+    REMOVE_PROMPT="Remove them anyway, taking keyring auto-unlock away from the users listed above?"
   elif [ "$OTHER_SCAN_OK" -eq 0 ]; then
     echo "The PAM module and helper are shared by every user of this tool on"
     echo "this machine, and it was not possible to check whether anyone else"
@@ -306,7 +307,7 @@ if [ -n "$found_module" ] || [ -f "$HELPER_DST" ]; then
     echo "this machine. No other user's sealed secret was found, though a home"
     echo "that isn't mounted right now wouldn't show up."
   fi
-  if confirm_default_no "Remove the machine-wide PAM module and helper?"; then
+  if confirm "$REMOVE_PROMPT"; then
     if [ -n "$found_module" ]; then
       sudo rm -f "$found_module"
       echo "Removed $found_module"
@@ -388,7 +389,7 @@ if [ -f "$DATA_DIR/primary.handle" ] && command -v tpm2_evictcontrol >/dev/null 
       echo "  tpm2_evictcontrol -C o -c $PRIMARY_HANDLE" >&2
     else
       echo "No other user's sealed secret names this handle."
-      if confirm_default_no "Evict the TPM primary key at $PRIMARY_HANDLE? It is shared by every
+      if confirm "Evict the TPM primary key at $PRIMARY_HANDLE? It is shared by every
 user of this tool on this machine. Nobody else was found using it - though a
 home that isn't mounted right now wouldn't show up. Anyone still holding one
 keeps logging in, just several seconds slower, until they re-run bin/seal.sh."; then

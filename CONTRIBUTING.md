@@ -3,7 +3,8 @@
 ## Project layout
 
 - `install.sh` / `uninstall.sh` — the actual tool.
-- `bin/seal.sh` — interactive TPM sealing, run by end users directly.
+- `bin/seal.sh` — interactive TPM sealing. `install.sh` runs it as one of
+  its steps; end users only invoke it directly to re-seal afterwards.
 - `bin/lib.sh` — shared logic (`install.sh`, `uninstall.sh`, and the test
   suite all source this rather than keeping their own copies, so they
   can't drift out of sync on things like the PAM module directory
