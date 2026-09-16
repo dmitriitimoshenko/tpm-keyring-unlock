@@ -3,7 +3,7 @@
 # Built by OBS from the tarball that _service pulls from the git tag.
 #
 Name:           tpm-keyring-unlock
-Version:        1.4.0
+Version:        1.4.1
 Release:        0
 Summary:        TPM-backed unlock of the GNOME login keyring at login
 License:        MIT

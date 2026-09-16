@@ -88,10 +88,13 @@ jobs:
           git tag -a "v$V" -m "Release $V"
           git push origin "v$V"
 
-      # OBS downloads this exact file, and so does the AUR - the checksum below
-      # is what `updpkgsums` would compute, printed here so publishing to the
-      # AUR later does not need the tag re-downloaded by hand.
-      - name: Wait for GitHub's tarball for the tag, and record its checksum
+      # A PKGBUILD cannot contain the checksum of the archive it is packaged
+      # in, so scripts/bump-version.sh leaves a placeholder and this step fills
+      # in the real one as soon as the tag exists. It has to be committed back:
+      # README tells Arch users to build straight from packaging/aur while the
+      # AUR is closed to new accounts, and a placeholder there means that
+      # instruction fails for everyone.
+      - name: Pin the AUR checksum to the new tag
         if: steps.gate.outputs.changed == 'yes'
         run: |
           set -euo pipefail
@@ -99,14 +102,29 @@ jobs:
           URL="https://github.com/${{ github.repository }}/archive/refs/tags/v$V.tar.gz"
           for attempt in $(seq 1 30); do
             if curl -fsSL "$URL" -o /tmp/release.tar.gz; then break; fi
-            echo "attempt $attempt: not available yet"
+            echo "attempt $attempt: tarball not available yet"
             sleep 10
           done
           [ -s /tmp/release.tar.gz ] || { echo "Tarball never appeared at $URL" >&2; exit 1; }
           SUM="$(sha256sum /tmp/release.tar.gz | cut -d' ' -f1)"
+
+          sed -i -E "s/^sha256sums=\('[0-9a-f]{64}'\)/sha256sums=('$SUM')/" packaging/aur/PKGBUILD
+          grep -q "sha256sums=('$SUM')" packaging/aur/PKGBUILD \
+            || { echo "Could not write the checksum into packaging/aur/PKGBUILD" >&2; exit 1; }
+
+          if ! git diff --quiet -- packaging/aur/PKGBUILD; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add packaging/aur/PKGBUILD
+            git commit -m "chore: pin the AUR checksum to v$V"
+            # main may have moved while the builds were queued.
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
+
           echo "### Release $V" >>"$GITHUB_STEP_SUMMARY"
           echo "" >>"$GITHUB_STEP_SUMMARY"
-          echo "AUR \`sha256sums\` for this tag:" >>"$GITHUB_STEP_SUMMARY"
+          echo "AUR \`sha256sums\` (already committed to packaging/aur/PKGBUILD):" >>"$GITHUB_STEP_SUMMARY"
           echo "\`\`\`" >>"$GITHUB_STEP_SUMMARY"
           echo "$SUM" >>"$GITHUB_STEP_SUMMARY"
           echo "\`\`\`" >>"$GITHUB_STEP_SUMMARY"

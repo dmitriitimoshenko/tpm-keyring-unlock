@@ -128,9 +128,16 @@ git commit -am "Release 1.5.0" && <open a PR, merge to main>
 ```
 
 On merge, `.github/workflows/release.yml` sees `VERSION` change and does the
-rest: tags `v1.5.0`, waits for GitHub to publish the tarball, records its
-sha256 in the job summary, commits `packaging/obs/*` to the Build Service and
-waits for all seven targets to build. A red target fails the job.
+rest: tags `v1.5.0`, waits for GitHub to publish the tarball, writes that
+tarball's sha256 into `packaging/aur/PKGBUILD` and commits it back, then
+commits `packaging/obs/*` to the Build Service and waits for all seven targets
+to build. A red target fails the job.
+
+The checksum round-trip is not decoration. A PKGBUILD cannot carry the hash of
+the archive it is packaged in, so `bump-version.sh` leaves a placeholder and
+the workflow fills it in once the tag exists. Leaving that to a human would
+break the `makepkg -si` instruction README gives Arch users for every release
+until someone remembered.
 
 Tags are created by the workflow, from `VERSION`, so a tag can never point at
 a commit whose packaging files say something else. **Never move a published
