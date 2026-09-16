@@ -1,0 +1,7 @@
+tpm-keyring-unlock (1.4.0-1) unstable; urgency=medium
+
+  * Packaging support: make install with DESTDIR/PREFIX/PAMDIR, the
+    tpm-keyring-seal and tpm-keyring-unlock-configure commands, and a
+    --no-build mode so the configure step leaves packaged files alone.
+
+ -- Dmitrii Timoshenko <dmitrii.timoshenko16@gmail.com>  Wed, 16 Sep 2026 10:30:02 +0200

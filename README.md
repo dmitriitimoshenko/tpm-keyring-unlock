@@ -50,6 +50,21 @@ it may refuse with `Can't read TPM PCRs`: the installer ran the TPM steps
 inside `sg tss`, and your own shell only picks up the new group membership
 after a logout.
 
+### From a distribution package
+
+Packaging recipes live in `packaging/` (OBS for openSUSE, Fedora, Debian and
+Ubuntu; AUR for Arch). A package installs the files only - sealing needs your
+password typed on a terminal, and the PAM edits need your consent, so neither
+happens behind a package manager's back:
+
+```bash
+tpm-keyring-unlock-configure     # seal + wire up PAM, asks before each change
+tpm-keyring-seal                 # re-seal later, on its own
+```
+
+Use one method or the other on a given machine, not both: they write the same
+PAM module filename, so whichever ran last wins. See `packaging/README.md`.
+
 ## What this protects, and what it doesn't
 
 **Protected: the disk comes out and gets read somewhere else.** The sealed

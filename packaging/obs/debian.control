@@ -1,0 +1,19 @@
+Source: tpm-keyring-unlock
+Section: admin
+Priority: optional
+Maintainer: Dmitrii Timoshenko <dmitrii.timoshenko16@gmail.com>
+Build-Depends: debhelper-compat (= 13), gcc, make, libpam0g-dev
+Standards-Version: 4.7.0
+Homepage: https://github.com/dmitriitimoshenko/tpm-keyring-unlock
+
+Package: tpm-keyring-unlock
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, tpm2-tools
+Description: TPM-backed unlock of the GNOME login keyring at login
+ A PAM module that hands a TPM-sealed copy of the GNOME keyring password to
+ pam_gnome_keyring at login, so the login keyring unlocks even when the login
+ itself was by fingerprint - without blanking the keyring password.
+ .
+ The secret is sealed to this machine's TPM under a PCR7 (Secure Boot) policy.
+ Installing this package only puts the files in place; run
+ tpm-keyring-unlock-configure afterwards to seal a password and wire up PAM.

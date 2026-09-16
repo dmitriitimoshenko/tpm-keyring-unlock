@@ -64,6 +64,11 @@ jobs:
   vm:
     name: VM (swtpm + OVMF) - real TPM/Secure Boot round trip
     runs-on: ubuntu-latest
+    # A backstop, not a target: the run takes ~30 minutes. Without it, a step
+    # that waits on input it will never get sits until GitHub's 6-hour default
+    # kills it - which is what happened on 2026-09-16 (JOURNAL.md). The test
+    # also bounds each pty-driven step itself via VM_TTY_TIMEOUT.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y swtpm swtpm-tools ovmf qemu-system-x86 qemu-utils

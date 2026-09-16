@@ -1,0 +1,22 @@
+#!/usr/bin/make -f
+# Debian/Ubuntu build, used by OBS for the .deb targets.
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+include /usr/share/dpkg/architecture.mk
+
+PAMDIR     = /usr/lib/$(DEB_HOST_MULTIARCH)/security
+LIBEXECDIR = /usr/libexec/tpm-keyring-unlock
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	dh_auto_build -- PREFIX=/usr PAMDIR=$(PAMDIR) LIBEXECDIR=$(LIBEXECDIR)
+
+override_dh_auto_install:
+	dh_auto_install -- PREFIX=/usr PAMDIR=$(PAMDIR) LIBEXECDIR=$(LIBEXECDIR)
+
+# dh_fixperms would reset the unseal helper to 0755. It runs as root and
+# unseals the keyring password, so it stays 0700 - the same mode install.sh
+# gives it.
+override_dh_fixperms:
+	dh_fixperms -X tpm-keyring-unseal

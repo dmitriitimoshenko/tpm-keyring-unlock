@@ -12,13 +12,47 @@
 # want to understand exactly what it touches.
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# readlink -f, because a packaged copy of this script is reached through a
+# symlink in $PATH and dirname of the *link* would point at /usr/bin.
+REPO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 DATA_DIR="$HOME/.local/share/tpm-keyring-unlock"
-HELPER_DST="/usr/local/sbin/tpm-keyring-unseal"
+# Overridable so a distribution package can point at its own helper: /usr/local
+# is off limits to packages, so `make install` puts it under libexec and the
+# generated wrapper passes the path in. The hand-rolled install keeps the path
+# it has always used, which is also the one compiled into the module by default.
+HELPER_DST="${TPM_KEYRING_HELPER:-/usr/local/sbin/tpm-keyring-unseal}"
 PCR_BANK="sha256:7"
 
+# Two layouts to support: a git checkout (bin/lib.sh, bin/seal.sh) and an
+# installed copy, where everything lands flat in one libexec directory.
+LIB_SH="$REPO_DIR/bin/lib.sh"
+[ -f "$LIB_SH" ] || LIB_SH="$REPO_DIR/lib.sh"
+SEAL_SH="$REPO_DIR/bin/seal.sh"
+[ -f "$SEAL_SH" ] || SEAL_SH="$REPO_DIR/seal.sh"
+
 # shellcheck source=bin/lib.sh
-source "$REPO_DIR/bin/lib.sh"
+source "$LIB_SH"
+
+# --no-build: the PAM module and the helper are already on disk, put there by
+# a distribution package, so this run must not compile or install them - it
+# only does the parts a package is not allowed to do (sealing a secret, which
+# needs the user's password, and editing /etc/pam.d, which needs consent).
+DO_BUILD=true
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --no-build) DO_BUILD=false ;;
+    -h | --help)
+      echo "usage: ${0##*/} [--no-build]"
+      echo "  --no-build  configure only; expects the module and helper to be installed"
+      exit 0
+      ;;
+    *)
+      echo "${0##*/}: unknown option '$1'" >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
 
 confirm() {
   local prompt="$1"
@@ -317,8 +351,12 @@ if [ "$NEED_TSS_ADD" = true ]; then
   echo "     continues inside 'sg tss', so no logout is needed."
   n=$((n + 1))
 fi
-echo "  $n. Compile + install the PAM module and helper, and mask systemd's"
-echo "     eager gnome-keyring-daemon startup (sudo)."
+if [ "$DO_BUILD" = true ]; then
+  echo "  $n. Compile + install the PAM module and helper, and mask systemd's"
+  echo "     eager gnome-keyring-daemon startup (sudo)."
+else
+  echo "  $n. Mask systemd's eager gnome-keyring-daemon startup."
+fi
 n=$((n + 1))
 if [ "$RESEAL" = true ]; then
   echo "  $n. Re-seal (overwrite) the existing sealed secret at $DATA_DIR."
@@ -425,11 +463,6 @@ if [ "$USE_SG" = true ]; then
   echo
 fi
 
-echo "-- Build + install --"
-gcc -Wall -Wextra -fPIC -shared \
-  -o "$REPO_DIR/pam/pam_tpm_keyring_authtok.so" \
-  "$REPO_DIR/pam/pam_tpm_keyring_authtok.c" -lpam
-
 PAM_MODULE_DIR="$(find_pam_module_dir || true)"
 if [ -z "$PAM_MODULE_DIR" ]; then
   echo "Couldn't find the PAM module directory (no pam_unix.so). Locate it" >&2
@@ -438,11 +471,31 @@ if [ -z "$PAM_MODULE_DIR" ]; then
   exit 1
 fi
 
-sudo install -o root -g root -m 0700 \
-  "$REPO_DIR/pam/tpm-keyring-unseal.sh" "$HELPER_DST"
-sudo install -o root -g root -m 0644 \
-  "$REPO_DIR/pam/pam_tpm_keyring_authtok.so" \
-  "$PAM_MODULE_DIR/pam_tpm_keyring_authtok.so"
+if [ "$DO_BUILD" = true ]; then
+  echo "-- Build + install --"
+  gcc -Wall -Wextra -fPIC -shared \
+    -o "$REPO_DIR/pam/pam_tpm_keyring_authtok.so" \
+    "$REPO_DIR/pam/pam_tpm_keyring_authtok.c" -lpam
+
+  sudo install -o root -g root -m 0700 \
+    "$REPO_DIR/pam/tpm-keyring-unseal.sh" "$HELPER_DST"
+  sudo install -o root -g root -m 0644 \
+    "$REPO_DIR/pam/pam_tpm_keyring_authtok.so" \
+    "$PAM_MODULE_DIR/pam_tpm_keyring_authtok.so"
+else
+  # Checked, not assumed: wiring a PAM stack to a module that is not there
+  # would leave every login logging "module not found" on a file that cannot
+  # be fixed without a working shell.
+  missing_parts=()
+  [ -f "$PAM_MODULE_DIR/pam_tpm_keyring_authtok.so" ] \
+    || missing_parts+=("$PAM_MODULE_DIR/pam_tpm_keyring_authtok.so")
+  [ -e "$HELPER_DST" ] || missing_parts+=("$HELPER_DST")
+  if [ "${#missing_parts[@]}" -gt 0 ]; then
+    echo "--no-build was given, but this is missing: ${missing_parts[*]}" >&2
+    echo "Install the package properly, or run without --no-build." >&2
+    exit 1
+  fi
+fi
 
 echo
 echo "-- Mask the eager keyring daemon units --"
@@ -459,7 +512,7 @@ if [ "$RESEAL" = true ]; then
 else
   echo "-- Seal into the TPM --"
 fi
-tpm_run "$REPO_DIR/bin/seal.sh"
+tpm_run "$SEAL_SH"
 
 echo
 if [ "$UNLIMIT_FPRINTD" = true ]; then

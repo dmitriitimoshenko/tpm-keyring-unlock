@@ -1,0 +1,37 @@
+# Maintainer: Dmitrii Timoshenko <dmitrii.timoshenko16@gmail.com>
+#
+# Before publishing a new version: bump pkgver, then run `updpkgsums` in this
+# directory to replace the checksum below with the real one, then
+# `makepkg --printsrcinfo > .SRCINFO`. Both are required by the AUR.
+pkgname=tpm-keyring-unlock
+pkgver=1.4.0
+pkgrel=1
+pkgdesc="TPM-backed unlock of the GNOME login keyring at login, incl. fingerprint logins"
+arch=('x86_64' 'aarch64')
+url="https://github.com/dmitriitimoshenko/tpm-keyring-unlock"
+license=('MIT')
+# bash and coreutils are in the 'base' group, which Arch packaging guidelines
+# say not to list. Same class of finding as Debian's lintian error about
+# depending on Essential packages.
+depends=('tpm2-tools' 'pam')
+# No debug package: namcap flags its build-id symlink as broken (it points at
+# the module, which lives in the main package), and split debug symbols are
+# not worth much for one small PAM module.
+options=('!debug')
+makedepends=('gcc' 'make')
+install="${pkgname}.install"
+source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
+sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')
+
+build() {
+  cd "${pkgname}-${pkgver}"
+  make PREFIX=/usr PAMDIR=/usr/lib/security LIBEXECDIR="/usr/lib/${pkgname}"
+}
+
+package() {
+  cd "${pkgname}-${pkgver}"
+  make DESTDIR="${pkgdir}" PREFIX=/usr PAMDIR=/usr/lib/security \
+    LIBEXECDIR="/usr/lib/${pkgname}" install
+  install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+}
