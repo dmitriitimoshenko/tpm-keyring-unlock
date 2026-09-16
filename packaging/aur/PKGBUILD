@@ -21,7 +21,7 @@ options=('!debug')
 makedepends=('gcc' 'make')
 install="${pkgname}.install"
 source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
-sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')
+sha256sums=('3cf1b56982206ac028af34d38eff8561b2fcee3eafa25bc11adb68980d97c7ce')
 
 build() {
   cd "${pkgname}-${pkgver}"
