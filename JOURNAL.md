@@ -5473,4 +5473,52 @@ the account owns nothing but this one project.
 **One convenience for the half that stays manual.** The workflow downloads the
 tag's tarball to confirm it exists before touching OBS, and prints its sha256
 into the job summary - which is exactly the number `updpkgsums` would compute
-for the AUR, ready for whenever registration reopens.
+for the AUR, ready for whenever registration reopens. **[Superseded the same
+day, before the first release: printing it was not enough. README points Arch
+users straight at `packaging/aur/PKGBUILD`, so a placeholder checksum left
+sitting on `main` breaks that instruction for every one of them until someone
+remembers. The workflow now writes the real checksum into the file and commits
+it back. See the entry below.]**
+
+## The first automated release, and the checksum that had to come back (2026-09-16, last)
+
+1.4.1 went out without a manual step: merge the PR, and the workflow tagged,
+published and verified itself. What it proved is the half that had never run -
+`osc` authenticating from a runner, uploading sources to OBS, and waiting on
+the build matrix. The gate had been exercised before (a push with no `VERSION`
+change skips in nine seconds); everything after it had not.
+
+**The checksum write-back came from a correction, not from the design.** The
+original plan had `bump-version.sh` reset `sha256sums` to 64 zeros and the
+workflow print the real value into the job summary for a human to paste. The
+repo owner rejected it in three words, and was right: README tells Arch users
+to run `makepkg -si` straight out of `packaging/aur/` while the AUR is closed
+to new accounts, so a placeholder sitting on `main` breaks that instruction
+for everyone until someone remembers to fix it - which is exactly the manual
+step the automation exists to remove. The workflow now computes the checksum
+as soon as the tag exists, writes it into the PKGBUILD and commits that back
+to `main`.
+
+One property of this cannot be fixed and should not be mistaken for sloppiness
+later: the PKGBUILD *inside* the release tarball keeps the placeholder
+forever, because a file cannot contain the hash of the archive it is packaged
+in. Every distribution solves this the same way - checksums live outside the
+archive. README's Arch instruction goes through `git clone`, which lands on
+`main`, where the value is real.
+
+**Verified, not assumed:**
+
+    tag v1.4.1                     created from VERSION, at 5ce31b7
+    checksum in PKGBUILD           3cf1b569...d97c7ce, committed as 3a55241
+    same tarball, computed here    3cf1b569...d97c7ce
+    OBS                            7 of 7 succeeded, sources at 1.4.1
+    Debian 13 container            1.4.1-1,   helper root:root 700
+    Fedora 42 container            1.4.1-1.1, helper root:root 700
+
+The two container installs are the part that matters: a green build says the
+package compiled, not that it installs and runs.
+
+**Also set the OBS package's title and description**, which were empty - the
+project had them, the package did not, and "No description set" is what anyone
+browsing or searching the Build Service would have seen. Noticed by opening
+the page in a browser; `osc results` does not show it.

@@ -148,6 +148,38 @@ script). Two scenarios:
   unseals, covering the transactional staging path in `bin/seal.sh`.
   It also fires two concurrent unseal calls at the real TPM to check the
   `flock` serialization fix for the second reboot regression in the journal.
+  After the reboot check it runs **the installer itself**, end to end: a
+  fixture PAM stack goes into `/etc/pam.d`, `install.sh` runs to completion,
+  and the checks are that the module line lands *directly above*
+  `pam_gnome_keyring.so` rather than merely somewhere in the file, that the
+  backup holds the pre-edit content byte for byte, and that what
+  `install.sh` sealed unseals through the helper it just installed. Then
+  `uninstall.sh` runs and has to restore the stack byte for byte. Then the
+  packaged path: `make install`, `tpm-keyring-seal`,
+  `tpm-keyring-unlock-configure` (which must not compile anything), and
+  `-deconfigure`, which must leave files a package owns alone. Until this
+  existed, nothing in the repo had ever executed `install.sh` - the distro
+  tests mirror its logic, they do not run it.
+
+### Driving the prompts: `test/vm/pty-drive.py`
+
+The interactive steps are not fed from a pipe. `sudo` deliberately discards
+whatever is already sitting in the terminal's input queue before it runs, so
+answers queued ahead of `install.sh`'s compile-and-install step are gone by
+the time a later prompt asks for them:
+
+```
+printf 'answer\n' | script -qec 'read -p "p: " v; echo [$v]'            -> [answer]
+printf 'answer\n' | script -qec 'sudo true; read -p "p: " v; echo [$v]' -> []
+```
+
+`pty-drive.py` writes each answer only once its prompt has appeared. Rules
+are `REGEX=ANSWER`, and a `*` prefix keeps a rule active for the rest of the
+run - which is how `uninstall.sh` is driven, every prompt of it taking the
+same Enter. Every pty-driven step is bounded by `VM_TTY_TIMEOUT` (420s) and
+logs `still waiting for: <regex>` on expiry, so a mismatch fails a check with
+the prompt named instead of hanging. That failure mode is not hypothetical:
+before the timeout existed it stalled a CI run for an hour.
   Then, still in the first boot, it evicts the persisted primary out from
   under the live enrollment — exactly what another user's `uninstall.sh`
   does to a handle that is shared machine-wide (GitHub issue #7) — leaving

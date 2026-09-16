@@ -10,6 +10,18 @@
   can't drift out of sync on things like the PAM module directory
   candidate list or the PAM-line detection regex).
 - `pam/` — the PAM module source and its root-owned helper script.
+- `packaging/` — distribution packaging: `obs/` (the spec and the
+  `debian.*` files, both consumed by one Open Build Service package) and
+  `aur/` (`PKGBUILD` for Arch). `packaging/README.md` explains what a
+  package may and may not do, and why the configure step is separate.
+- `scripts/bump-version.sh` — sets the release version in the five files
+  that record it. Not a convenience: the release workflow refuses to
+  publish when they disagree, because a package that claims one version
+  and contains another is worse than a failed release.
+- `.github/workflows/release.yml` — tags and publishes to the Build
+  Service when `VERSION` changes on `main`. The tag is created *from*
+  `VERSION`, so it can never point at a commit whose packaging files say
+  something else.
 - `JOURNAL.md` — the running decision/debugging log. Read `CLAUDE.md` for
   the standing rule about keeping it updated; it applies to human
   contributors too, not just an AI agent working in this repo.
