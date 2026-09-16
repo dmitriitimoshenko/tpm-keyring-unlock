@@ -116,12 +116,46 @@ the one known gap, and they matter for Debian proper rather than for OBS or the
 AUR. The two permission tags on the helper are recorded in
 `debian.lintian-overrides` as deliberate.
 
-## Release checklist
+## Releasing
 
-1. `VERSION`, `Version:` in the spec, `pkgver` in `PKGBUILD`,
-   `revision` in `_service`, a new `debian.changelog` entry - all to the same
-   number.
-2. Tag `vX.Y.Z` and push it; the tarballs both services download come from
-   that tag.
-3. AUR: `updpkgsums && makepkg --printsrcinfo > .SRCINFO`, push.
-4. OBS: `osc commit` - it rebuilds every target.
+Five files record the version. `scripts/bump-version.sh` sets all of them, and
+the release workflow refuses to publish if they disagree - a package claiming
+one version and containing another is worse than a failed release.
+
+```bash
+scripts/bump-version.sh 1.5.0
+git commit -am "Release 1.5.0" && <open a PR, merge to main>
+```
+
+On merge, `.github/workflows/release.yml` sees `VERSION` change and does the
+rest: tags `v1.5.0`, waits for GitHub to publish the tarball, records its
+sha256 in the job summary, commits `packaging/obs/*` to the Build Service and
+waits for all seven targets to build. A red target fails the job.
+
+Tags are created by the workflow, from `VERSION`, so a tag can never point at
+a commit whose packaging files say something else. **Never move a published
+tag**: the AUR checksum pins its content, and moving it breaks every user's
+build.
+
+### The AUR half is still manual
+
+Only because AUR registration is closed to new accounts (see the note in
+README.md). When it reopens:
+
+```bash
+cd ~/aur-tpm-keyring-unlock
+cp <repo>/packaging/aur/PKGBUILD .
+updpkgsums                          # or paste the sum from the job summary
+makepkg --printsrcinfo > .SRCINFO   # mandatory, the AUR rejects pushes without it
+git commit -am "Update to 1.5.0" && git push
+```
+
+### Credentials
+
+The workflow needs `OSC_USERNAME` and `OSC_PASSWORD` as repository secrets -
+the Build Service account that owns the project. An OBS *token* would be
+narrower and was tried first, but tokens can only trigger a service run or a
+rebuild, and publishing a new version means changing the package sources (the
+tag in `_service`, the version in the spec and the changelog). That needs a
+real login. The secrets are only reachable from pushes to `main` in this
+repository, never from a fork's pull request.

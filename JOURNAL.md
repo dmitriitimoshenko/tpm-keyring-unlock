@@ -5433,3 +5433,44 @@ checksum pinned to v1.4.0 and build-tested against the real tag, so publishing
 is a five-minute job whenever registration reopens. Until then README documents
 `makepkg -si` straight from `packaging/aur/`, which needs no AUR at all - AUR
 distributes PKGBUILDs, and ours is in the repository.
+
+## Releases are automated, and the token idea did not survive contact (2026-09-16, night)
+
+A merge to `main` that changes `VERSION` now tags the commit and publishes to
+OBS by itself (`.github/workflows/release.yml`). What it is keyed on matters:
+not a tag push, but `VERSION` changing. The tag is then created *from*
+`VERSION`, which removes the failure where a tag points at a commit whose
+packaging files still say the previous number.
+
+**Five files record the version** - `VERSION`, the spec, the dsc, `_service`'s
+tag, the Debian changelog, and the AUR `pkgver`. `scripts/bump-version.sh`
+sets them together and the workflow re-checks every one of them before it will
+publish. A package that claims one version and contains another is worse than
+a failed release, so that check is a hard gate.
+
+**The token idea, and why it failed.** The safe design would be an OBS token
+scoped to one operation on one package (`osc token --create --operation
+runservice ...`), so a leaked CI secret could do nothing but re-run a build.
+That requires `_service` to derive the version by itself, which means
+`obs_scm` with `versionformat=@PARENT_TAG@` plus `tar`, `recompress` and
+`set_version`. Tried it; the source server refused:
+
+    /usr/lib/obs/service//tar.service: No such file or directory
+
+The `tar` service exists only as a *buildtime* service, and buildtime services
+are exactly what the Debian and Ubuntu targets cannot run (earlier entry).
+Neither end can do it: the build root lacks the package, the source server
+lacks the service. So the version has to be written into `_service` by hand,
+which means CI must change the package sources, which needs a real login -
+`OSC_USERNAME` and `OSC_PASSWORD` as repository secrets. Recorded because it
+looks like an oversight and is not: the narrower credential was tried first
+and does not work here.
+
+Two mitigations worth keeping in mind: the secrets are reachable only from
+pushes to `main` in this repository (never from a fork's pull request), and
+the account owns nothing but this one project.
+
+**One convenience for the half that stays manual.** The workflow downloads the
+tag's tarball to confirm it exists before touching OBS, and prints its sha256
+into the job summary - which is exactly the number `updpkgsums` would compute
+for the AUR, ready for whenever registration reopens.

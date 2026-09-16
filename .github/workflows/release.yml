@@ -1,0 +1,165 @@
+# Publishes a release to the Open Build Service when, and only when, VERSION
+# changes on main.
+#
+# Why VERSION and not a tag push: the tag is created *here*, from VERSION, so
+# there is one thing to bump (scripts/bump-version.sh does it everywhere) and
+# no way to tag a commit whose packaging files say something else.
+#
+# What it needs: OSC_USERNAME and OSC_PASSWORD, the Build Service account that
+# owns home:<user>. A scoped OBS token would be safer but cannot do this job -
+# tokens can trigger a service run or a rebuild, and publishing a new version
+# means *changing the package sources* (the tag in _service, the version in
+# the spec and the changelog), which needs a real login. See JOURNAL.md.
+name: release
+
+on:
+  push:
+    branches: [main]
+
+# Only for pushing the tag. Note a tag pushed with GITHUB_TOKEN does not start
+# another workflow run, so this cannot loop.
+permissions:
+  contents: write
+
+env:
+  OBS_PROJECT: home:dmitrii.timoshenko
+  OBS_PACKAGE: tpm-keyring-unlock
+
+jobs:
+  publish:
+    name: Tag and publish to OBS
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Did VERSION change in this push?
+        id: gate
+        run: |
+          set -euo pipefail
+          before='${{ github.event.before }}'
+          # A brand new branch reports all-zeros; fall back to the parent.
+          if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
+            before="$(git rev-parse HEAD~1 2>/dev/null || echo '')"
+          fi
+          changed=no
+          if [ -n "$before" ] && git diff --name-only "$before" '${{ github.sha }}' | grep -qx VERSION; then
+            changed=yes
+          fi
+          echo "changed=$changed" >>"$GITHUB_OUTPUT"
+          echo "version=$(cat VERSION)" >>"$GITHUB_OUTPUT"
+          echo "VERSION changed: $changed (version $(cat VERSION))"
+
+      # A package that claims one version and contains another is worse than a
+      # failed release, so this is a hard gate rather than a warning.
+      - name: Every file that records the version must agree
+        if: steps.gate.outputs.changed == 'yes'
+        run: |
+          set -euo pipefail
+          V='${{ steps.gate.outputs.version }}'
+          fail=0
+          check() {
+            if [ "$2" = "$V" ]; then
+              echo "ok   - $1: $2"
+            else
+              echo "FAIL - $1: $2 (VERSION says $V)"
+              fail=1
+            fi
+          }
+          check "spec"      "$(sed -nE 's/^Version:[[:space:]]+(.*)/\1/p' packaging/obs/tpm-keyring-unlock.spec)"
+          check "dsc"       "$(sed -nE 's/^Version:[[:space:]]+([0-9.]+)-[0-9]+/\1/p' packaging/obs/tpm-keyring-unlock.dsc)"
+          check "PKGBUILD"  "$(sed -nE 's/^pkgver=(.*)/\1/p' packaging/aur/PKGBUILD)"
+          check "_service"  "$(sed -nE 's|.*archive/refs/tags/v([0-9.]+)\.tar\.gz.*|\1|p' packaging/obs/_service)"
+          check "changelog" "$(sed -nE '1s/^tpm-keyring-unlock \(([0-9.]+)-[0-9]+\).*/\1/p' packaging/obs/debian.changelog)"
+          [ "$fail" -eq 0 ] || { echo "Run scripts/bump-version.sh $V and commit the result." >&2; exit 1; }
+
+      - name: Tag v${{ steps.gate.outputs.version }}
+        if: steps.gate.outputs.changed == 'yes'
+        run: |
+          set -euo pipefail
+          V='${{ steps.gate.outputs.version }}'
+          if git rev-parse "v$V" >/dev/null 2>&1; then
+            echo "Tag v$V already exists - leaving it alone."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "v$V" -m "Release $V"
+          git push origin "v$V"
+
+      # OBS downloads this exact file, and so does the AUR - the checksum below
+      # is what `updpkgsums` would compute, printed here so publishing to the
+      # AUR later does not need the tag re-downloaded by hand.
+      - name: Wait for GitHub's tarball for the tag, and record its checksum
+        if: steps.gate.outputs.changed == 'yes'
+        run: |
+          set -euo pipefail
+          V='${{ steps.gate.outputs.version }}'
+          URL="https://github.com/${{ github.repository }}/archive/refs/tags/v$V.tar.gz"
+          for attempt in $(seq 1 30); do
+            if curl -fsSL "$URL" -o /tmp/release.tar.gz; then break; fi
+            echo "attempt $attempt: not available yet"
+            sleep 10
+          done
+          [ -s /tmp/release.tar.gz ] || { echo "Tarball never appeared at $URL" >&2; exit 1; }
+          SUM="$(sha256sum /tmp/release.tar.gz | cut -d' ' -f1)"
+          echo "### Release $V" >>"$GITHUB_STEP_SUMMARY"
+          echo "" >>"$GITHUB_STEP_SUMMARY"
+          echo "AUR \`sha256sums\` for this tag:" >>"$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`" >>"$GITHUB_STEP_SUMMARY"
+          echo "$SUM" >>"$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Publish to the Build Service
+        if: steps.gate.outputs.changed == 'yes'
+        env:
+          OSC_USERNAME: ${{ secrets.OSC_USERNAME }}
+          OSC_PASSWORD: ${{ secrets.OSC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${OSC_USERNAME:-}" ] || [ -z "${OSC_PASSWORD:-}" ]; then
+            echo "OSC_USERNAME / OSC_PASSWORD are not set - add them as repository secrets." >&2
+            exit 1
+          fi
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq osc >/dev/null
+          # Ephemeral runner, and the file is never written anywhere else.
+          mkdir -p ~/.config/osc
+          umask 077
+          cat >~/.config/osc/oscrc <<EOF
+          [general]
+          apiurl = https://api.opensuse.org
+          [https://api.opensuse.org]
+          user = $OSC_USERNAME
+          pass = $OSC_PASSWORD
+          credentials_mgr_class = osc.credentials.PlaintextConfigFileCredentialsManager
+          EOF
+          # Fixed path, not mktemp: the next step needs this working copy and
+          # guessing at a random directory name is a needless way to fail.
+          WORK="$RUNNER_TEMP/obs"
+          rm -rf "$WORK" && mkdir -p "$WORK"
+          cd "$WORK"
+          osc checkout "$OBS_PROJECT" "$OBS_PACKAGE"
+          cp "$GITHUB_WORKSPACE"/packaging/obs/* "$OBS_PROJECT/$OBS_PACKAGE/"
+          cd "$OBS_PROJECT/$OBS_PACKAGE"
+          osc addremove
+          osc commit -m "Release ${{ steps.gate.outputs.version }}"
+
+      # A green publish step only means the sources were accepted. This is the
+      # part that says whether anything actually built.
+      - name: Wait for the builds
+        if: steps.gate.outputs.changed == 'yes'
+        run: |
+          set -uo pipefail
+          cd "$RUNNER_TEMP/obs/$OBS_PROJECT/$OBS_PACKAGE"
+          timeout 2400 osc results --watch || true
+          RESULTS="$(osc results)"
+          echo "$RESULTS"
+          echo '```' >>"$GITHUB_STEP_SUMMARY"
+          echo "$RESULTS" >>"$GITHUB_STEP_SUMMARY"
+          echo '```' >>"$GITHUB_STEP_SUMMARY"
+          if echo "$RESULTS" | grep -qE "failed|unresolvable|broken"; then
+            echo "At least one target did not build." >&2
+            exit 1
+          fi
