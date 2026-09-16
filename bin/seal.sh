@@ -36,21 +36,60 @@ mkdir -p "$DATA_DIR"
 chmod 700 "$DATA_DIR"
 
 if [ -f "$DATA_DIR/seal.priv" ]; then
-  # Y/n like every other prompt in this tool; a failed read (no terminal)
-  # declines rather than overwriting a working seal. Answering yes no longer
-  # deletes anything here - the replacement is built in STAGE_DIR and only
-  # moved into place once it has proved it unseals.
-  read -rp "A sealed secret already exists at $DATA_DIR. Overwrite? [Y/n] " ans || exit 0
+  # Y/n like every other prompt in this tool, so install.sh stays a
+  # press-Enter-through run; a failed read (no terminal) declines rather than
+  # overwriting a working seal. Answering yes no longer deletes anything
+  # here - the replacement is built in STAGE_DIR and only moved into place
+  # once it has proved it unseals.
+  #
+  # What STAGE_DIR cannot catch is a typo: it proves the new object unseals to
+  # what was typed, not that what was typed is the keyring password. Type the
+  # same wrong password twice and a working enrollment is silently replaced by
+  # a useless one, which only shows up as the keyring not opening at the next
+  # login. Hence the warning - the recovery is just re-running this script
+  # with the right password.
+  echo "A sealed secret already exists at $DATA_DIR."
+  echo "Overwriting replaces it with whatever you type next; nothing here can"
+  echo "check that against your actual keyring password. If auto-unlock works"
+  echo "today and you did not mean to re-seal, answer n."
+  read -rp "Overwrite? [Y/n] " ans || exit 0
   [[ ! "$ans" =~ ^[Nn][Oo]?$ ]] || exit 0
 fi
 
-read -rsp "Password to seal (should match your GNOME login keyring password): " PASSWORD
+# IFS= on both reads, or the default IFS trims leading and trailing whitespace
+# off the password and seals a different secret than the one typed. Nothing
+# downstream catches that: both prompts trim identically, so the Confirm check
+# passes, and the self-test below compares the unsealed value against the
+# already-trimmed $PASSWORD, so it passes too. The only symptom would be the
+# keyring silently refusing to open at login. The delivery path preserves
+# whitespace (tpm2_unseal writes raw bytes; the PAM module strips at most one
+# trailing newline, which `read` cannot produce), so sealing it verbatim is
+# what makes the two ends agree.
+IFS= read -rsp "Password to seal (should match your GNOME login keyring password): " PASSWORD
 echo
-read -rsp "Confirm: " PASSWORD2
+IFS= read -rsp "Confirm: " PASSWORD2
 echo
 
 if [ "$PASSWORD" != "$PASSWORD2" ]; then
   echo "Passwords did not match." >&2
+  unset PASSWORD PASSWORD2
+  exit 1
+fi
+
+# A TPM seals at most MAX_SYM_DATA bytes (128 in the TPM 2.0 spec) into a
+# keyedhash object's sensitive area. Past that, tpm2_create fails far below
+# here with a raw TPM error code and no hint that length is the problem -
+# after the primary has already been persisted, which looks like the tool
+# broke rather than like the password being too long. Checked in bytes, not
+# characters: the limit is on bytes, and ${#var} counts characters under a
+# UTF-8 locale. The subshell only ever hands back the number - the password
+# itself stays in this process, never reaching a pipe, a file or an argv.
+MAX_SEALED_BYTES=128
+PW_BYTES=$(LC_ALL=C; printf %s "${#PASSWORD}")
+if [ "$PW_BYTES" -gt "$MAX_SEALED_BYTES" ]; then
+  echo "That password is $PW_BYTES bytes; a TPM can seal at most $MAX_SEALED_BYTES." >&2
+  echo "Shorten the keyring password (change it in Passwords and Keys first)," >&2
+  echo "then re-run this script. Nothing was changed." >&2
   unset PASSWORD PASSWORD2
   exit 1
 fi

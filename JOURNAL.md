@@ -4896,3 +4896,123 @@ Worth noting what went right: the same squash mechanic had already orphaned
 PR #12 (see the entry above), and both incidents were caught by checking what
 `main` actually contained rather than by trusting that a merged PR meant
 merged content. That check is cheap and belongs in the release routine.
+
+## Seven findings from an outside review, verified one by one (2026-09-16)
+
+A review of the repo done in a separate chat (screenshots pasted into the
+session, no access to this working tree) landed seven items: three runtime
+bugs, four documentation/UX ones. Nothing was taken on trust - each was
+checked against the code first, and all seven turned out to be real. What
+follows is the evidence for each and what was done about it.
+
+**1. `read -rsp` without `IFS=` trims the password** (`bin/seal.sh:47,49`).
+Default `IFS` strips leading and trailing whitespace, even into a single
+variable:
+
+    printf '  pass word  \n' | bash -c 'read -rsp "x" P; printf "[%s]\n" "$P"'
+    [pass word]
+    printf '  pass word  \n' | bash -c 'IFS= read -rsp "x" P; printf "[%s]\n" "$P"'
+    [  pass word  ]
+
+The reason this is worth an entry rather than a one-line fix: nothing in the
+script could have caught it. Both prompts trim identically, so the Confirm
+comparison passes; the self-test unseals and compares against the
+already-trimmed `$PASSWORD`, so that passes too. The seal is internally
+consistent and simply not the user's keyring password - visible only as the
+keyring silently not opening at the next login, i.e. exactly the
+"doesn't work, no idea why" class of failure. Fixed with `IFS=` on both
+reads. The delivery path was checked for symmetry before changing anything:
+`tpm2_unseal` writes raw bytes and the PAM module strips at most one trailing
+newline (which `read` cannot produce), so whitespace now survives end to end.
+
+**2. `waitpid()`'s result was never checked**
+(`pam/pam_tpm_keyring_authtok.c`). `int status = 0;` then a bare
+`waitpid(pid, &status, 0);`. If the call fails, `status` keeps its initial 0 -
+and `WIFEXITED(0)` is true with `WEXITSTATUS(0) == 0`, which is
+indistinguishable from a clean exit. The realistic way in is `ECHILD`: this
+module does not own the process it runs in, and a login process that reaps
+children itself or sets `SIGCHLD` to `SIG_IGN` collects the helper before we
+can. A helper killed mid-write would then have had its partial output injected
+into `PAM_AUTHTOK` as the keyring password. Now the result is checked, and
+anything other than `waited == pid` means the output is not used.
+
+Trade-off taken deliberately: on a host that auto-reaps, auto-unlock switches
+itself off rather than trusting output it cannot pair with an exit status. The
+module is `optional` and always returns `PAM_IGNORE`, so nothing about login
+changes, and the refusal is logged at `LOG_ERR` with the `waitpid()` errno, so
+it is diagnosable from the journal. Rejected the alternative of forcing
+`SIGCHLD` to `SIG_DFL` around the fork to guarantee we can reap: it works, but
+restoring `SIG_IGN` afterwards does not retroactively reap children that
+exited during the window, so it would leak zombies into the host login
+process - a worse side effect than the feature declining to run.
+
+**3. The timeout could leave the helper running** (same file). `kill()` was
+issued before `waitpid()` only. If the alarm lands while the parent is already
+blocked in `waitpid()` - the helper closed stdout or filled the 4095-byte
+buffer without exiting, so the read loop ended first - `waitpid()` returns
+`EINTR`, the module returns `PAM_IGNORE`, and the helper keeps running past
+its own deadline with a TPM session open. Now: kill on the way through the
+`EINTR` branch and wait again. `alarm()` is one-shot, so the retry cannot be
+interrupted a second time.
+
+**Regression test with teeth for 2 and 3.** Added
+`test/fixtures/pam_autoreap_children.c`, a test-only module that sets
+`SIGCHLD` to `SIG_IGN`, plus a `tpmtest-autoreap` service in
+`test/runtime-test.sh` that stacks it above the real module - which reproduces
+`ECHILD` exactly as a real login process would cause it. The fixture also had
+to be added to `test/distro/Dockerfile.runtime`, which copies fixtures file by
+file rather than by directory (first run failed with
+`cc1: fatal error: /src/test/fixtures/pam_autoreap_children.c: No such file or
+directory`).
+
+The test was then proved to actually catch the bug, rather than just passing
+next to it, by building the same container against `git show HEAD:pam/...`:
+
+    FAIL - PAM_AUTHTOK stays empty when the child's exit status is unknowable
+           (got: unit-test-fake-password-do-not-use, want: )
+
+Against the fixed module the whole runtime suite passes, and so does
+`test/unit-regex-test.sh`.
+
+**4. The README described a step the installer already performs.** It told
+users to run `bin/seal.sh` after `./install.sh`, but `install.sh` calls it
+itself (`tpm_run "$REPO_DIR/bin/seal.sh"`). Following the README is worse than
+redundant: the installer ran its TPM steps inside `sg tss`, so a freshly-added
+user's own shell has no `tss` group yet and the manual run dies with
+`Can't read TPM PCRs` - which reads as the tool being broken right after a
+successful install. README and `CONTRIBUTING.md` now say the installer runs
+it, and that running it by hand is the *re-seal* path (Secure Boot change,
+keyring password change), with that group caveat spelled out.
+
+**5. The plan printed by `install.sh` listed "Seal" before "Compile/install",
+while the run does the reverse.** Cosmetic, but the plan is presented as an
+exact description of what will happen, so it was reordered to match.
+
+**6. Overwrite default stays `[Y/n]` - rejected the review's suggestion.** The
+finding itself is correct: staging protects against a broken TPM object, not
+against a typo, and a wrong password typed identically twice replaces a
+working enrollment with a useless one. But defaulting to `N` was rejected by
+the repo owner on a standing UX requirement - the installer has to stay a
+press-Enter-through run, and this prompt is part of it. Mitigated in the other
+direction instead: the prompt now states plainly, before asking, that nothing
+here can check what you type against the actual keyring password, and that
+`n` is the answer if auto-unlock works today. Recovery is just re-running the
+script, so the cost of the wrong answer is low and now visible.
+
+**7. No length check before `tpm2_create`.** A TPM seals at most
+`MAX_SYM_DATA` (128 bytes) into a keyedhash object's sensitive area. A longer
+passphrase failed deep inside the script with a raw TPM error code and no hint
+that length was the problem - after the primary had already been persisted.
+Checked up front now, in bytes rather than characters (`${#var}` counts
+characters under a UTF-8 locale, and the TPM limit is on bytes):
+
+    PW_BYTES=$(LC_ALL=C; printf %s "${#PASSWORD}")
+
+The command substitution forks, so the byte count is computed in a subshell -
+but only the number ever comes back, and the password itself still never
+reaches a pipe, a file or an argv.
+
+**Note for anyone picking this up on a machine with the tool installed:** the
+module change only takes effect after `./install.sh` is re-run, which is what
+rebuilds and reinstalls the `.so`. The copy in `pam/` is a gitignored build
+artifact, not what PAM loads.

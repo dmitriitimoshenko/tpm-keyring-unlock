@@ -379,16 +379,16 @@ if [ "$NEED_TSS_ADD" = true ]; then
   echo "     picks the new group up without a logout."
   n=$((n + 1))
 fi
+echo "  $n. Compile the PAM helper module and install it + its helper script"
+echo "     (needs sudo)."
+n=$((n + 1))
+echo "  $n. Mask systemd's eager gnome-keyring-daemon startup, if present."
+n=$((n + 1))
 if [ "$RESEAL" = true ]; then
   echo "  $n. Re-seal (overwrite) the existing sealed secret at $DATA_DIR."
 else
   echo "  $n. Seal your keyring password into the TPM."
 fi
-n=$((n + 1))
-echo "  $n. Compile the PAM helper module and install it + its helper script"
-echo "     (needs sudo)."
-n=$((n + 1))
-echo "  $n. Mask systemd's eager gnome-keyring-daemon startup, if present."
 n=$((n + 1))
 if [ "$UNLIMIT_FPRINTD" = true ]; then
   echo "  $n. Rewrite the pam_fprintd.so auth line into $PAM_FPRINTD_ATTEMPTS attempts, each"

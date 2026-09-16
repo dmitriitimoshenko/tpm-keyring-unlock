@@ -37,16 +37,18 @@ change, and the exact PAM diffs it would apply, with every file backed up. It
 asks once before touching anything, and Enter accepts. It will not run without
 a terminal.
 
-Then seal your keyring password:
-
-```bash
-bin/seal.sh
-```
-
-You type the password into the terminal. It is never written to disk
-unencrypted and never passed as a command-line argument.
+Sealing the keyring password is part of that run: the installer calls
+`bin/seal.sh` itself, which asks for the password in this same terminal. You
+type it there. It is never written to disk unencrypted and never passed as a
+command-line argument.
 
 Log out and back in to test.
+
+You only run `bin/seal.sh` yourself to **re-seal** later - after a Secure Boot
+change, or after changing the keyring password. Straight after a first install
+it may refuse with `Can't read TPM PCRs`: the installer ran the TPM steps
+inside `sg tss`, and your own shell only picks up the new group membership
+after a logout.
 
 ## What this protects, and what it doesn't
 

@@ -179,8 +179,33 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc,
         kill(pid, SIGKILL);
     }
 
+    /* Both the retry and the return value matter here.
+     *
+     * The alarm can land while this process is already blocked in waitpid()
+     * rather than in read() - the helper closes stdout or fills buf without
+     * exiting, read() ends, and the timeout only arrives afterwards. The
+     * single unchecked call this replaces then returned on EINTR having
+     * killed nothing, leaving the helper running past its own deadline with
+     * a TPM session still open. So kill on the way through and wait again;
+     * alarm() is one-shot, so the retry cannot be interrupted a second time.
+     *
+     * And the result has to be checked, not just the status: `status` stays
+     * as initialised if waitpid() fails, and 0 reads back as
+     * WIFEXITED/WEXITSTATUS == 0 - a clean exit. ECHILD is the realistic way
+     * in, because the host process is not ours: a login process that reaps
+     * children itself, or has SIGCHLD set to SIG_IGN, can collect this child
+     * before we do. A helper killed mid-write would then be mistaken for a
+     * successful one and whatever partial output it managed injected as the
+     * keyring password. Without a confirmed exit status, buf is not
+     * trusted. */
     int status = 0;
-    waitpid(pid, &status, 0);
+    pid_t waited;
+    do {
+        waited = waitpid(pid, &status, 0);
+        if (waited < 0 && errno == EINTR && g_timed_out) {
+            kill(pid, SIGKILL);
+        }
+    } while (waited < 0 && errno == EINTR);
 
     alarm(0);
     sigaction(SIGALRM, &old_sa, NULL);
@@ -189,6 +214,15 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc,
         pam_syslog(pamh, LOG_ERR,
                    "tpm-keyring-unseal helper timed out after %ds, killed",
                    HELPER_TIMEOUT_SECS);
+        memset(buf, 0, sizeof(buf));
+        return PAM_IGNORE;
+    }
+
+    if (waited != pid) {
+        pam_syslog(pamh, LOG_ERR,
+                   "waitpid() for the tpm-keyring-unseal helper failed: %s - "
+                   "its exit status is unknown, so its output is not used",
+                   strerror(errno));
         memset(buf, 0, sizeof(buf));
         return PAM_IGNORE;
     }
