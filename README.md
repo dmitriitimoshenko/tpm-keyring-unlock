@@ -268,23 +268,36 @@ have tested.
 
    `sudo -i` reads `/etc/pam.d/sudo-i` instead. Give it the same line if you
    use it.
-3. For polkit, copy the vendor file into `/etc/pam.d`, where it overrides the
-   original, and add the same line above its `@include common-auth`. If
-   `/etc/pam.d/polkit-1` already exists, edit that one instead.
+3. For polkit, add the same line above the `@include common-auth` in
+   `/etc/pam.d/polkit-1`. Where polkit ships its file in `/usr/lib/pam.d`
+   instead (Ubuntu 24.04 and later, Debian 12), copy it over first. The copy
+   in `/etc/pam.d` then replaces the vendor file. The command leaves an
+   existing `/etc/pam.d/polkit-1` alone:
 
    ```bash
-   sudo cp /usr/lib/pam.d/polkit-1 /etc/pam.d/polkit-1
+   [ -e /etc/pam.d/polkit-1 ] || sudo cp /usr/lib/pam.d/polkit-1 /etc/pam.d/polkit-1
    ```
 
 4. Test with `sudo -k; sudo true` and with `pkexec true` or any polkit
    dialog. Both should ask for a finger.
 
-Two things come with it. `/etc/pam.d/sudo` is a package configuration file,
-so a `sudo` upgrade that changes it will ask which version to keep. And
-`/etc/pam.d/polkit-1` replaces the vendor file for good: polkit updates to
-`/usr/lib/pam.d/polkit-1` stop reaching you until you delete the copy. To
-undo, remove the line again, `sudo rm /etc/pam.d/polkit-1`, and re-enable
-the profile if you want it back.
+A few things come with it:
+
+- `/etc/pam.d/sudo` is a package configuration file, so a `sudo` upgrade that
+  changes it will ask which version to keep.
+- A copied `/etc/pam.d/polkit-1` replaces the vendor file for good. polkit
+  updates to `/usr/lib/pam.d/polkit-1` stop reaching you until you delete the
+  copy.
+- If the profile comes back later (from GNOME Settings, `pam-auth-update` or
+  `uninstall.sh`), `sudo` and polkit try the reader twice before the password:
+  their own line first, then the one in `common-auth`. `uninstall.sh` names
+  the services this applies to before it asks.
+
+To undo, remove the line you added from each file. Delete
+`/etc/pam.d/polkit-1` only if step 3 created it as a copy. On releases that
+ship that file themselves, such as Ubuntu 22.04, it belongs to the package,
+and deleting it loses it for good. Re-enable the profile afterwards if you want
+it back.
 
 `gdm-password` stays password-only this way, so the gap described above stays
 closed.

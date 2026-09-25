@@ -5617,6 +5617,12 @@ Results (`both` = `/etc/pam.d`, then `/usr/lib/pam.d`):
     Fedora 44      1.7.2    both      both (auth include,     -                   stack fails
                                       auth substack)
 
+**[Corrected 2026-09-26, review of PR #20: the last column holds for
+`@include` only. There, a missing file fails the whole service ("Initialization
+failure", even with `auth sufficient pam_permit.so` above it). A missing `auth
+include` or `auth substack` target fails only at its own line. Either way
+nothing gets in through it. See the 2026-09-26 entry.]**
+
 On Fedora `@include` is not recognised at all (it failed even with an absolute
 path). It is the Debian spelling, and Fedora's stacks use `auth include`. In
 every case the `/etc/pam.d` copy of a name won over the vendor copy, for
@@ -5643,7 +5649,9 @@ knows `/usr/etc/pam.d`; Arch keeps `systemd-user` and `systemd-run0` there.
   question from it. The question is asked from two places (the plan, and the
   end-of-run check), so it lives in one function, `fprintd_conflict_question`.
   uninstall.sh's "re-enabling puts fingerprint back for..." uses the same
-  phrase.
+  phrase. **[Superseded 2026-09-26: the question moved into `bin/lib.sh` as
+  `pam_fprintd_conflict_question`, where it is tested. install.sh's
+  `fprintd_conflict_offer` now prints the cost above it at both call sites.]**
 - `sudo -i` really is a separate service with sudo-rs, checked rather than
   assumed. In an `ubuntu:26.04` container, with a `pam_permit` stand-in added
   to `/etc/pam.d/sudo` and a `pam_deny` one to `/etc/pam.d/sudo-i`:
@@ -5658,7 +5666,11 @@ makes; install.sh itself needs a TPM and was not run there:
     GDM and the lock screen keep fingerprint. All 9: chfn chsh login other remote su sudo sudo-i polkit-1
     Fix the lock screen? Fingerprint stops being offered in sudo and polkit prompts. [Y/n]
 
-On this machine the phrase is "sudo -i and polkit".
+On this machine the phrase is "sudo -i and polkit". **[Superseded
+2026-09-26: the list above still misses su-l, reached through `auth include
+su`. "GDM and the lock screen keep fingerprint" was an unchecked claim sitting
+in front of a list that names gdm-password. Both are fixed in the 2026-09-26
+entry, which has the new output.]**
 
 Tests: a fixture tree `test/fixtures/pam.d/vendor/`, with `etc/` standing in
 for `/etc/pam.d` and `usr-lib/` for `/usr/lib/pam.d`. `sudo`, `sudo-i`,
@@ -5667,7 +5679,11 @@ Ubuntu 26.04 packages, and `systemd-user` is systemd's. It adds a `shadowed`
 pair, a name in both directories where only the `/etc/pam.d` copy may count.
 `shared/` gains the stock `sudo-i`, so the tree that models this machine now
 loses fingerprint for `sudo -i`, as the real one does. Every new check fails
-against `main`'s `bin/lib.sh`.
+against `main`'s `bin/lib.sh`. **[Corrected 2026-09-26, review of PR #20: not
+every one. That suite run with `main`'s `lib.sh` gives 166 ok and 11 FAIL out
+of 177. Checks such as "is not listed", "a name found in no directory fails"
+and "reading /etc/pam.d alone misses polkit" pass against the old code too, by
+construction. The 11 that fail are the ones that pin the fix.]**
 
 ### Rejected: having the installer add fingerprint to sudo and polkit
 
@@ -5706,7 +5722,7 @@ reasons:
   its own.
 - `test/unit-regex-test.sh` sets `trap ... EXIT` three times, each replacing
   the last, so its `WORKDIR` and `HANDLE_TREE` temp directories are never
-  removed.
+  removed. **[Fixed 2026-09-26: one trap, one list of directories.]**
 - Unrelated to the issue, seen while reading uninstall.sh: its root-side
   dependents scan sources `"$REPO_DIR/bin/lib.sh"` rather than `"$LIB_SH"`.
   In a packaged install, lib.sh sits flat beside `deconfigure.sh`, so that
@@ -5714,3 +5730,133 @@ reasons:
   primary is never evicted from that path. It fails closed, so it is safe,
   but it is a bug of its own.
 
+
+## The cost, reviewed: every way a service reaches common-auth, and a question that is never bare (2026-09-26, review of PR #20)
+
+A `max`-effort review of PR #20 came back with 15 findings, 11 confirmed and 4
+plausible. The repo owner then split the work into two pull requests. This one
+keeps to issue #19: what disabling the fprintd profile costs, and how the
+installer says so. A second one takes the insertion-point check. So commit
+216c544 (fail-closed include resolution) was taken out of this branch with an
+ordinary `git revert`, not a force-push, and nothing on a published branch was
+rewritten. The second pull request re-applies it.
+
+### What libpam accepts, measured
+
+Several findings rested on libpam reading PAM lines more liberally than this
+tool did. Each claim was checked with pamtester, in the same kind of throwaway
+containers as the 2026-09-25 entry, before anything was built on it. One
+lesson from the first attempt: libpam lowercases the *service name*, so a
+probe file called `P01` is never read. Every probe then fell through to
+`other` and "failed" alike, which looked like a finding and was not. Results:
+
+                                                   Debian 12  Ubuntu 24.04  Ubuntu 26.04  Fedora 44
+                                                   1.5.2      1.5.3         1.7.0         1.7.2
+    @include X # comment, @include X extra words   included   included      included      (1)
+    auth include X # comment, -auth include X      included   included      included      included
+    AUTH, SUFFICIENT, auth Include, auth Substack  honoured   honoured      honoured      honoured
+    @INCLUDE X                                     included   included      included      (1)
+    [SUCCESS=DONE DEFAULT=DIE]                     not honoured anywhere: bracket values are case-sensitive
+    absolute module path                           loaded     loaded        loaded        loaded
+    `# ... \` or `... \ # ...`                     the comment is cut first, and the line never continues
+    `\` followed by trailing spaces                continues  continues     continues     continues
+    comment or blank line inside a continuation    skipped,   skipped,      ends the      ends the
+                                                   carries on carries on    logical line  logical line
+    @include of a missing file                     the service fails to initialise    (1)
+    auth include/substack of a missing file        fails at that line only, everywhere
+    service file with no auth line                 authenticated with "other"'s auth phase,
+      (session-only, empty, /dev/null)             everywhere
+
+(1) Fedora does not know `@include` at all. It skips the line, so even a
+missing target goes unnoticed there.
+
+Two of these matter beyond this pull request, and they are recorded for the
+second one. Bracket values must not be case-folded by anything that models
+libpam. And a continuation that runs into a comment or blank line means
+different things on 1.5 and 1.7, so no single line model is right for both.
+
+### What changed here
+
+- **Every way a service reaches the shared stack is counted.** The loser list
+  used to match a literal lowercase `@include common-auth` to end of line. It
+  now walks the auth phase through all three include forms (`@include`, `auth
+  include`, `auth substack`), in any case, with comments cut off, and through
+  other files. `_pam_include_target()` reads the include out of a line. On a
+  stock Ubuntu 26.04 that adds su-l (`auth include su`) and gdm's smartcard
+  stacks (`auth substack common-auth`). On this machine the list goes from 12
+  to 17 services: su-l plus four gdm-smartcard stacks. A service keeps fingerprint when a pam_fprintd line sits anywhere on
+  its walk outside the shared stack, including in a file it includes.
+- **A service with no auth phase is answered for `other`.** That is what
+  libpam does (last row above). It matters for the question, not the list: a
+  session-only `polkit-1` loses fingerprint exactly when `other` does, so the
+  question names polkit then. The list itself shows only files with an auth
+  phase of their own; otherwise `common-session` and friends would appear as
+  "services".
+- **An unreadable service file counts as a loss.** It used to vanish from the
+  cost and print "Permission denied" into it. For a cost stated in a question
+  that defaults to yes, overstating is the safe mistake.
+- **The cost is printed at both call sites, and the question is never bare
+  while something is lost.** `fprintd_conflict_offer` in install.sh prints the
+  cost and asks, from the plan and from the end-of-run check. Before this, the
+  end-of-run check asked with no list above it, and with no sudo or polkit
+  among the losses the question degraded to a bare "Fix the lock screen?".
+  `pam_fprintd_conflict_question` now falls back to the number of services
+  listed above it. It moved to `bin/lib.sh`, where it is tested.
+- **"GDM and the lock screen keep fingerprint" is gone.** It was an unchecked
+  claim, printed right in front of a list that names gdm-password. In its
+  place the installer names the stacks that do keep fingerprint, the ones
+  carrying the attempt stack or about to: "Fingerprint stays in
+  gdm-fingerprint, which gets the extra attempts."
+- **uninstall.sh says what re-enabling gives back, and what it doubles.** It
+  prints the computed list instead of "(polkit prompts, login, su)". It also
+  names the services that would try the reader twice: the ones with a
+  fingerprint line of their own that still reach the shared stack, which is
+  exactly what README's recipe leaves behind. On this machine that is `sudo`.
+- **README's recipe no longer deletes a package's file.** The undo used to say
+  `sudo rm /etc/pam.d/polkit-1` unconditionally. On Ubuntu 22.04, polkitd
+  0.105-33ubuntu0.2 ships `/etc/pam.d/polkit-1` itself, as a conffile
+  (checked in an `ubuntu:22.04` container). A user who edited it per step 3
+  and then undid the recipe would delete the distribution's file, and dpkg
+  does not bring back a conffile the admin removed. The copy step is now
+  guarded with `[ -e ] ||`, and the undo says to delete the file only if step
+  3 created it.
+- **Tests clean up after themselves, and run from any checkout path.** The
+  three `trap ... EXIT` lines are now one trap over a list of directories. A
+  checkout path containing a colon gets its fixtures copied to one without, so
+  the colon-separated search paths still parse. Checked from a path with a
+  colon and from one with a space.
+
+### The fixture trees
+
+`test/fixtures/pam.d/vendor/` is now the stock Ubuntu 26.04 layout in earnest.
+Every file but the `shadowed` pair is byte for byte what the packages install:
+sudo-common, util-linux, login, libpam-runtime, gdm3 50.1, polkitd and systemd.
+`common-auth` is exactly what `pam-auth-update --enable fprintd` writes there.
+Its `gdm-password` used to be a synthetic five-line copy of `shared/`'s, and
+the review caught the test calling it "the stock one". It is the real one now.
+`test/fixtures/pam.d/forms/` holds the non-stock spellings: `auth include`
+from sudo, a comment after `@include`, upper case, a dashed substack, a
+two-file chain, a fingerprint line reached through an include, and a polkit
+with no auth phase.
+
+219 checks. 25 of them fail against e64c054's `lib.sh`, the state this pull
+request had before the review. That count is exact on purpose, after the
+2026-09-25 entry overstated it: the "is not listed" and "no include in" checks
+pass against the old code too, by construction, because they pin that the
+wider walk does not over-count.
+
+### Moved to the second pull request
+
+Everything about the insertion-point check:
+
+- the fail-closed include resolution (216c544, re-applied);
+- the four ways its line parsing differs from libpam (a comment or extra words
+  after `@include`, a backslash inside a comment, keyword case, absolute
+  module paths);
+- a read error after the `-f && -r` pre-check;
+- re-validating stacks that were wired before the check existed;
+- tests for the nested include branch, which a mutant turned fail-open without
+  a single check noticing.
+
+Backups piling up in `/etc/pam.d` stay a separate change, as recorded on
+2026-09-25.

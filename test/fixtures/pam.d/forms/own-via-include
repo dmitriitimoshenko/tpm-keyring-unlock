@@ -1,0 +1,5 @@
+#%PAM-1.0
+# Its own fingerprint line lives in an included file that is not the shared
+# stack - README's recipe written as a snippet. It still counts as its own.
+@include fp-snippet
+@include common-auth

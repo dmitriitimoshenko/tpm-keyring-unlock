@@ -1,0 +1,4 @@
+#%PAM-1.0
+# Reaches the shared stack only through chain-mid, the way Ubuntu's su-l
+# reaches it only through `auth include su`.
+auth    include    chain-mid

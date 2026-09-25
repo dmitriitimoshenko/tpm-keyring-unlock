@@ -1,0 +1,3 @@
+#%PAM-1.0
+# libpam compares the type and the control without regard to case.
+AUTH    INCLUDE    common-auth

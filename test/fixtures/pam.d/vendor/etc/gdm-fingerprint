@@ -1,7 +1,7 @@
 #%PAM-1.0
 auth    requisite       pam_nologin.so
 auth	required	pam_succeed_if.so user != root quiet_success
-@include common-auth
+auth	required	pam_fprintd.so
 auth    optional        pam_gnome_keyring.so
 @include common-account
 # SELinux needs to be the first session rule. This ensures that any 
@@ -22,4 +22,4 @@ session required        pam_env.so readenv=1
 session required        pam_env.so readenv=1 user_readenv=1 envfile=/etc/default/locale
 @include common-session
 session optional        pam_gnome_keyring.so auto_start
-@include common-password
+password required       pam_fprintd.so

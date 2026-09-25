@@ -1,0 +1,5 @@
+#%PAM-1.0
+# A fingerprint line of its own, below the include: it keeps fingerprint
+# without the shared stack, and with it tries the reader twice.
+@include common-auth
+auth    sufficient    pam_fprintd.so

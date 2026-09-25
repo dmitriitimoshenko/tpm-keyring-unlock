@@ -1,0 +1,5 @@
+#%PAM-1.0
+# sudo reaching the shared stack through `auth include` rather than
+# `@include`: it loses fingerprint all the same, and has to be named.
+auth       include    common-auth
+@include common-account
