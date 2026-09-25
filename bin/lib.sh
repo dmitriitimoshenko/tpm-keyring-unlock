@@ -966,16 +966,10 @@ PAM_PRIMARY_AUTH_RE='^[[:space:]]*-?auth[[:space:]]+(\[[^]]*\]|[^[:space:]]+)[[:
 # whose keyring line comes before `@include common-auth` puts the whole of
 # common-auth - pam_unix.so with try_first_pass and all - underneath our
 # module.
-#
-# $2 is the search path includes are resolved against (PAM_CONFIG_PATH).
 _pam_stack_authenticates() {
-  local f="$1" path="${2:-$PAM_CONFIG_PATH}" depth="${3:-0}"
-  local line inc inc_file
-  # A file that cannot be read answers "yes", for the same reason the depth
-  # cap below does. Until 2026-09-25 a missing file answered "no" - and an
-  # include looked up in /etc/pam.d alone is missing exactly when libpam finds
-  # it in /usr/lib/pam.d instead, so a pam_unix.so there read as safe.
-  { [ -f "$f" ] && [ -r "$f" ]; } || return 0
+  local f="$1" dir="${2:-/etc/pam.d}" depth="${3:-0}"
+  local line inc
+  [ -f "$f" ] || return 1
   # Include loops are legal to write and would otherwise hang an installer on
   # a login path; libpam caps recursion, so cap it here too. Hitting the cap
   # reports "yes, this authenticates" on purpose - the honest answer is "could
@@ -992,11 +986,7 @@ _pam_stack_authenticates() {
     else
       continue
     fi
-    # Found nowhere is "could not tell" too. libpam fails a stack whose
-    # include it cannot load, so refusing one costs nothing - and it is also
-    # what an include from a directory this tool does not model looks like.
-    inc_file="$(pam_config_file "$inc" "$path")" || return 0
-    ! _pam_stack_authenticates "$inc_file" "$path" "$((depth + 1))" || return 0
+    ! _pam_stack_authenticates "$dir/$inc" "$dir" "$((depth + 1))" || return 0
   done < <(_pam_logical_lines "$f")
   return 1
 }
@@ -1014,13 +1004,10 @@ _pam_stack_authenticates() {
 # libpam - it does not reason about control flags or jumps, and it treats any
 # primary auth module below as disqualifying whether or not it actually
 # carries try_first_pass, because `optional` ordering is not worth splitting
-# hairs over on a login path. An include below that cannot be resolved or read
-# is disqualifying too (see _pam_stack_authenticates).
-#
-# $2 is the search path includes are resolved against (PAM_CONFIG_PATH).
+# hairs over on a login path.
 pam_auth_insertion_point_is_safe() {
-  local f="$1" path="${2:-$PAM_CONFIG_PATH}"
-  local line inc inc_file seen_keyring=0
+  local f="$1" dir="${2:-/etc/pam.d}"
+  local line inc seen_keyring=0
   [ -f "$f" ] || return 1
   grep -qE "$PAM_GNOME_KEYRING_AUTH_RE" < <(_pam_logical_lines "$f") || return 1
   while IFS= read -r line; do
@@ -1038,8 +1025,7 @@ pam_auth_insertion_point_is_safe() {
     else
       continue
     fi
-    inc_file="$(pam_config_file "$inc" "$path")" || return 1
-    ! _pam_stack_authenticates "$inc_file" "$path" 1 || return 1
+    ! _pam_stack_authenticates "$dir/$inc" "$dir" 1 || return 1
   done < <(_pam_logical_lines "$f")
   return 0
 }

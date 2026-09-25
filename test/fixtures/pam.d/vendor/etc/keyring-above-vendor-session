@@ -1,7 +1,0 @@
-#%PAM-1.0
-# Same shape, but what the vendor directory holds under that name has no
-# auth-phase module at all - so following the include into /usr/lib/pam.d
-# must still come back safe, not refuse everything that lives there.
-auth    required        pam_permit.so
-auth    optional        pam_gnome_keyring.so
-@include vendor-session
