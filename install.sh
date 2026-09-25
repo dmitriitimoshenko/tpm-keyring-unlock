@@ -251,8 +251,10 @@ targets=()
 # Our module sets PAM_AUTHTOK from the TPM before anyone has authenticated, so
 # anything down there that takes its password from PAM_AUTHTOK instead of
 # prompting would let a login through on a secret nobody typed. Collected
-# separately and reported, never patched. See bin/lib.sh's
-# pam_auth_insertion_point_is_safe and JOURNAL.md, 2026-09-15.
+# separately and reported, never patched. An include down there that cannot
+# be found or read counts too: "could not look" is not "nothing there". See
+# bin/lib.sh's pam_auth_insertion_point_is_safe and JOURNAL.md, 2026-09-15
+# and 2026-09-25.
 unsafe_targets=()
 for c in "${candidates[@]}"; do
   if grep -q pam_tpm_keyring_authtok.so "$c"; then continue; fi
@@ -413,7 +415,8 @@ if [ "${#unsafe_targets[@]}" -gt 0 ]; then
   echo
   echo "  !! NOT wiring $(pam_names "${unsafe_targets[@]}"):"
   echo "     a password module sits below their keyring auth line, which"
-  echo "     try_first_pass could turn into a login on a secret nobody typed."
+  echo "     try_first_pass could turn into a login on a secret nobody typed"
+  echo "     (or an include below it could not be followed to rule that out)."
 fi
 echo
 
@@ -616,7 +619,8 @@ else
     # skipped on a stale plan - getting it wrong writes a login bypass.
     if ! pam_auth_insertion_point_is_safe "$TARGET"; then
       echo "$TARGET has a password module below its pam_gnome_keyring.so auth" >&2
-      echo "line - left untouched (see the note printed above)." >&2
+      echo "line, or an include there that can't be followed - left untouched" >&2
+      echo "(see the note printed above)." >&2
       continue
     fi
     backup_pam_file "$TARGET"

@@ -5714,3 +5714,76 @@ reasons:
   primary is never evicted from that path. It fails closed, so it is safe,
   but it is a bug of its own.
 
+## The insertion-point check failed open on an include it could not find (2026-09-25, same investigation)
+
+Found by following the `/usr/lib/pam.d` thread above through the rest of
+`bin/lib.sh`. `_pam_stack_authenticates()` resolved every include as
+`/etc/pam.d/<name>` and began with
+
+    [ -f "$f" ] || return 1      # "this does not authenticate"
+
+That predicate is the one deciding whether anything *below* the inserted line
+could turn the TPM-unsealed `PAM_AUTHTOK` into a login (see "The installer
+never checked what runs *above* the line it inserts", 2026-09-15). "Not found"
+is exactly what an include looks like when libpam finds it in `/usr/lib/pam.d`
+instead, and libpam 1.5.3 and later does (table in the entry above). So an
+include below the keyring line, whose target lived only in the vendor
+directory and carried `pam_unix.so try_first_pass`, was called safe to wire.
+The function's own comment said that giving up has to answer "yes"; the
+missing-file path answered "no". An absolute include path failed the same way,
+glued onto the directory as `/etc/pam.d//abs/path`, and so did an include that
+exists but cannot be read by the user running install.sh.
+
+It was not reachable on any stack this tool has been pointed at. It needs a
+vendor-only include placed *below* a keyring line, and on this machine, and on
+a stock Ubuntu 26.04 container with gdm3's PAM files unpacked into it, every
+include below a keyring line resolves in `/etc/pam.d` (`common-account`,
+`common-session`, `common-password`). But the direction of the error is the one
+this predicate exists to rule out, so it is fixed rather than noted.
+
+### The fix, and why it holds on every libpam measured
+
+Includes are resolved with `pam_config_file()` on `PAM_CONFIG_PATH`, absolute
+names as they stand. Anything that cannot be found or read counts as "could
+authenticate", which means refused:
+
+- On libpam 1.5.3 and later the resolution is exact.
+- On Debian 12's 1.5.2, which does not look in `/usr/lib/pam.d` for includes,
+  the walk may inspect a vendor file libpam would never load. That is
+  conservative in both outcomes. If the file holds a password module it is
+  refused. If it holds none, libpam cannot load the include anyway, and a
+  failed include fails the stack, so nothing gets in through it.
+- A name found nowhere, including in a directory this tool does not model
+  (openSUSE's `/usr/etc/pam.d`), is refused. libpam fails such a stack
+  outright ("include found nowhere" in the table), so refusing it takes
+  nothing away.
+
+The only cost is on fixtures. `shared/gdm-password` has `@include
+common-account` below its keyring line, and `shared/` had no `common-account`,
+so the tree that models this machine would have been refused. Every real
+`/etc/pam.d` has that file, and now the fixture tree does too. The installer's
+two "not wiring" messages now mention the include case, so a refusal for that
+reason is not reported as "a password module sits below".
+
+### Verified
+
+    this machine, all 7 candidates, old predicate vs new    same verdict (safe) for every one
+    stock Ubuntu 26.04 + gdm3's PAM files, 6 candidates      all safe; gdm-fingerprint still eligible
+                                                             for the attempt stack
+
+New checks, each failing against `main`'s `bin/lib.sh`:
+
+- `ordering/unsafe-include-missing`: an include found nowhere is refused.
+- `vendor/etc/keyring-above-vendor-auth`: `pam_unix.so` reached through a
+  vendor-only include is refused, and so is the same file judged from
+  `/etc/pam.d` alone.
+- An absolute `@include` below the keyring line is followed and refused.
+- An unreadable include is refused. This check is skipped as root, which
+  reads a mode-000 file regardless.
+
+These pass on both old and new, and have to:
+
+- `vendor/etc/keyring-above-vendor-session`: a vendor-only include with no
+  auth module is still accepted.
+- The stock Ubuntu 26.04 `gdm-password` is still accepted, resolved across
+  both directories.

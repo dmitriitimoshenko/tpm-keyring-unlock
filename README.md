@@ -178,7 +178,9 @@ patches every `/etc/pam.d/` service with an auth-phase `pam_gnome_keyring.so`
 line, because `gdm-password` can also succeed via fingerprint once you enable
 it system-wide. It refuses to patch a stack where a password module runs
 *below* the insertion point, since that would let a token nobody typed
-authenticate a login.
+authenticate a login. Includes are followed the way libpam follows them, into
+`/usr/lib/pam.d` as well, and one that cannot be found or read counts as a
+reason to refuse.
 
 ## The fingerprint reader dropping out mid-prompt
 

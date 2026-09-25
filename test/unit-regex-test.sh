@@ -664,7 +664,8 @@ for f in safe-direct safe-include safe-substack safe-continued \
   check "insertion point accepted: $f" "$got" "safe"
 done
 
-for f in unsafe-keyring-first unsafe-unix-below unsafe-substack-below loop-below; do
+for f in unsafe-keyring-first unsafe-unix-below unsafe-substack-below loop-below \
+         unsafe-include-missing; do
   if pam_auth_insertion_point_is_safe "$ORDERING/$f" "$ORDERING"; then
     got=safe
   else
@@ -684,6 +685,73 @@ else
   got=refused
 fi
 check "a real @include-based gdm-password stack is still accepted" "$got" "safe"
+
+if pam_auth_insertion_point_is_safe "$VENDOR/etc/gdm-password" "$VENDOR_PATH"; then
+  got=safe
+else
+  got=refused
+fi
+check "...and so is the stock Ubuntu 26.04 one, resolved across both directories" \
+  "$got" "safe"
+
+# An include below the insertion point is looked up where libpam looks it up:
+# /etc/pam.d, then /usr/lib/pam.d, where libpam >= 1.5.3 finds includes too
+# (measured; JOURNAL.md, 2026-09-25). Until then a name missing from
+# /etc/pam.d answered "nothing below authenticates", so a vendor-only include
+# carrying pam_unix.so try_first_pass was called safe to wire.
+if pam_auth_insertion_point_is_safe "$VENDOR/etc/keyring-above-vendor-auth" "$VENDOR_PATH"; then
+  got=safe
+else
+  got=refused
+fi
+check "a pam_unix.so reached through a vendor-only include is seen" "$got" "refused"
+
+# The same file judged from /etc/pam.d alone - the old view - is refused as
+# well: an include found nowhere is "could not tell", never "nothing there".
+if pam_auth_insertion_point_is_safe "$VENDOR/etc/keyring-above-vendor-auth" "$VENDOR/etc"; then
+  got=safe
+else
+  got=refused
+fi
+check "an include found in no directory is refused, not waved through" "$got" "refused"
+
+# Following an include into the vendor directory must not turn into refusing
+# everything that lives there.
+if pam_auth_insertion_point_is_safe "$VENDOR/etc/keyring-above-vendor-session" "$VENDOR_PATH"; then
+  got=safe
+else
+  got=refused
+fi
+check "a vendor-only include with no auth module in it is still safe" "$got" "safe"
+
+# An absolute include path is taken as it stands, as libpam takes it. Glued
+# onto the directory ("/etc/pam.d//abs/path") it was missing, and so safe.
+printf '#%%PAM-1.0\nauth\toptional\tpam_gnome_keyring.so\n@include %s\n' \
+  "$ORDERING/common-auth" >"$WORKDIR/keyring-above-absolute"
+if pam_auth_insertion_point_is_safe "$WORKDIR/keyring-above-absolute" "$ORDERING"; then
+  got=safe
+else
+  got=refused
+fi
+check "an absolute @include path below the keyring line is followed" "$got" "refused"
+
+# An include that exists but cannot be read is "could not tell" too. Skipped
+# as root, which reads a mode-000 file regardless.
+if [ "$(id -u)" != 0 ]; then
+  UNREADABLE="$WORKDIR/unreadable"
+  mkdir -p "$UNREADABLE"
+  printf 'auth\trequired\tpam_permit.so\n' >"$UNREADABLE/sealed-off"
+  chmod 000 "$UNREADABLE/sealed-off"
+  printf '#%%PAM-1.0\nauth\toptional\tpam_gnome_keyring.so\n@include sealed-off\n' \
+    >"$UNREADABLE/keyring-above-unreadable"
+  if pam_auth_insertion_point_is_safe "$UNREADABLE/keyring-above-unreadable" "$UNREADABLE"; then
+    got=safe
+  else
+    got=refused
+  fi
+  check "an include that cannot be read is refused" "$got" "refused"
+  chmod 600 "$UNREADABLE/sealed-off"
+fi
 
 # No pam_gnome_keyring auth line means no insertion point, which is not the
 # same as a safe one.
