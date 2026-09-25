@@ -1,0 +1,7 @@
+#%PAM-1.0
+# The keyring line comes first, and the include below it exists only in the
+# vendor directory - where libpam >= 1.5.3 finds it, pam_unix.so
+# try_first_pass and all. Looked up in /etc/pam.d alone it is missing, and a
+# missing include used to read as "nothing below authenticates".
+auth    optional        pam_gnome_keyring.so
+@include vendor-auth

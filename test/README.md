@@ -80,9 +80,16 @@ actually runs there, never skips.
   keyring line placed before `@include common-auth`, a bare `pam_unix.so
   try_first_pass` below, an `auth substack` below, and an `@include` loop
   below (must refuse rather than hang — the walk fails closed when it gives
-  up). The real `@include`-based `gdm-password` fixture is asserted accepted
-  separately: that one breaking would refuse every supported Debian-family
-  install. The PAM control flow
+  up). Includes are resolved the way libpam resolves them, `/etc/pam.d` and
+  then `/usr/lib/pam.d`, and the walk fails closed on those too: an include
+  found nowhere (`unsafe-include-missing`), one that exists only in the
+  vendor directory and carries `pam_unix.so`
+  (`vendor/etc/keyring-above-vendor-auth`), an absolute include path and an
+  unreadable include are all refused, while a vendor-only include with no
+  auth module in it is still accepted. The real `@include`-based
+  `gdm-password` fixture is asserted accepted separately, and so is the stock
+  Ubuntu 26.04 one: either breaking would refuse every supported
+  Debian-family install. The PAM control flow
   of the generated stack is covered by `runtime-test.sh` below, against real
   libpam.
 - **`test/runtime-test.sh`** (one container, distro doesn't matter) — the
