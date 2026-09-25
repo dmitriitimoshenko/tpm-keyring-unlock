@@ -790,16 +790,24 @@ _pam_fprintd_walk() {
   fi
   while IFS= read -r line; do
     line="${line%%#*}"
-    if inc="$(_pam_include_target "$line")"; then
-      inc_file="$(pam_config_file "$inc" "$path")" || continue
-      if [ "$inc_file" = "$shared" ]; then
-        _pam_fp_reaches=1
-        _pam_fp_auth=1
-      else
-        _pam_fprintd_walk "$inc_file" "$shared" "$path" "$((depth + 1))"
-      fi
-      continue
-    fi
+    # Only a line that says "include" or "substack", in some case, can be an
+    # include, and only those are worth the subshell _pam_include_target()
+    # costs. Asking it about every line made the cost take 2.8 s to work out
+    # on a real /etc/pam.d, twice per question.
+    case "${line,,}" in
+      *include* | *substack*)
+        if inc="$(_pam_include_target "$line")"; then
+          inc_file="$(pam_config_file "$inc" "$path")" || continue
+          if [ "$inc_file" = "$shared" ]; then
+            _pam_fp_reaches=1
+            _pam_fp_auth=1
+          else
+            _pam_fprintd_walk "$inc_file" "$shared" "$path" "$((depth + 1))"
+          fi
+          continue
+        fi
+        ;;
+    esac
     # the type is compared the way libpam compares it, without regard to case
     lc="$line"
     if [[ "$line" =~ ^([[:space:]]*)([^[:space:]]+)(.*)$ ]]; then

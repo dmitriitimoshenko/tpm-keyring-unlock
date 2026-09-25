@@ -5860,3 +5860,15 @@ Everything about the insertion-point check:
 
 Backups piling up in `/etc/pam.d` stay a separate change, as recorded on
 2026-09-25.
+
+### Addendum: the walk forked once per line
+
+Found while building the second pull request on top of this one. The walk
+asked `_pam_include_target()` about every line, and that is a command
+substitution, so a subshell each time. Working out the cost on this machine's
+real `/etc/pam.d` took 2.8 s against main's 0.09 s, and install.sh works it
+out twice per question. Only a line that says "include" or "substack", in
+some case, can be an include, so the walk now checks that with a glob first:
+0.46 s, and the same 17 services and "sudo -i and polkit". The unit suite's
+time is unchanged against main's (8.7 s against 8.3 s), since the pipefail
+stability checks dominate it.
