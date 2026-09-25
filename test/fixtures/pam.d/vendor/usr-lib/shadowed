@@ -1,0 +1,5 @@
+#%PAM-1.0
+# Shadowed by ../etc/shadowed, so libpam never reads this file. Were it read,
+# it would lose fingerprint with the shared stack's line gone.
+@include common-auth
+@include common-account

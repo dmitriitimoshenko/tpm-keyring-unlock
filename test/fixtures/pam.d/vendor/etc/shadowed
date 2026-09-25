@@ -1,0 +1,8 @@
+#%PAM-1.0
+# The /etc/pam.d copy of a service that also has a vendor copy below it in
+# /usr/lib/pam.d. libpam reads only this one. It has a fingerprint line of
+# its own, so it keeps fingerprint - and the vendor copy, which has none,
+# must not be listed as a loss on its behalf.
+auth    sufficient    pam_fprintd.so
+@include common-auth
+@include common-account

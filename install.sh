@@ -153,6 +153,22 @@ disable_fprintd_profile() {
   fi
 }
 
+# The question that leads to disable_fprintd_profile, asked from the same two
+# places. It defaults to yes like every prompt here, so the cost has to be in
+# the question itself - and it is read off this machine's files, because a
+# fixed "stops being offered in polkit prompts" left out sudo on the Ubuntu
+# that ships a /etc/pam.d/sudo with no fingerprint line of its own. See
+# GitHub issue #19.
+fprintd_conflict_question() {
+  local prompts
+  prompts="$(pam_fprintd_shared_stack_prompts)"
+  if [ -n "$prompts" ]; then
+    printf 'Fix the lock screen? Fingerprint stops being offered in %s prompts.' "$prompts"
+  else
+    printf 'Fix the lock screen?'
+  fi
+}
+
 
 # Every prompt below defaults to yes, so a run with no terminal must not be
 # allowed to answer them by hitting EOF. read() failing counts as "no" in
@@ -312,13 +328,18 @@ if { [ "$UNLIMIT_FPRINTD" = true ] || [ "$FPRINTD_STACK_PRESENT" = true ]; } \
 
   if pam_auth_update_owns_fprintd; then
     if [ "${#conflict_losers[@]}" -gt 0 ]; then
-      # The reassurance stays ahead of the list: it is long, mostly services
-      # that never prompt for a finger (cron, cups, ppp), and leading with it
-      # makes the change look bigger than it is. See JOURNAL.md, 2026-09-15.
-      echo "Cost: ${#conflict_losers[@]} services fall back to the password (polkit above all);"
-      echo "sudo, GDM and the lock screen keep it: ${conflict_losers[*]##*/}"
+      # The prompts people meet (sudo, polkit) come first and the full list
+      # last: it is long, mostly services that never prompt for a finger
+      # (cron, cups, ppp), and leading with it makes the change look bigger
+      # than it is. Which prompts those are is computed, never assumed - this
+      # used to say "sudo keeps it", true only on a machine whose
+      # /etc/pam.d/sudo had been given a fingerprint line by hand. See GitHub
+      # issue #19 and JOURNAL.md, 2026-09-25.
+      conflict_prompts="$(pam_fprintd_shared_stack_prompts)"
+      echo "Cost: ${#conflict_losers[@]} services fall back to the password${conflict_prompts:+, $conflict_prompts prompts among them}."
+      echo "GDM and the lock screen keep fingerprint. All ${#conflict_losers[@]}: ${conflict_losers[*]##*/}"
     fi
-    if confirm "Fix the lock screen? Fingerprint stops being offered in polkit prompts."; then
+    if confirm "$(fprintd_conflict_question)"; then
       FPRINTD_CONFLICT_FIX=true
     else
       echo "Left as it is - the extra tries will not reach the reader."
@@ -636,7 +657,7 @@ if [ "$fprintd_stack_installed" = true ] && pam_fprintd_in_shared_stack; then
     echo "   The step earlier in this run could not remove it - see above."
   elif pam_auth_update_owns_fprintd; then
     echo "   Fix: sudo pam-auth-update --disable fprintd (undo: --enable)."
-    if confirm "Fix the lock screen? Fingerprint stops being offered in polkit prompts."; then
+    if confirm "$(fprintd_conflict_question)"; then
       disable_fprintd_profile
       pam_fprintd_in_shared_stack && echo "Still there - see above." || true
     else

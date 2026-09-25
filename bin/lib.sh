@@ -68,6 +68,50 @@ PAM_GNOME_KEYRING_AUTH_RE='^\s*-?auth\s+(\S+|\[[^]]*\])\s+pam_gnome_keyring\.so'
 # directory part can't match.
 PAM_NON_SERVICE_RE='(^|/)[^/]*\.[^/]*$'
 
+# Where libpam looks for a service file or an included one, in its own order:
+# /etc/pam.d first, then /usr/lib/pam.d, where distributions ship defaults. A
+# file in /etc/pam.d replaces the one of the same name below it outright - an
+# override, not a merge. Ubuntu 26.04 ships polkit's service file only in
+# /usr/lib/pam.d, so anything reading /etc/pam.d alone misses it, silently.
+# See GitHub issue #19 and JOURNAL.md, 2026-09-25.
+#
+# Measured with pamtester in throwaway containers, not read off a manual:
+# service files come from both directories on every libpam tried; *includes*
+# reach /usr/lib/pam.d on libpam 1.5.3 and later (Ubuntu 24.04 and 26.04,
+# Fedora 44) but not on Debian 12's 1.5.2; and an include found nowhere fails
+# the whole stack. Searching both is exact on the newer libpam and merely
+# conservative on the older one: a file it would not load gets inspected
+# anyway, and an include it cannot load cannot let anyone in.
+#
+# Colon-separated like PATH, so the tests can hand every predicate a fixture
+# tree through the directory argument they already took. Not modelled: a
+# libpam built with an extra vendor directory (openSUSE's /usr/etc/pam.d). A
+# name that exists only there resolves to nothing here, and every caller
+# treats "nothing" as the unsafe answer.
+PAM_CONFIG_PATH="/etc/pam.d:/usr/lib/pam.d"
+
+# Prints the file libpam would read for the service or include name $1: an
+# absolute name as it stands, anything else from the first directory in $2
+# (default PAM_CONFIG_PATH) that has it. Prints nothing and fails when none
+# does.
+pam_config_file() {
+  local name="$1" path="${2:-$PAM_CONFIG_PATH}" dir dirs=()
+  if [[ "$name" == /* ]]; then
+    [ -e "$name" ] || return 1
+    printf '%s\n' "$name"
+    return 0
+  fi
+  IFS=: read -r -a dirs <<<"$path"
+  for dir in "${dirs[@]}"; do
+    [ -n "$dir" ] || continue
+    if [ -e "$dir/$name" ]; then
+      printf '%s\n' "$dir/$name"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # Exits with an explanatory message unless Secure Boot is verifiably on.
 # This tool's entire security model rests on PCR7 (the Secure Boot state) -
 # a seal made while Secure Boot is off is not a meaningful lock, so this
@@ -699,31 +743,81 @@ pam_fprintd_in_shared_stack() {
   grep -qE "$PAM_FPRINTD_AUTH_RE" < <(_pam_logical_lines "$shared")
 }
 
-# Prints the /etc/pam.d/ services that @include $1 and have no pam_fprintd
-# auth line of their own - i.e. exactly the services that would stop offering
-# fingerprint if it were removed from the shared stack. A service with its own
-# explicit line (Ubuntu ships one in /etc/pam.d/sudo) keeps fingerprint and is
-# deliberately left out, so the cost quoted to the user is the real one rather
-# than "everything that includes common-auth".
+# Prints the services that @include $1 and have no pam_fprintd auth line of
+# their own - i.e. exactly the services that would stop offering fingerprint
+# if it were removed from the shared stack. A service with its own explicit
+# line keeps fingerprint and is deliberately left out, so the cost quoted to
+# the user is the real one rather than "everything that includes common-auth".
 #
-# Printed rather than summarised because the list is the whole point: on a
-# machine with no /etc/pam.d/polkit-1 the entry that matters is "other", and
-# no generic wording would tell anyone that polkit dialogs are what changes.
+# Every directory in $2 (default PAM_CONFIG_PATH) is scanned, and a file is
+# listed only if it is the copy libpam actually reads: /usr/lib/pam.d/polkit-1
+# counts when /etc/pam.d has no polkit-1, and never when it does. Reading
+# /etc/pam.d alone is how polkit went missing from this list on Ubuntu 26.04,
+# and how "other" got credited with polkit's prompts. See GitHub issue #19.
+#
+# Printed rather than summarised because the list is the whole point.
+# pam_fprintd_shared_stack_prompts() below names the part of it people meet.
 pam_fprintd_services_losing_fingerprint() {
-  local shared="${1:-$PAM_SHARED_AUTH_STACK}" dir="${2:-/etc/pam.d}"
-  local base f
+  local shared="${1:-$PAM_SHARED_AUTH_STACK}" path="${2:-$PAM_CONFIG_PATH}"
+  local base dir f dirs=()
   base="$(basename "$shared")"
-  for f in "$dir"/*; do
-    [ -f "$f" ] || continue
-    if [ "$f" = "$shared" ]; then continue; fi
-    if [[ "$f" =~ $PAM_NON_SERVICE_RE ]]; then continue; fi
-    if ! grep -qE "^[[:space:]]*@include[[:space:]]+${base}[[:space:]]*$" \
-         < <(_pam_logical_lines "$f"); then
-      continue
-    fi
-    if grep -qE "$PAM_FPRINTD_AUTH_RE" < <(_pam_logical_lines "$f"); then continue; fi
-    echo "$f"
+  IFS=: read -r -a dirs <<<"$path"
+  for dir in "${dirs[@]}"; do
+    [ -n "$dir" ] || continue
+    for f in "$dir"/*; do
+      [ -f "$f" ] || continue
+      if [ "$f" = "$shared" ]; then continue; fi
+      if [[ "$f" =~ $PAM_NON_SERVICE_RE ]]; then continue; fi
+      # shadowed by a copy of the same name earlier in the path: libpam never
+      # reads this one, whatever it says
+      [ "$(pam_config_file "${f##*/}" "$path")" = "$f" ] || continue
+      if ! grep -qE "^[[:space:]]*@include[[:space:]]+${base}[[:space:]]*$" \
+           < <(_pam_logical_lines "$f"); then
+        continue
+      fi
+      if grep -qE "$PAM_FPRINTD_AUTH_RE" < <(_pam_logical_lines "$f"); then continue; fi
+      echo "$f"
+    done
   done
+  return 0
+}
+
+# Prints, as one phrase ("sudo and polkit"), the everyday prompts whose
+# fingerprint comes from the shared stack on this machine: the part of
+# pam_fprintd_services_losing_fingerprint()'s list a person actually meets.
+# Prints nothing when none of them depends on it.
+#
+# Worked out from the files, never assumed. Until GitHub issue #19 the
+# installer said "sudo keeps it" unconditionally, which was true only where
+# /etc/pam.d/sudo had been given its own pam_fprintd.so line by hand - the
+# file Ubuntu ships has none. Disabling the fprintd profile there takes
+# fingerprint from sudo as well as from polkit, and the question that
+# disables it defaults to yes, so its text is where the cost has to be right.
+#
+# A service counts only through a file of its own, found the way libpam finds
+# it. `sudo -i` is a service of its own on Debian-family systems (sudo-i), and
+# is named only when plain sudo keeps fingerprint - otherwise "sudo" says it.
+pam_fprintd_shared_stack_prompts() {
+  local shared="${1:-$PAM_SHARED_AUTH_STACK}" path="${2:-$PAM_CONFIG_PATH}"
+  local losers=() names=() svc cfg loser sudo_lost=false
+  mapfile -t losers < <(pam_fprintd_services_losing_fingerprint "$shared" "$path")
+  for svc in sudo sudo-i polkit-1; do
+    cfg="$(pam_config_file "$svc" "$path")" || continue
+    for loser in "${losers[@]}"; do
+      [ "$loser" = "$cfg" ] || continue
+      case "$svc" in
+        sudo) names+=(sudo); sudo_lost=true ;;
+        sudo-i) [ "$sudo_lost" = true ] || names+=("sudo -i") ;;
+        polkit-1) names+=(polkit) ;;
+      esac
+      break
+    done
+  done
+  case "${#names[@]}" in
+    0) ;;
+    1) printf '%s\n' "${names[0]}" ;;
+    *) printf '%s and %s\n' "${names[0]}" "${names[1]}" ;;
+  esac
   return 0
 }
 

@@ -36,6 +36,15 @@ actually runs there, never skips.
   (`fprintd-handrolled`, which `uninstall.sh` must not claim as its own).
   Plus which `/etc/pam.d/` entries count as services at all — `.bak-<ts>`,
   `.pacnew`, `.rpmsave`, `.dpkg-old` and friends are not.
+  And the cost `install.sh` quotes before it disables the `fprintd`
+  pam-auth-update profile (`pam_fprintd_services_losing_fingerprint`,
+  `pam_fprintd_shared_stack_prompts`), against
+  `test/fixtures/pam.d/vendor/`: the stock Ubuntu 26.04 layout, where
+  `sudo` and `sudo-i` have no fingerprint line of their own and polkit's
+  service file lives only in the vendor directory (`vendor/usr-lib` standing
+  in for `/usr/lib/pam.d`), plus a name present in both directories, of
+  which only the `/etc/pam.d` copy may count. GitHub issue #19: the question
+  used to promise that `sudo` keeps fingerprint.
   Also `tpm_handle_is_wellformed` and `tpm_primary_handle_dependents`, the
   two predicates `uninstall.sh` consults before evicting the TPM primary
   key that every user of the tool on a machine shares. Driven against a

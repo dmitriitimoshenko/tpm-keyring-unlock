@@ -265,11 +265,15 @@ if [ -f "$DATA_DIR/$PAM_FPRINTD_PROFILE_MARKER" ]; then
     # and the marker no longer describes reality, so drop it.
     rm -f "$DATA_DIR/$PAM_FPRINTD_PROFILE_MARKER"
   else
+    # Which everyday prompts get fingerprint back is read off the files, the
+    # same way install.sh words the cost of taking it away: on a stock Ubuntu
+    # that is sudo as well as polkit. See GitHub issue #19.
+    FPRINTD_PROMPTS="$(pam_fprintd_shared_stack_prompts)"
     echo "install.sh disabled the 'fprintd' pam-auth-update profile, which is"
     echo "what took pam_fprintd.so out of $PAM_SHARED_AUTH_STACK."
     echo "Re-enabling puts fingerprint back for every service that @include's"
-    echo "it (polkit prompts, login, su), and puts back the race with the"
-    echo "fingerprint attempt stack if any of that is still installed."
+    echo "it (${FPRINTD_PROMPTS:+$FPRINTD_PROMPTS prompts, }login, su), and puts back the race"
+    echo "with the fingerprint attempt stack if any of that is still installed."
     if confirm "Re-enable the 'fprintd' pam-auth-update profile?"; then
       for f in "$(dirname "$PAM_SHARED_AUTH_STACK")"/common-*; do
         [ -f "$f" ] || continue
