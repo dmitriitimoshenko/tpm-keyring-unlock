@@ -1,0 +1,5 @@
+#%PAM-1.0
+auth    optional        pam_gnome_keyring.so
+auth \
+# libpam 1.5 carries the continuation on past this line, 1.7 ends it here
+required pam_unix.so try_first_pass

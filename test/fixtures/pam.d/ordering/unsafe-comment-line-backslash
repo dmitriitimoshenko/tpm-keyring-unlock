@@ -1,0 +1,4 @@
+#%PAM-1.0
+auth    optional        pam_gnome_keyring.so
+# the fallback below \
+@include common-auth
