@@ -265,11 +265,24 @@ if [ -f "$DATA_DIR/$PAM_FPRINTD_PROFILE_MARKER" ]; then
     # and the marker no longer describes reality, so drop it.
     rm -f "$DATA_DIR/$PAM_FPRINTD_PROFILE_MARKER"
   else
+    # What re-enabling gives back is read off the files, the same way
+    # install.sh words the cost of taking it away: on a stock Ubuntu that is
+    # sudo as well as polkit (GitHub issue #19). A service that meanwhile got a
+    # fingerprint line of its own - README's per-service recipe - would try
+    # the reader twice, so that is said too rather than found out at a prompt.
+    mapfile -t FPRINTD_REGAIN < <(pam_fprintd_services_losing_fingerprint)
+    mapfile -t FPRINTD_TWICE < <(pam_fprintd_services_asking_twice)
+    FPRINTD_PROMPTS="$(pam_fprintd_shared_stack_prompts)"
     echo "install.sh disabled the 'fprintd' pam-auth-update profile, which is"
     echo "what took pam_fprintd.so out of $PAM_SHARED_AUTH_STACK."
-    echo "Re-enabling puts fingerprint back for every service that @include's"
-    echo "it (polkit prompts, login, su), and puts back the race with the"
-    echo "fingerprint attempt stack if any of that is still installed."
+    echo "Re-enabling puts fingerprint back for ${#FPRINTD_REGAIN[@]} services${FPRINTD_PROMPTS:+, $FPRINTD_PROMPTS prompts among them}:"
+    echo "  ${FPRINTD_REGAIN[*]##*/}"
+    if [ "${#FPRINTD_TWICE[@]}" -gt 0 ]; then
+      echo "These have a fingerprint line of their own as well, so they would try"
+      echo "the reader twice before the password: ${FPRINTD_TWICE[*]##*/}"
+    fi
+    echo "It also puts back the race with the fingerprint attempt stack, if any"
+    echo "of that is still installed."
     if confirm "Re-enable the 'fprintd' pam-auth-update profile?"; then
       for f in "$(dirname "$PAM_SHARED_AUTH_STACK")"/common-*; do
         [ -f "$f" ] || continue

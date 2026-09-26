@@ -1,0 +1,4 @@
+#%PAM-1.0
+# No auth-phase line at all, so libpam authenticates polkit with the auth
+# phase of "other" - which loses fingerprint here, so polkit does too.
+session    required   pam_env.so readenv=1 user_readenv=0

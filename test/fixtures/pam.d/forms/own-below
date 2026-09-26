@@ -1,0 +1,7 @@
+#%PAM-1.0
+# A fingerprint line of its own, but below the include. common-auth ends in
+# `requisite pam_deny.so`, so a wrong password stops the stack before this
+# line runs: it is no alternative to the password, and the service loses
+# fingerprint with the shared stack's line gone all the same.
+@include common-auth
+auth    sufficient    pam_fprintd.so

@@ -9,6 +9,22 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FIXTURES="$REPO_DIR/test/fixtures/pam.d"
 
+# One cleanup for every temp dir below. `trap ... EXIT` replaces the trap set
+# before it rather than adding to it, and this file used to set three - so
+# every temp dir but the last outlived the run.
+CLEANUP=()
+trap '[ "${#CLEANUP[@]}" -eq 0 ] || rm -rf -- "${CLEANUP[@]}"' EXIT
+
+# The predicates take colon-separated search paths (PAM_CONFIG_PATH), so a
+# fixture directory cannot contain a colon. A checkout path that does gets its
+# fixtures copied somewhere that doesn't.
+if [[ "$FIXTURES" == *:* ]]; then
+  FIXTURE_COPY="$(mktemp -d)"
+  CLEANUP+=("$FIXTURE_COPY")
+  cp -R "$FIXTURES/." "$FIXTURE_COPY/"
+  FIXTURES="$FIXTURE_COPY"
+fi
+
 # shellcheck source=../bin/lib.sh
 source "$REPO_DIR/bin/lib.sh"
 
@@ -61,7 +77,7 @@ check "already-patched is correctly skipped" "$got" "no"
 # --- insertion: sed actually inserts our line right before the matched
 # line, for every control-syntax style -----------------------------------
 WORKDIR=$(mktemp -d)
-trap 'rm -rf "$WORKDIR"' EXIT
+CLEANUP+=("$WORKDIR")
 
 for f in simple-control bracketed-control dash-prefixed; do
   cp "$FIXTURES/$f" "$WORKDIR/$f"
@@ -473,13 +489,16 @@ mapfile -t losers < <(pam_fprintd_services_losing_fingerprint \
   "$FIXTURES/shared/common-auth" "$FIXTURES/shared")
 losers_str=" ${losers[*]} "
 
-for want in gdm-password; do
+for want in gdm-password sudo-i; do
   case "$losers_str" in *"/shared/$want "*) got=listed ;; *) got=absent ;; esac
   check "$want loses fingerprint with the shared stack's line gone" "$got" "listed"
 done
 
-# sudo has its own pam_fprintd.so line above the @include, so it keeps
-# fingerprint either way and must not be quoted as a cost.
+# This sudo has its own pam_fprintd.so line above the @include, so it keeps
+# fingerprint either way and must not be quoted as a cost. It is this repo's
+# own machine, where the line was added by hand - Ubuntu's stock file has
+# none (the vendor tree below is the stock layout; GitHub issue #19). Its
+# sudo-i was never given one, so `sudo -i` loses fingerprint there.
 case "$losers_str" in *"/shared/sudo "*) got=listed ;; *) got=absent ;; esac
 check "a service with its own fprintd line is not counted as a loss" "$got" "absent"
 
@@ -493,8 +512,163 @@ check "a .bak- copy of a qualifying service is not listed" "$got" "absent"
 case "$losers_str" in *"/shared/common-auth "*) got=listed ;; *) got=absent ;; esac
 check "the shared stack does not list itself" "$got" "absent"
 
-check "exactly one service loses fingerprint in the fixture tree" \
-  "${#losers[@]}" "1"
+check "exactly two services lose fingerprint in the fixture tree" \
+  "${#losers[@]}" "2"
+
+# What the question that disables the profile names out of that list: only
+# the prompts a person meets, and only where they really lose fingerprint.
+check "a sudo with its own line leaves only sudo -i to name" \
+  "$(pam_fprintd_shared_stack_prompts "$FIXTURES/shared/common-auth" "$FIXTURES/shared")" \
+  "sudo -i"
+
+check "no sudo or polkit among the losses means nothing is named" \
+  "$(pam_fprintd_shared_stack_prompts "$FIXTURES/ordering/common-auth" "$FIXTURES/ordering")" \
+  ""
+
+# --- the same, on the layout Ubuntu 26.04 ships (GitHub issue #19) -------
+# vendor/etc stands for /etc/pam.d and vendor/usr-lib for /usr/lib/pam.d.
+# Every file but the `shadowed` pair is byte for byte what the Ubuntu 26.04
+# packages install (sudo-common, util-linux, login, libpam-runtime, gdm3,
+# polkitd, systemd), with common-auth as pam-auth-update writes it once the
+# fprintd profile is on. Stock sudo and sudo-i carry no fingerprint line of
+# their own, so both lose it along with the shared stack's; polkit's service
+# file exists only in /usr/lib/pam.d, where a scan of /etc/pam.d never looked;
+# su-l and the smartcard stack reach common-auth through `auth include su` and
+# `auth substack`. The installer used to promise that sudo keeps fingerprint.
+VENDOR="$FIXTURES/vendor"
+VENDOR_PATH="$VENDOR/etc:$VENDOR/usr-lib"
+
+# resolving a name the way libpam does: /etc/pam.d first, then the vendor
+# directory, an absolute name as it stands (measured; JOURNAL.md, 2026-09-25)
+check "a name in both directories resolves to the /etc/pam.d copy" \
+  "$(pam_config_file shadowed "$VENDOR_PATH")" "$VENDOR/etc/shadowed"
+check "a vendor-only name resolves into the vendor directory" \
+  "$(pam_config_file polkit-1 "$VENDOR_PATH")" "$VENDOR/usr-lib/polkit-1"
+check "an absolute name resolves to itself" \
+  "$(pam_config_file "$VENDOR/usr-lib/polkit-1" /nonexistent)" "$VENDOR/usr-lib/polkit-1"
+if pam_config_file no-such-service "$VENDOR_PATH" >/dev/null; then got=found; else got=missing; fi
+check "a name found in no directory fails" "$got" "missing"
+
+mapfile -t losers < <(pam_fprintd_services_losing_fingerprint \
+  "$VENDOR/etc/common-auth" "$VENDOR_PATH")
+losers_str=" ${losers[*]} "
+
+for want in etc/sudo etc/sudo-i etc/other etc/gdm-password etc/su etc/su-l \
+  etc/login etc/gdm-smartcard-sssd-or-password usr-lib/polkit-1; do
+  case "$losers_str" in *" $VENDOR/$want "*) got=listed ;; *) got=absent ;; esac
+  check "stock layout: $want loses fingerprint with the shared stack's line gone" \
+    "$got" "listed"
+done
+
+# libpam reads /etc/pam.d/shadowed, which keeps fingerprint, and never the
+# vendor copy beneath it - so neither may be quoted as a loss. gdm-fingerprint
+# has fingerprint of its own and no shared stack; the rest have no auth phase.
+for unwanted in etc/shadowed usr-lib/shadowed usr-lib/systemd-user etc/common-auth \
+  etc/gdm-fingerprint etc/common-account etc/common-password etc/common-session \
+  etc/common-session-noninteractive; do
+  case "$losers_str" in *" $VENDOR/$unwanted "*) got=listed ;; *) got=absent ;; esac
+  check "stock layout: $unwanted is not listed" "$got" "absent"
+done
+
+check "stock layout: exactly nine services lose fingerprint" "${#losers[@]}" "9"
+
+# The /etc/pam.d-only view of the same tree, which is what the scan used to
+# be: polkit is simply not in it.
+mapfile -t losers < <(pam_fprintd_services_losing_fingerprint \
+  "$VENDOR/etc/common-auth" "$VENDOR/etc")
+case " ${losers[*]} " in *"/polkit-1 "*) got=listed ;; *) got=absent ;; esac
+check "reading /etc/pam.d alone misses polkit - the scan has to follow libpam" \
+  "$got" "absent"
+
+check "stock layout: the question names sudo and polkit" \
+  "$(pam_fprintd_shared_stack_prompts "$VENDOR/etc/common-auth" "$VENDOR_PATH")" \
+  "sudo and polkit"
+
+# --- every way a service reaches the shared stack (review of PR #20) ------
+# `auth include` and `auth substack` as well as `@include`, keywords in any
+# case, a comment or extra words after the name, and through another file -
+# every form libpam accepts (measured; JOURNAL.md, 2026-09-26). Reading only a
+# literal `@include common-auth` left five stock services out of the cost on
+# a real Ubuntu 26.04, and would have left sudo out of the question had it
+# been spelled `auth include`.
+FORMS="$FIXTURES/forms"
+
+for line in "@include common-auth" "@include common-auth # a comment" \
+  "@include common-auth extra words" "@INCLUDE common-auth" \
+  "auth include common-auth" "AUTH Include common-auth" \
+  "-auth substack common-auth" "$(printf '  auth\tsubstack\tcommon-auth')"; do
+  check "an include is read out of: $line" \
+    "$(_pam_include_target "$line" || echo none)" "common-auth"
+done
+
+for line in "account include common-auth" "auth required pam_unix.so" \
+  "# @include common-auth" "@include" "session include common-session"; do
+  check "no auth-phase include in: $line" \
+    "$(_pam_include_target "$line" || echo none)" "none"
+done
+
+mapfile -t losers < <(pam_fprintd_services_losing_fingerprint \
+  "$FORMS/common-auth" "$FORMS")
+losers_str=" ${losers[*]} "
+
+for want in sudo other upper-case dashed-substack chain-top chain-mid own-below; do
+  case "$losers_str" in *" $FORMS/$want "*) got=listed ;; *) got=absent ;; esac
+  check "spelled another way: $want loses fingerprint" "$got" "listed"
+done
+
+# own-via-include keeps fingerprint through a line of its own that runs before
+# the shared stack (own-below's runs after it, so it loses fingerprint anyway);
+# fp-snippet and session-only never reach the shared stack; polkit-1 has no
+# auth phase, so its cost is other's.
+for unwanted in own-via-include fp-snippet session-only polkit-1 common-auth; do
+  case "$losers_str" in *" $FORMS/$unwanted "*) got=listed ;; *) got=absent ;; esac
+  check "spelled another way: $unwanted is not listed" "$got" "absent"
+done
+
+check "spelled another way: exactly seven services lose fingerprint" "${#losers[@]}" "7"
+
+# libpam authenticates a polkit whose file has no auth phase with other's, and
+# other loses fingerprint here - so the question has to name polkit, and the
+# sudo that says `auth include` as well.
+check "a sudo reached by auth include, and a polkit with no auth phase, are named" \
+  "$(pam_fprintd_shared_stack_prompts "$FORMS/common-auth" "$FORMS")" \
+  "sudo and polkit"
+
+# README's per-service recipe leaves a service with a fingerprint line of its
+# own *and* the shared stack: once the profile is back, it tries the reader
+# twice. uninstall.sh names these before it re-enables the profile.
+mapfile -t twice < <(pam_fprintd_services_asking_twice "$FORMS/common-auth" "$FORMS")
+check "services with a fingerprint line of their own are the ones that ask twice" \
+  "${twice[*]##*/}" "own-via-include"
+
+# A service file the installing user cannot read is counted as a loss, not
+# dropped and not left to print "Permission denied" into the cost. Skipped as
+# root, which reads a mode-000 file regardless.
+if [ "$(id -u)" != 0 ]; then
+  UNREADABLE_TREE="$WORKDIR/unreadable-tree"
+  mkdir -p "$UNREADABLE_TREE"
+  cp "$FORMS/common-auth" "$UNREADABLE_TREE/"
+  printf 'auth\tinclude\tcommon-auth\n' >"$UNREADABLE_TREE/polkit-1"
+  chmod 000 "$UNREADABLE_TREE/polkit-1"
+  check "a service file that cannot be read is named, quietly" \
+    "$(pam_fprintd_shared_stack_prompts "$UNREADABLE_TREE/common-auth" "$UNREADABLE_TREE" 2>&1)" \
+    "polkit"
+  chmod 600 "$UNREADABLE_TREE/polkit-1"
+fi
+
+# The question itself, as install.sh asks it at both of its call sites. It
+# defaults to yes, so it has to carry a cost whenever there is one.
+check "the question names the prompts when there are any" \
+  "$(pam_fprintd_conflict_question "sudo and polkit" 9)" \
+  "Fix the lock screen? Fingerprint stops being offered in sudo and polkit prompts."
+check "...and otherwise still states what is lost" \
+  "$(pam_fprintd_conflict_question "" 4)" \
+  "Fix the lock screen? The 4 services above fall back to the password."
+check "...in the singular too" \
+  "$(pam_fprintd_conflict_question "" 1)" \
+  "Fix the lock screen? The service above falls back to the password."
+check "...and is bare only when nothing is lost" \
+  "$(pam_fprintd_conflict_question "" 0)" "Fix the lock screen?"
 
 # --- the machine-wide TPM primary handle ----------------------------------
 # bin/lib.sh's tpm_handle_is_wellformed / tpm_primary_handle_dependents, which
@@ -518,7 +692,7 @@ for bad in "0X81018000" "0x81018000  extra" "" "0x71018000" "/tmp/evil.ctx" "0x8
 done
 
 HANDLE_TREE="$(mktemp -d)"
-trap 'rm -rf "$HANDLE_TREE"' EXIT
+CLEANUP+=("$HANDLE_TREE")
 
 mkhome() {
   local user="$1" handle="$2" with_blob="$3"
@@ -586,7 +760,7 @@ check "a handle nobody uses returns empty AND exits zero" "$got" "ok:[]"
 # Both directions are load-bearing, and the safe ones more so: a false
 # "unsafe" refuses gdm-fingerprint, which is the entire scenario this tool
 # exists for. See JOURNAL.md, 2026-09-15.
-ORDERING="$REPO_DIR/test/fixtures/pam.d/ordering"
+ORDERING="$FIXTURES/ordering"
 
 for f in safe-direct safe-include safe-substack safe-continued \
          safe-fingerprint-only safe-autologin; do
@@ -644,7 +818,7 @@ check "a stack with no keyring auth line is not called safe" "$got" "refused"
 # when grep leaves, so the old code fails every single iteration and the test
 # has teeth anywhere it runs.
 STABILITY_DIR="$(mktemp -d)"
-trap 'rm -rf -- "$STABILITY_DIR"' EXIT
+CLEANUP+=("$STABILITY_DIR")
 {
   echo "auth    optional    pam_gnome_keyring.so"
   for i in $(seq 1 400); do echo "auth    optional    pam_filler_$i.so"; done

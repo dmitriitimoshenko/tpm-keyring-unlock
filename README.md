@@ -232,20 +232,75 @@ on a service that is not named after fingerprints.
 
 It also costs you something. The same profile puts `pam_fprintd.so` into
 `common-auth`, and at the greeter that stack races `gdm-fingerprint` for the
-sensor and wins, with a single attempt on a 10-second timeout. Fingerprint for
-`sudo` and polkit, and a retrying fingerprint prompt at the lock screen, are
-therefore mutually exclusive. `install.sh` detects the conflict, explains it,
-lists which services would lose fingerprint on your machine, and offers to
-disable the profile:
+sensor and wins, with a single attempt on a 10-second timeout. As long as
+`sudo` and polkit get fingerprint from that profile, fingerprint for them and
+a retrying fingerprint prompt at the lock screen are mutually exclusive.
+`install.sh` detects the conflict, explains it, lists which services would
+lose fingerprint on your machine, and offers to disable the profile:
 
 ```bash
 sudo pam-auth-update --disable fprintd     # what the installer runs
 sudo pam-auth-update --enable fprintd      # undo, any time
 ```
 
-`sudo` itself keeps fingerprint either way, because Ubuntu's `/etc/pam.d/sudo`
-carries its own line. polkit prompts, `login` and `su` fall back to the
-password they already accept.
+On a stock Ubuntu or Debian that includes `sudo`: `/etc/pam.d/sudo` has no
+fingerprint line of its own and gets one only through `common-auth`. polkit
+prompts, `login` and `su` go the same way, back to the password they already
+accept. The installer works out which services lose it from your files,
+`/usr/lib/pam.d` included, which is where Ubuntu 26.04 keeps polkit's, and
+names `sudo` and polkit in the question when they are among them.
+
+### Keeping fingerprint for `sudo` and polkit anyway
+
+You can give `sudo` and polkit a fingerprint line of their own, so they stop
+depending on the profile. The tool does not do this for you. With
+`sufficient`, a finger alone is enough to become root, and whether that is
+acceptable on your machine is your call, not an installer's. A mistake in
+these files can lock you out of `sudo`, so keep a root shell open until you
+have tested.
+
+1. Disable the profile, which is what `install.sh` offers anyway.
+2. In `/etc/pam.d/sudo`, directly above `@include common-auth`, add:
+
+   ```
+   auth    sufficient    pam_fprintd.so
+   ```
+
+   `sudo -i` reads `/etc/pam.d/sudo-i` instead. Give it the same line if you
+   use it.
+3. For polkit, add the same line above the `@include common-auth` in
+   `/etc/pam.d/polkit-1`. Where polkit ships its file in `/usr/lib/pam.d`
+   instead (Ubuntu 24.04 and later, Debian 12), copy it over first. The copy
+   in `/etc/pam.d` then replaces the vendor file. The command leaves an
+   existing `/etc/pam.d/polkit-1` alone:
+
+   ```bash
+   [ -e /etc/pam.d/polkit-1 ] || sudo cp /usr/lib/pam.d/polkit-1 /etc/pam.d/polkit-1
+   ```
+
+4. Test with `sudo -k; sudo true` and with `pkexec true` or any polkit
+   dialog. Both should ask for a finger.
+
+A few things come with it:
+
+- `/etc/pam.d/sudo` is a package configuration file, so a `sudo` upgrade that
+  changes it will ask which version to keep.
+- A copied `/etc/pam.d/polkit-1` replaces the vendor file for good. polkit
+  updates to `/usr/lib/pam.d/polkit-1` stop reaching you until you delete the
+  copy.
+- If the profile comes back later (from GNOME Settings, `pam-auth-update` or
+  `uninstall.sh`), `sudo` and polkit try the reader twice before the password:
+  their own line first, then the one in `common-auth`. `uninstall.sh` names
+  the services this applies to before it asks.
+
+To undo, remove the line you added from each file. Delete
+`/etc/pam.d/polkit-1` only if step 3 created it as a copy. On releases that
+ship that file themselves, such as Ubuntu 22.04, it belongs to the package,
+and deleting it loses it for good. Re-enable the profile afterwards if you want
+it back.
+
+`gdm-password` stays password-only this way, so the gap described above stays
+closed.
 
 ## Shared machines
 

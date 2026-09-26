@@ -153,6 +153,29 @@ disable_fprintd_profile() {
   fi
 }
 
+# Prints what disabling the fprintd profile costs on this machine and asks the
+# question that leads to disable_fprintd_profile. Asked from the same two
+# places, so the cost is printed at both, right above the question: it
+# defaults to yes like every prompt here, and at the end-of-run check nothing
+# else had printed it. Every word of it is read off this machine's files - a
+# fixed "sudo keeps it" was wrong on the Ubuntu that ships a /etc/pam.d/sudo
+# with no fingerprint line of its own (GitHub issue #19), and a fixed "GDM
+# keeps it" sat right in front of a list naming gdm-password.
+#
+# $@ are the fingerprint-only stacks that keep fingerprint: the ones carrying
+# the attempt stack, or about to.
+fprintd_conflict_offer() {
+  local losers=() prompts
+  mapfile -t losers < <(pam_fprintd_services_losing_fingerprint)
+  prompts="$(pam_fprintd_shared_stack_prompts)"
+  if [ "${#losers[@]}" -gt 0 ]; then
+    echo "Cost: ${#losers[@]} services fall back to the password${prompts:+, $prompts prompts among them}."
+    [ "$#" -eq 0 ] || echo "Fingerprint stays in ${*##*/}, which gets the extra attempts."
+    echo "All ${#losers[@]}: ${losers[*]##*/}"
+  fi
+  confirm "$(pam_fprintd_conflict_question "$prompts" "${#losers[@]}")"
+}
+
 
 # Every prompt below defaults to yes, so a run with no terminal must not be
 # allowed to answer them by hitting EOF. read() failing counts as "no" in
@@ -259,6 +282,7 @@ done
 UNLIMIT_FPRINTD=false
 FPRINTD_STACK_PRESENT=false
 fprintd_targets=()
+fprintd_stacks_present=()
 if pam_fprintd_supports_attempt_options; then
   for f in /etc/pam.d/*; do
     [ -f "$f" ] || continue
@@ -269,6 +293,7 @@ if pam_fprintd_supports_attempt_options; then
     # whether the shared-stack conflict in 1f below is worth raising at all
     if pam_fprintd_harden <"$f" | cmp -s - "$f"; then
       FPRINTD_STACK_PRESENT=true
+      fprintd_stacks_present+=("$f")
       continue
     fi
     # the whole eligibility rule lives in bin/lib.sh, because step 3 below has
@@ -299,11 +324,8 @@ fi
 # measurement and reasoning in bin/lib.sh next to the predicates, and in
 # JOURNAL.md, 2026-09-15.
 FPRINTD_CONFLICT_FIX=false
-conflict_losers=()
 if { [ "$UNLIMIT_FPRINTD" = true ] || [ "$FPRINTD_STACK_PRESENT" = true ]; } \
   && pam_fprintd_in_shared_stack; then
-  mapfile -t conflict_losers < <(pam_fprintd_services_losing_fingerprint)
-
   # Same trade as above: the greeter race, the D-Bus round trip that decides
   # it, and why fingerprint cannot live in the shared stack are all in
   # README.md, 'Fingerprint for sudo'. Two lines here, not twenty.
@@ -311,14 +333,12 @@ if { [ "$UNLIMIT_FPRINTD" = true ] || [ "$FPRINTD_STACK_PRESENT" = true ]; } \
   echo "the shared stack wins that race at the greeter. Why: README.md."
 
   if pam_auth_update_owns_fprintd; then
-    if [ "${#conflict_losers[@]}" -gt 0 ]; then
-      # The reassurance stays ahead of the list: it is long, mostly services
-      # that never prompt for a finger (cron, cups, ppp), and leading with it
-      # makes the change look bigger than it is. See JOURNAL.md, 2026-09-15.
-      echo "Cost: ${#conflict_losers[@]} services fall back to the password (polkit above all);"
-      echo "sudo, GDM and the lock screen keep it: ${conflict_losers[*]##*/}"
-    fi
-    if confirm "Fix the lock screen? Fingerprint stops being offered in polkit prompts."; then
+    # The prompts people meet (sudo, polkit) come first and the full list
+    # last: it is long, mostly services that never prompt for a finger (cron,
+    # cups, ppp), and leading with it makes the change look bigger than it is.
+    fprintd_kept=("${fprintd_stacks_present[@]}")
+    [ "$UNLIMIT_FPRINTD" = false ] || fprintd_kept+=("${fprintd_targets[@]}")
+    if fprintd_conflict_offer "${fprintd_kept[@]}"; then
       FPRINTD_CONFLICT_FIX=true
     else
       echo "Left as it is - the extra tries will not reach the reader."
@@ -617,12 +637,13 @@ echo "Log out and back in to test."
 # reads as success. So the state on disk is checked here and said plainly. See
 # JOURNAL.md, 2026-09-15.
 fprintd_stack_installed=false
+fprintd_installed_stacks=()
 for f in /etc/pam.d/*; do
   [ -f "$f" ] || continue
   if [[ "$f" =~ $PAM_NON_SERVICE_RE ]]; then continue; fi
   if grep -qE "$PAM_FPRINTD_RETRY_LINE_RE" "$f"; then
     fprintd_stack_installed=true
-    break
+    fprintd_installed_stacks+=("$f")
   fi
 done
 
@@ -636,7 +657,7 @@ if [ "$fprintd_stack_installed" = true ] && pam_fprintd_in_shared_stack; then
     echo "   The step earlier in this run could not remove it - see above."
   elif pam_auth_update_owns_fprintd; then
     echo "   Fix: sudo pam-auth-update --disable fprintd (undo: --enable)."
-    if confirm "Fix the lock screen? Fingerprint stops being offered in polkit prompts."; then
+    if fprintd_conflict_offer "${fprintd_installed_stacks[@]}"; then
       disable_fprintd_profile
       pam_fprintd_in_shared_stack && echo "Still there - see above." || true
     else

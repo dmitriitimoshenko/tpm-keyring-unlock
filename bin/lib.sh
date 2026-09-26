@@ -68,6 +68,49 @@ PAM_GNOME_KEYRING_AUTH_RE='^\s*-?auth\s+(\S+|\[[^]]*\])\s+pam_gnome_keyring\.so'
 # directory part can't match.
 PAM_NON_SERVICE_RE='(^|/)[^/]*\.[^/]*$'
 
+# Where libpam looks for a service file or an included one, in its own order:
+# /etc/pam.d first, then /usr/lib/pam.d, where distributions ship defaults. A
+# file in /etc/pam.d replaces the one of the same name below it outright - an
+# override, not a merge. Ubuntu 26.04 ships polkit's service file only in
+# /usr/lib/pam.d, so anything reading /etc/pam.d alone misses it, silently.
+# See GitHub issue #19 and JOURNAL.md, 2026-09-25.
+#
+# Measured with pamtester in throwaway containers, not read off a manual:
+# service files come from both directories on every libpam tried, and
+# *includes* reach /usr/lib/pam.d on libpam 1.5.3 and later (Ubuntu 24.04 and
+# 26.04, Fedora 44) but not on Debian 12's 1.5.2. Searching both is exact on
+# the newer libpam and merely generous on the older one: a file it would not
+# load gets inspected anyway.
+#
+# Colon-separated like PATH, so the tests can hand every predicate a fixture
+# tree through the directory argument they already took - which is also why
+# no directory on it can contain a colon. Not modelled: a libpam built with an
+# extra vendor directory (openSUSE's /usr/etc/pam.d). A name that exists only
+# there resolves to nothing here, and each caller says what it makes of that.
+PAM_CONFIG_PATH="/etc/pam.d:/usr/lib/pam.d"
+
+# Prints the file libpam would read for the service or include name $1: an
+# absolute name as it stands, anything else from the first directory in $2
+# (default PAM_CONFIG_PATH) that has it. Prints nothing and fails when none
+# does.
+pam_config_file() {
+  local name="$1" path="${2:-$PAM_CONFIG_PATH}" dir dirs=()
+  if [[ "$name" == /* ]]; then
+    [ -e "$name" ] || return 1
+    printf '%s\n' "$name"
+    return 0
+  fi
+  IFS=: read -r -a dirs <<<"$path"
+  for dir in "${dirs[@]}"; do
+    [ -n "$dir" ] || continue
+    if [ -e "$dir/$name" ]; then
+      printf '%s\n' "$dir/$name"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # Exits with an explanatory message unless Secure Boot is verifiably on.
 # This tool's entire security model rests on PCR7 (the Secure Boot state) -
 # a seal made while Secure Boot is off is not a meaningful lock, so this
@@ -699,32 +742,219 @@ pam_fprintd_in_shared_stack() {
   grep -qE "$PAM_FPRINTD_AUTH_RE" < <(_pam_logical_lines "$shared")
 }
 
-# Prints the /etc/pam.d/ services that @include $1 and have no pam_fprintd
-# auth line of their own - i.e. exactly the services that would stop offering
-# fingerprint if it were removed from the shared stack. A service with its own
-# explicit line (Ubuntu ships one in /etc/pam.d/sudo) keeps fingerprint and is
-# deliberately left out, so the cost quoted to the user is the real one rather
-# than "everything that includes common-auth".
+# Prints the file the logical line $1 includes into the auth phase - `@include
+# X`, `auth include X` or `auth substack X`, spelled any way libpam accepts
+# them: keywords in any case, a leading dash on auth, a comment or extra words
+# after the name (measured with pamtester; JOURNAL.md, 2026-09-26) - and fails
+# when the line includes nothing into the auth phase.
+_pam_include_target() {
+  local t1="" t2="" t3=""
+  read -r t1 t2 t3 _ <<<"${1%%#*}"
+  if [ "${t1,,}" = "@include" ]; then
+    [ -n "$t2" ] || return 1
+    printf '%s\n' "$t2"
+    return 0
+  fi
+  case "${t1,,}" in auth | -auth) ;; *) return 1 ;; esac
+  case "${t2,,}" in include | substack) ;; *) return 1 ;; esac
+  [ -n "$t3" ] || return 1
+  printf '%s\n' "$t3"
+}
+
+# Walks the auth phase of $1 with every include followed (resolved on $3, the
+# shared stack $2 itself not entered) and sets three flags, which the caller
+# declares local:
 #
-# Printed rather than summarised because the list is the whole point: on a
-# machine with no /etc/pam.d/polkit-1 the entry that matters is "other", and
-# no generic wording would tell anyone that polkit dialogs are what changes.
-pam_fprintd_services_losing_fingerprint() {
-  local shared="${1:-$PAM_SHARED_AUTH_STACK}" dir="${2:-/etc/pam.d}"
-  local base f
-  base="$(basename "$shared")"
-  for f in "$dir"/*; do
-    [ -f "$f" ] || continue
-    if [ "$f" = "$shared" ]; then continue; fi
-    if [[ "$f" =~ $PAM_NON_SERVICE_RE ]]; then continue; fi
-    if ! grep -qE "^[[:space:]]*@include[[:space:]]+${base}[[:space:]]*$" \
-         < <(_pam_logical_lines "$f"); then
-      continue
+#   _pam_fp_reaches  the shared stack is included somewhere on the way
+#   _pam_fp_own      a pam_fprintd auth line outside the shared stack runs
+#                    *before* it, so the service keeps fingerprint regardless.
+#                    One below it does not count: pam-auth-update's
+#                    common-auth ends in `requisite pam_deny.so`, so a wrong
+#                    password stops the stack before such a line is reached
+#                    (measured with pamtester; JOURNAL.md, 2026-09-26)
+#   _pam_fp_auth     there is an auth-phase line at all; libpam gives a
+#                    service with none the auth phase of "other" instead
+#
+# All three include forms count, transitively: on Ubuntu su-l reaches
+# common-auth only through `auth include su`, and gdm's smartcard stacks
+# through `auth substack common-auth`. Reading `@include common-auth` alone
+# left five services out of the cost on this machine (review of PR #20).
+#
+# A file that cannot be read counts as reaching the shared stack with no line
+# of its own. For a cost stated in a question that defaults to yes,
+# overstating it is the safe mistake.
+_pam_fprintd_walk() {
+  local f="$1" shared="$2" path="$3" depth="${4:-0}"
+  local line lc inc inc_file
+  [ "$depth" -lt 8 ] || return 0
+  if [ ! -f "$f" ] || [ ! -r "$f" ]; then
+    _pam_fp_reaches=1
+    _pam_fp_auth=1
+    return 0
+  fi
+  while IFS= read -r line; do
+    line="${line%%#*}"
+    # Only a line that says "include" or "substack", in some case, can be an
+    # include, and only those are worth the subshell _pam_include_target()
+    # costs. Asking it about every line made the cost take 2.8 s to work out
+    # on a real /etc/pam.d, twice per question.
+    case "${line,,}" in
+      *include* | *substack*)
+        if inc="$(_pam_include_target "$line")"; then
+          inc_file="$(pam_config_file "$inc" "$path")" || continue
+          if [ "$inc_file" = "$shared" ]; then
+            _pam_fp_reaches=1
+            _pam_fp_auth=1
+          else
+            _pam_fprintd_walk "$inc_file" "$shared" "$path" "$((depth + 1))"
+          fi
+          continue
+        fi
+        ;;
+    esac
+    # the type is compared the way libpam compares it, without regard to case
+    lc="$line"
+    if [[ "$line" =~ ^([[:space:]]*)([^[:space:]]+)(.*)$ ]]; then
+      lc="${BASH_REMATCH[1]}${BASH_REMATCH[2],,}${BASH_REMATCH[3]}"
     fi
-    if grep -qE "$PAM_FPRINTD_AUTH_RE" < <(_pam_logical_lines "$f"); then continue; fi
-    echo "$f"
+    [[ "$lc" =~ ^[[:space:]]*-?auth[[:space:]] ]] || continue
+    _pam_fp_auth=1
+    # the walk runs in libpam's order, so "reached yet" is simply the flag
+    if [ "$_pam_fp_reaches" = 0 ] && [[ "$lc" =~ $PAM_FPRINTD_AUTH_RE ]]; then
+      _pam_fp_own=1
+    fi
+  done < <(_pam_logical_lines "$f")
+  return 0
+}
+
+# Prints the files, across every directory in $3 (default PAM_CONFIG_PATH),
+# for which _pam_fprintd_walk() answers what $1 asks:
+#
+#   loses  reaches the shared stack $2 and has no fingerprint line of its own
+#   twice  reaches it *and* has one that runs before it - with fingerprint
+#          back in the shared stack, such a service tries the reader twice
+#          before the password
+#
+# Only files with an auth phase of their own are listed, and only the copy
+# libpam actually reads: /usr/lib/pam.d/polkit-1 counts when /etc/pam.d has no
+# polkit-1, and never when it does. Reading /etc/pam.d alone is how polkit
+# went missing from the cost on Ubuntu 26.04 (GitHub issue #19).
+_pam_fprintd_scan() {
+  local mode="$1" shared="$2" path="$3"
+  local dir f dirs=() _pam_fp_reaches _pam_fp_own _pam_fp_auth
+  IFS=: read -r -a dirs <<<"$path"
+  for dir in "${dirs[@]}"; do
+    [ -n "$dir" ] || continue
+    for f in "$dir"/*; do
+      [ -f "$f" ] || continue
+      if [ "$f" = "$shared" ]; then continue; fi
+      if [[ "$f" =~ $PAM_NON_SERVICE_RE ]]; then continue; fi
+      # shadowed by a copy of the same name earlier in the path: libpam never
+      # reads this one, whatever it says
+      [ "$(pam_config_file "${f##*/}" "$path")" = "$f" ] || continue
+      _pam_fp_reaches=0 _pam_fp_own=0 _pam_fp_auth=0
+      _pam_fprintd_walk "$f" "$shared" "$path"
+      [ "$_pam_fp_auth" = 1 ] && [ "$_pam_fp_reaches" = 1 ] || continue
+      case "$mode" in
+        loses) [ "$_pam_fp_own" = 0 ] || continue ;;
+        twice) [ "$_pam_fp_own" = 1 ] || continue ;;
+      esac
+      echo "$f"
+    done
   done
   return 0
+}
+
+# Prints the services that would stop offering fingerprint if it were removed
+# from the shared stack $1: the ones whose auth phase reaches it, with no
+# pam_fprintd line of their own anywhere on the way. A service with its own
+# line keeps fingerprint and is deliberately left out, so the cost quoted to
+# the user is the real one rather than "everything that includes common-auth".
+#
+# Printed rather than summarised because the list is the whole point.
+# pam_fprintd_shared_stack_prompts() below names the part of it people meet.
+pam_fprintd_services_losing_fingerprint() {
+  _pam_fprintd_scan loses "${1:-$PAM_SHARED_AUTH_STACK}" "${2:-$PAM_CONFIG_PATH}"
+}
+
+# Prints the services that reach the shared stack $1 *and* carry a pam_fprintd
+# line of their own above it - what README's per-service recipe produces. With
+# fingerprint back in the shared stack, they try the reader twice before the
+# password; uninstall.sh says so before it re-enables the profile.
+pam_fprintd_services_asking_twice() {
+  _pam_fprintd_scan twice "${1:-$PAM_SHARED_AUTH_STACK}" "${2:-$PAM_CONFIG_PATH}"
+}
+
+# Succeeds if the service whose file is $1 loses fingerprint with the shared
+# stack's line gone. A file with no auth-phase line at all - empty,
+# session-only - is answered for "other", whose auth phase libpam uses for it.
+_pam_fprintd_service_loses() {
+  local f="$1" shared="$2" path="$3" other
+  local _pam_fp_reaches=0 _pam_fp_own=0 _pam_fp_auth=0
+  _pam_fprintd_walk "$f" "$shared" "$path"
+  if [ "$_pam_fp_auth" = 0 ]; then
+    other="$(pam_config_file other "$path")" || return 1
+    [ "$other" != "$f" ] || return 1
+    _pam_fprintd_walk "$other" "$shared" "$path"
+  fi
+  [ "$_pam_fp_reaches" = 1 ] && [ "$_pam_fp_own" = 0 ]
+}
+
+# Prints, as one phrase ("sudo and polkit"), the everyday prompts whose
+# fingerprint comes from the shared stack on this machine: the part of the
+# cost a person actually meets. Prints nothing when none of them depends on
+# it.
+#
+# Worked out from the files, never assumed. Until GitHub issue #19 the
+# installer said "sudo keeps it" unconditionally, which was true only where
+# /etc/pam.d/sudo had been given its own pam_fprintd.so line by hand - the
+# file Ubuntu ships has none. Disabling the fprintd profile there takes
+# fingerprint from sudo as well as from polkit, and the question that
+# disables it defaults to yes, so its text is where the cost has to be right.
+#
+# A prompt is named only when its service has a file, found the way libpam
+# finds it - a missing file says nothing about whether the program is even
+# installed, and its cost is carried by "other" in the full list. `sudo -i` is
+# a service of its own on Debian-family systems (sudo-i, checked with sudo-rs),
+# and is named only when plain sudo keeps fingerprint; otherwise "sudo" says
+# it.
+pam_fprintd_shared_stack_prompts() {
+  local shared="${1:-$PAM_SHARED_AUTH_STACK}" path="${2:-$PAM_CONFIG_PATH}"
+  local names=() svc cfg sudo_lost=false
+  for svc in sudo sudo-i polkit-1; do
+    cfg="$(pam_config_file "$svc" "$path")" || continue
+    _pam_fprintd_service_loses "$cfg" "$shared" "$path" || continue
+    case "$svc" in
+      sudo) names+=(sudo); sudo_lost=true ;;
+      sudo-i) [ "$sudo_lost" = true ] || names+=("sudo -i") ;;
+      polkit-1) names+=(polkit) ;;
+    esac
+  done
+  case "${#names[@]}" in
+    0) ;;
+    1) printf '%s\n' "${names[0]}" ;;
+    *) printf '%s and %s\n' "${names[0]}" "${names[1]}" ;;
+  esac
+  return 0
+}
+
+# The question that leads to disabling the fprintd profile. It names the
+# prompts in $1 (from pam_fprintd_shared_stack_prompts) when there are any,
+# and otherwise the number of services in $2, whose list install.sh prints
+# right above it. Every prompt there defaults to yes, so the cost has to be in
+# the question itself - a bare "Fix the lock screen?" is what the review of
+# PR #20 found the end-of-run check asking.
+pam_fprintd_conflict_question() {
+  local prompts="$1" count="${2:-0}"
+  if [ -n "$prompts" ]; then
+    printf 'Fix the lock screen? Fingerprint stops being offered in %s prompts.' "$prompts"
+  elif [ "$count" -eq 1 ]; then
+    printf 'Fix the lock screen? The service above falls back to the password.'
+  elif [ "$count" -gt 1 ]; then
+    printf 'Fix the lock screen? The %s services above fall back to the password.' "$count"
+  else
+    printf 'Fix the lock screen?'
+  fi
 }
 
 # Succeeds if the pam_fprintd line in the shared stack is one pam-auth-update

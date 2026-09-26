@@ -1,0 +1,3 @@
+#
+# A comment after the include name: libpam cuts it off and includes the file.
+@include common-auth   # the system default
