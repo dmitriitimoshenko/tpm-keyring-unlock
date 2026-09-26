@@ -12,7 +12,10 @@ EOF
 }
 
 post_upgrade() {
-  echo "==> If PAM stacks were already wired, nothing needs re-running."
+  echo "==> Run tpm-keyring-unlock-configure once after an upgrade: it re-checks"
+  echo "==> the PAM stacks an older version wired, and takes the helper back"
+  echo "==> out of any the current checks refuse. Answer n at 'Overwrite?' to"
+  echo "==> keep your sealed secret."
   echo "==> Re-seal only after a Secure Boot or keyring password change:"
   echo "==>     tpm-keyring-seal"
 }

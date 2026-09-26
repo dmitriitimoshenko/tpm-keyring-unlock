@@ -5894,6 +5894,10 @@ unaffected: 17 services, "sudo -i and polkit", and sudo is still the one that
 would ask twice.
 ## The insertion-point check failed open on an include it could not find (2026-09-25, same investigation)
 
+**[Moved 2026-09-26: written for PR #20, reverted out of it when the review's
+findings were split in two, and re-applied in the pull request that takes the
+insertion-point check. The entry after this one continues it.]**
+
 Found by following the `/usr/lib/pam.d` thread above through the rest of
 `bin/lib.sh`. `_pam_stack_authenticates()` resolved every include as
 `/etc/pam.d/<name>` and began with
@@ -5934,7 +5938,12 @@ authenticate", which means refused:
 - A name found nowhere, including in a directory this tool does not model
   (openSUSE's `/usr/etc/pam.d`), is refused. libpam fails such a stack
   outright ("include found nowhere" in the table), so refusing it takes
-  nothing away.
+  nothing away. **[Corrected 2026-09-26: outright only for `@include`. A
+  missing `auth include` or `auth substack` target fails at its own line, so
+  a stack that grants a login above it - `auth sufficient pam_fprintd.so`,
+  say - still works, and refusing it costs that stack. The refusal stands:
+  the error is on the safe side, and the file is missing either way. See the
+  2026-09-26 entries.]**
 
 The only cost is on fixtures. `shared/gdm-password` has `@include
 common-account` below its keyring line, and `shared/` had no `common-account`,
@@ -5964,4 +5973,267 @@ These pass on both old and new, and have to:
 - `vendor/etc/keyring-above-vendor-session`: a vendor-only include with no
   auth module is still accepted.
 - The stock Ubuntu 26.04 `gdm-password` is still accepted, resolved across
-  both directories.
+  both directories. **[Corrected 2026-09-26, review of PR #20: when this was
+  written, that fixture was a synthetic five-line copy of `shared/`'s, and
+  the real file - with `@include common-session` and `common-password` below
+  its keyring line - would have been refused against a tree that lacked
+  those. The fixture is the real one now, its includes are in the tree, and
+  it is accepted.]**
+
+## The insertion-point check reads lines the way libpam does, and re-checks what it wired (2026-09-26, the other half of PR #20's review)
+
+The half of PR #20's review that concerns the check deciding whether
+`pam_tpm_keyring_authtok.so` may go above a keyring line: nothing below that
+line may be able to log someone in with the TPM-unsealed `PAM_AUTHTOK`. The
+review confirmed four ways this check read a PAM line differently from
+libpam. In each, the check said "safe" while libpam would have run
+`pam_unix.so try_first_pass` below the inserted line. All four predate this
+work (they are on `main`), and all four need a hand-written stack; no
+distribution ships one. They are fixed anyway, because this is the one
+predicate whose permissive mistake is a login bypass. The measurements they
+rest on are the table in the 2026-09-26 entry above.
+
+### One line model, in one place
+
+`_pam_logical_lines()` now reads a file the way libpam does, and every
+predicate reads through it:
+
+- A comment is cut at the first `#` before continuations are looked at. That
+  covers `@include common-auth # fallback`, which the include regex's `$`
+  anchor used to reject outright, so the include was never followed. It also
+  covers `... # note \`, whose backslash used to glue the *next* line, a live
+  `pam_unix.so` line, into the comment.
+- The type and a plain control word are folded to lower case (`AUTH`,
+  `Include`, `@INCLUDE`), because libpam compares them without regard to case.
+  A bracketed control is left alone, because its values are case-sensitive,
+  which was measured rather than assumed: `[SUCCESS=DONE]` is not honoured.
+  Folding it would have made this tool believe in controls libpam ignores.
+- The include itself is read by `_pam_include_target()`, which PR #20 added
+  for the cost walk. It takes the first word after `@include`, so `@include X
+  extra words` is followed the way libpam follows it.
+- `PAM_PRIMARY_AUTH_RE` accepts a module named by its absolute path, which
+  libpam loads like a bare name. It also now lists `pam_systemd_home.so`,
+  which logs homed users in and uses a `PAM_AUTHTOK` an earlier module set.
+  The list stays wider than the one `pam_shared_stack_is_sane_without_fprintd`
+  uses, on purpose. There a false "yes" puts a broken stack back; here a false
+  "no" is a bypass. **[Superseded the same day: `PAM_PRIMARY_AUTH_RE` is gone.
+  The repo owner chose an allowlist of harmless modules instead, see the
+  entry after this one.]**
+
+### A continuation libpam versions disagree about
+
+A comment or blank line inside a continuation is carried past by libpam 1.5
+and ends the logical line in 1.7. No single reading is conservative for both.
+Take `auth optional pam_foo.so \`, then a comment, then `auth required
+pam_unix.so`. On 1.5 the last line becomes arguments to pam_foo; on 1.7 it is
+a live `pam_unix.so`. Now take `auth \`, a comment, then `required
+pam_unix.so`. That is a live `pam_unix.so` on 1.5 and two malformed lines on
+1.7. Whichever reading the check took, one of these would pass on the wrong
+version. So `_pam_config_is_ambiguous()` spots such a file, and the check
+refuses it rather than betting. **[Superseded the same day: that separate
+reader is folded into `_pam_logical_lines()`, which returns 2 for such a
+file. Two readers of one set of rules could drift apart, as the review
+pointed out.]** A continuation that runs into the end of the
+file gets the same treatment. `_pam_logical_lines()` itself prints the 1.7
+reading, for the predicates that only look.
+
+### Read errors, and one walk instead of two
+
+`_pam_logical_lines()` reads the file with `cat` first and fails if that
+fails, so a read error is no longer a silently short file. The review's
+`@include /proc/self/mem` passed `-f && -r` and then read as "no lines",
+which made it safe. The walk below the keyring line and the walk into an
+include were two copies of the same loop with opposite return values. The
+review found that only one of them was pinned by a test: turning the nested
+copy fail-open left all 184 checks green. It is one function now,
+`_pam_lines_authenticate()`, with a nested-include fixture on each side of
+it.
+
+### Stacks wired before the check could see this
+
+A stack that already carried our line was skipped at plan time as "already
+wired in", so one wired under an older, more permissive verdict kept its
+line forever. The AUR package even told users "nothing needs re-running".
+install.sh now runs the same check on wired stacks. Our line sits above the
+keyring line, where the check does not look, so it gives the same verdict with
+the line in place as without (there is a test for that). A stack that fails
+now gets a planned, backed-up step that takes our line back out, re-checked
+at write time like every other PAM edit in step 3. Removing an `optional`
+line that never votes cannot lock anyone out; it is the uninstaller's own
+edit. The AUR `post_upgrade` message now says to run the configure step once
+after an upgrade, and to answer `n` at "Overwrite?" to keep the sealed
+secret.
+
+### What it costs
+
+The new reader is slower per line than the old one-regex loop. A first
+version ran a regex on every line of every file and forked
+`_pam_include_target()` on every line of the walk, and the pipefail
+stability checks alone went past a minute. With globs deciding which lines
+are worth a regex or a subshell:
+
+    _pam_logical_lines, a 400-line file         6 ms on main    15 ms now
+    all 7 insertion checks on this machine      0.10 s          0.19 s
+    the cost scan on this machine (PR #20)      0.46 s          0.76 s
+    test/unit-regex-test.sh                     8.3 s           14.7 s
+
+The suite's growth is almost all the synthetic 400-line stability files, run
+200 times each. Real PAM files are 20 to 60 lines.
+
+### Verified
+
+    this machine, 7 candidates vs main's predicate           same verdict (safe) for every one
+    stock Ubuntu 26.04 + gdm3 50.1's PAM files, fprintd on   6 candidates, all safe; gdm-fingerprint
+                                                             still eligible for the attempt stack
+    unit suite                                               252 checks; 24 of them fail against
+                                                             PR #20's lib.sh (9761dc5)
+
+The 24 are the fixes: a fixture for each way a line used to be read
+differently, the nested and absolute includes, the read error, the unreadable
+include, the wired stack, and the reader's own checks. The positive cases -
+a commented-out `pam_unix.so`, a harmless nested include, an absolute include
+naming a file with no auth phase, the wired stock `gdm-password` - pass on
+both sides by construction. They are there so that "refuse more" cannot
+quietly become "refuse everything".
+
+### Deliberately not done
+
+- **Refusing every unknown module below the keyring line.** A whitelist of
+  harmless modules would be stricter than the list of known password modules
+  used now, and it would refuse stacks that work today. `pam_ecryptfs` and
+  `pam_mount` read `PAM_AUTHTOK` to unwrap and mount, not to let anyone in.
+  That trade is for the repo owner to make, and it is recorded here rather
+  than made silently. **[Superseded the same day: the owner made it, after a
+  second review. See the next entry.]**
+- **Wiring stacks that live only in `/usr/lib/pam.d`.** That needs an
+  `/etc/pam.d` override written by this tool, a decision of its own (noted on
+  2026-09-25).
+
+## Only vetted modules may run after the helper (2026-09-26, the repo owner's decision)
+
+A second review of the combined work, at `xhigh`, found more lines libpam runs
+that the insertion check could not see. Each one was the same kind of bug the
+first review had just fixed:
+
+- a bracketed type or module (`[auth]`, `[pam_unix.so]`);
+- a `]` glued to the module, or a `\]` inside a bracket;
+- `-@include`;
+- a Turkish locale folding `INCLUDE` to `ınclude`;
+- modules that take the token without being pam_unix: `pam_extrausers` (a
+  pam_unix fork Ubuntu ships), `pam_userdb`, `pam_exec expose_authtok`.
+
+Three findings did not depend on spelling at all:
+
+- `sed` inserts above every physical keyring line, while the check looked
+  below the first logical one;
+- a service that *includes* the stack and runs `pam_unix.so` after the include
+  was never looked at;
+- at write time, only stacks already planned for removal were re-checked.
+
+The trend was the argument. Under a rule of "refuse the known password
+modules", every unmodelled spelling and every unlisted module is a login
+bypass, and each review finds the next one. The options were put to the repo
+owner: keep patching one spelling at a time, or turn the rule around. The
+owner chose to turn it around, asking only that the list hold modules we are
+sure of, and asked what "refused" means in practice. It means install.sh does
+not patch that stack and says why; logins there are untouched, and the
+keyring stays locked until its password is typed.
+
+### The rule
+
+Everything that runs after `pam_tpm_keyring_authtok` is checked: below the
+keyring line, everything included from there, and everything after the
+include in any file that includes the stack, followed transitively. It must
+satisfy both of these:
+
+- **It reads cleanly under a strict grammar.** The type is one of the four
+  phases, with or without the dash, or `@include`. The control is one plain
+  word, or one bracket expression that closes before a blank and holds no `[`
+  or `\`. The module is a bare name. Lines of the other phases are skipped,
+  since they never run the auth-phase line.
+- **It names a module on `PAM_AFTER_TOKEN_MODULE_RE`.** The list is permit,
+  deny, nologin, succeed_if, localuser, shells, faildelay, faillock, echo,
+  warn, env, keyinit, cap, group, fprintd, gnome_keyring, kwallet, kwallet5,
+  and this tool's own module. Each one either never looks at `PAM_AUTHTOK` or
+  reads it only to unlock a keyring or wallet. None of them imports
+  `pam_get_authtok`, checked with `nm` on Ubuntu 26.04; pam_unix does. That
+  import test cannot replace the list: extrausers, userdb and exec reach the
+  token through `pam_get_item`, which every module uses for everything. That
+  is why the list names the harmless rather than the dangerous.
+
+Anything else is a refusal, and `PAM_INSERTION_REFUSAL` carries the reason
+for install.sh to print, e.g. "pam_extrausers.so runs after the keyring line,
+and is not on the list of modules known to leave PAM_AUTHTOK alone".
+
+### The three structural gaps
+
+- **The writer and the check agree on one line.**
+  `_pam_keyring_anchor_is_single()` requires exactly one physical line
+  matching the keyring regex, which is what sed inserts above. It must also
+  be exactly one logical line, with no comment on it, and not part of a
+  continuation.
+- **Includers.** `_pam_includers_are_harmless()` finds, with one `grep -lF`
+  per directory, the files that name the stack. For each one, whatever follows
+  the first line naming it must pass the same rule, and so must that file's
+  own includers. If the first line naming the stack is not an include this
+  tool reads (`-@include`, a bracket), that is a refusal. Lines of the other
+  phases are skipped here too. Backups are scanned as well, because libpam
+  reads a dotted file if something includes it.
+- **Write time.** Every wired stack is re-checked just before step 3 touches
+  anything. One that fails without having been planned for removal is shown
+  with its reason and asked about. Removing our `optional` line cannot lock
+  anyone out. install.sh and uninstall.sh now take the line out with one
+  shared sed expression, `PAM_TPM_LINE_DELETE_SED`.
+
+Also from this review:
+
+- `_pam_logical_lines()` folds case under `LC_ALL=C`, and so does
+  `_pam_include_target()`.
+- The ambiguity reader is folded into `_pam_logical_lines()` as exit status 2.
+- The fingerprint-only, fall-through and relative-jump predicates, and the
+  cost walk, capture their lines, so a read that fails half-way no longer
+  looks like a shorter file. The walk checks `-f` before reading anything, so
+  it never opens a FIFO.
+
+### What it refuses, and what it does not
+
+Refused now and accepted before:
+
+- any stack with a module off the list below its keyring line, e.g.
+  `pam_ecryptfs` or `pam_mount` placed there;
+- any stack the grammar does not read.
+
+Checked against the stacks distributions ship, with the real package files in
+containers:
+
+    this machine (Ubuntu 26.04), 7 wired gdm stacks            all safe
+    Ubuntu 26.04: gdm3 50.1 (6 stacks), lightdm 1.32           all safe
+    Debian 12:    gdm3 43.0 (6 stacks), lightdm 1.26           all safe
+    Fedora 44:    gdm (gdm-password, -autologin, -switchable)  all safe
+    Arch:         gdm (gdm-password, -autologin, -fingerprint, -smartcard)  all safe
+
+Below their keyring lines these stacks have only `pam_permit` (autologin),
+`-auth pam_kwallet*` (lightdm), and includes of account, session and password
+files.
+
+### Tests
+
+284 checks. They cover each spelling and module from the review (refused),
+what the shipped stacks put below the keyring line (safe), the reason text,
+the writer/check agreement, includers (direct, through a second file, and
+spelled in a way the tool does not read), and the Turkish locale where it is
+installed. Every new check was mutation-tested. Dropping `LC_ALL=C`, the
+includer scan or the anchor check each makes exactly its own checks fail.
+The pipefail stability fixture now pads with `pam_echo`, since
+`pam_filler_N.so` is, correctly, no longer allowed below a keyring line.
+
+### Not done
+
+- OBS deb/rpm packages print nothing on upgrade. README now tells package
+  users to run the configure step once after upgrading, and AUR's
+  `post_upgrade` says so. A `debian.postinst` and a `%post` scriptlet would
+  say it at the right moment, but neither can be built here, and a broken one
+  surfaces only at release time.
+- Candidate discovery still reads `/etc/pam.d` only (noted on 2026-09-25).
+- The cost walk runs two or three times per question with nothing cached:
+  0.76 s on this machine. It is left as it is.

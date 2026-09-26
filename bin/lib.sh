@@ -186,9 +186,8 @@ PAM_AUTH_PASSIVE_MODULE_RE='^pam_(fprintd|nologin|succeed_if|faillock|tally2?|de
 # rather than trying to follow the include.
 PAM_AUTHLESS_INCLUDE_RE='^common-(account|session|session-noninteractive|password)$'
 
-# Prints $1 with PAM's backslash line continuations joined, so every output
-# line is one logical config line. Every predicate below reads through this
-# rather than the file directly.
+# Prints $1 the way libpam reads it, one logical config line per output line.
+# Every predicate below reads through this rather than the file directly.
 #
 # Without it a second auth-phase module split across two physical lines is
 # invisible to them - `auth \` on one line has no module token to look at, and
@@ -196,8 +195,32 @@ PAM_AUTHLESS_INCLUDE_RE='^common-(account|session|session-noninteractive|passwor
 # both are skipped and a shared stack reads as fingerprint-only. Exactly the
 # hole the leading-dash form had. See JOURNAL.md, 2026-09-15.
 #
-# The trailing backslash is dropped and the next physical line appended as-is,
-# which is what libpam's own parser does.
+# libpam's rules, each one measured with pamtester (JOURNAL.md, 2026-09-26) -
+# a predicate that reads a line differently from libpam can call a stack safe
+# in which libpam runs a password module:
+#
+# - A comment starts at the first `#` on a physical line, and is cut *before*
+#   continuations are looked at: a backslash inside a comment, or in front of
+#   one, continues nothing.
+# - A backslash that ends a line, trailing blanks allowed, joins the next line
+#   and stands for a space.
+# - Blank and comment-only lines are skipped. One *inside* a continuation is
+#   where libpam versions part ways: 1.5 carries the continuation on past it,
+#   1.7 ends the logical line there. This prints the 1.7 reading and returns
+#   2, so a safety check can refuse such a file rather than bet on either.
+# - The type (auth, -auth, @include) and a plain control word (required,
+#   include, substack, ...) are case-insensitive, so they come out in lower
+#   case. A bracketed control stays as written: its values are case-sensitive,
+#   and [SUCCESS=DONE] is not [success=done] to libpam.
+#
+# Returns 1, having printed nothing, when the file cannot be read to the end,
+# so a caller that captures the output can tell "no lines" from "could not
+# read". Returns 2, having printed the 1.7 reading, when the file has a
+# continuation whose meaning depends on the libpam version: one that runs into
+# a blank or comment line, or into the end of the file. No distro ships
+# either. One pass decides both, so the rules cannot drift apart between two
+# readers (review of PR #20).
+#
 # NEVER put this on the left of a pipe feeding `grep -q` (or anything else
 # that exits early): this is a shell function writing one line at a time, so
 # when the reader leaves first the writer dies of SIGPIPE, the pipeline's
@@ -209,16 +232,78 @@ PAM_AUTHLESS_INCLUDE_RE='^common-(account|session|session-noninteractive|passwor
 # instead: the process substitution's exit status is nobody's business but
 # its own. See JOURNAL.md, 2026-09-16, and mtriam/tpm-keyring-unlock#1.
 _pam_logical_lines() {
-  local f="$1" line acc=""
-  while IFS= read -r line || [ -n "$line" ]; do
-    if [[ "$line" =~ ^(.*)\\$ ]]; then
-      acc="$acc${BASH_REMATCH[1]}"
+  # LC_ALL=C for the case fold: in a Turkish locale bash folds `I` to a
+  # dotless `ı`, and `INCLUDE` would no longer read as `include` - libpam's
+  # strcasecmp runs in the C locale (review of PR #20).
+  local LC_ALL=C
+  local f="$1" content raw="" line acc="" cont=0 ambiguous=0
+  # read in one go, so that a read error (EIO, a file that vanishes) is a
+  # failure here rather than an early, silent end of the loop below
+  content="$(cat -- "$f" 2>/dev/null)" || return 1
+  # Globs and expansions rather than regexes on the common path: this runs on
+  # every line of every file each predicate reads, and a regex apiece made the
+  # pipefail stability checks alone take over a minute.
+  while IFS= read -r raw || [ -n "$raw" ]; do
+    line="${raw#"${raw%%[![:space:]]*}"}"
+    if [ -z "$line" ] || [ "${line:0:1}" = "#" ]; then
+      if [ "$cont" = 1 ]; then
+        _pam_print_logical_line "$acc"
+        acc="" cont=0 ambiguous=1
+      fi
       continue
     fi
-    printf '%s%s\n' "$acc" "$line"
-    acc=""
-  done <"$f"
-  [ -z "$acc" ] || printf '%s\n' "$acc"
+    case "$raw" in
+      *"#"*)
+        line="$acc${raw%%#*}"
+        ;;
+      *\\*)
+        if [[ "$raw" =~ ^(.*)\\[[:space:]]*$ ]]; then
+          acc="$acc${BASH_REMATCH[1]} "
+          cont=1
+          continue
+        fi
+        line="$acc$raw"
+        ;;
+      *)
+        line="$acc$raw"
+        ;;
+    esac
+    acc="" cont=0
+    # the fold is only needed where there is upper case to fold
+    case "$line" in
+      *[[:upper:]]*) _pam_print_logical_line "$line" ;;
+      *) printf '%s\n' "$line" ;;
+    esac
+  done <<<"$content"
+  if [ -n "$acc" ]; then
+    _pam_print_logical_line "$acc"
+    ambiguous=1
+  fi
+  [ "$ambiguous" = 0 ] || return 2
+}
+
+# Prints one logical line with its type and a plain control word folded to
+# lower case - the parts libpam compares with strcasecmp. Nothing else is
+# touched: file and module names are case-sensitive, and so are the values of
+# a bracketed control.
+_pam_print_logical_line() {
+  local l="$1"
+  # nothing to fold on a line with no upper case in it, which is nearly all
+  case "$l" in
+    *[[:upper:]]*) ;;
+    *)
+      printf '%s\n' "$l"
+      return 0
+      ;;
+  esac
+  if [[ "$l" =~ ^([[:space:]]*)(@[^[:space:]]*)(.*)$ ]]; then
+    l="${BASH_REMATCH[1]}${BASH_REMATCH[2],,}${BASH_REMATCH[3]}"
+  elif [[ "$l" =~ ^([[:space:]]*)([^[:space:]]+)([[:space:]]+)([^[:space:][]+)(.*)$ ]]; then
+    l="${BASH_REMATCH[1]}${BASH_REMATCH[2],,}${BASH_REMATCH[3]}${BASH_REMATCH[4],,}${BASH_REMATCH[5]}"
+  elif [[ "$l" =~ ^([[:space:]]*)([^[:space:]]+)(.*)$ ]]; then
+    l="${BASH_REMATCH[1]}${BASH_REMATCH[2],,}${BASH_REMATCH[3]}"
+  fi
+  printf '%s\n' "$l"
 }
 
 # Succeeds if no line in $1 ends in a backslash continuation.
@@ -252,9 +337,12 @@ pam_config_has_no_line_continuations() {
 # password prompt at all. Hence a whitelist, and a refusal on anything not
 # provably fingerprint-only.
 pam_auth_is_fingerprint_only() {
-  local f="$1" line module
+  local f="$1" line module lines
   [ -f "$f" ] || return 1
   grep -qE "$PAM_FPRINTD_AUTH_RE" "$f" || return 1
+  # Captured rather than read through `< <(...)`, so that a read that fails
+  # half-way is a refusal instead of a shorter file (review of PR #20).
+  lines="$(_pam_logical_lines "$f")" || return 1
 
   # `|| [ -n "$line" ]`: a file whose last line has no trailing newline
   # still gets that line checked. Missing it in a *safety* predicate would
@@ -285,7 +373,7 @@ pam_auth_is_fingerprint_only() {
       module="${BASH_REMATCH[2]}"
       [[ "$module" =~ $PAM_AUTH_PASSIVE_MODULE_RE ]] || return 1
     fi
-  done < <(_pam_logical_lines "$f")
+  done <<<"$lines"
 
   return 0
 }
@@ -528,8 +616,11 @@ pam_fprintd_has_single_auth_line() {
 # away cost nothing, and guessing at someone else's control field on a login
 # path is not worth the little it would buy. See JOURNAL.md, 2026-09-15.
 pam_fprintd_control_falls_through() {
-  local f="$1" line control inner found=false
+  local f="$1" line control inner found=false lines
   [ -f "$f" ] || return 1
+  # Captured rather than read through `< <(...)`, so that a read that fails
+  # half-way is a refusal instead of a shorter file (review of PR #20).
+  lines="$(_pam_logical_lines "$f")" || return 1
   while IFS= read -r line || [ -n "$line" ]; do
     line="${line%%#*}"
     [[ "$line" =~ ^[[:space:]]*-?auth[[:space:]]+(\[[^]]*\]|[^[:space:]]+)[[:space:]]+pam_fprintd\.so ]] || continue
@@ -546,7 +637,7 @@ pam_fprintd_control_falls_through() {
         ;;
       *) return 1 ;;
     esac
-  done < <(_pam_logical_lines "$f")
+  done <<<"$lines"
   [ "$found" = true ]
 }
 
@@ -566,8 +657,11 @@ pam_fprintd_control_falls_through() {
 # they aim at - which is why this stops at the fprintd line. See JOURNAL.md,
 # 2026-09-15.
 pam_auth_has_no_relative_jumps() {
-  local f="$1" line control
+  local f="$1" line control lines
   [ -f "$f" ] || return 1
+  # Captured rather than read through `< <(...)`, so that a read that fails
+  # half-way is a refusal instead of a shorter file (review of PR #20).
+  lines="$(_pam_logical_lines "$f")" || return 1
   while IFS= read -r line || [ -n "$line" ]; do
     line="${line%%#*}"
     if [[ "$line" =~ ^[[:space:]]*-?auth[[:space:]]+(\[[^]]*\]|[^[:space:]]+)[[:space:]]+pam_fprintd\.so ]]; then
@@ -577,7 +671,7 @@ pam_auth_has_no_relative_jumps() {
       control="${BASH_REMATCH[1]}"
       if [[ "$control" =~ =[0-9]+ ]]; then return 1; fi
     fi
-  done < <(_pam_logical_lines "$f")
+  done <<<"$lines"
   return 0
 }
 
@@ -748,6 +842,8 @@ pam_fprintd_in_shared_stack() {
 # after the name (measured with pamtester; JOURNAL.md, 2026-09-26) - and fails
 # when the line includes nothing into the auth phase.
 _pam_include_target() {
+  # C locale for the case fold, as in _pam_logical_lines()
+  local LC_ALL=C
   local t1="" t2="" t3=""
   read -r t1 t2 t3 _ <<<"${1%%#*}"
   if [ "${t1,,}" = "@include" ]; then
@@ -785,20 +881,28 @@ _pam_include_target() {
 # overstating it is the safe mistake.
 _pam_fprintd_walk() {
   local f="$1" shared="$2" path="$3" depth="${4:-0}"
-  local line lc inc inc_file
+  local line inc inc_file lines rc=0
   [ "$depth" -lt 8 ] || return 0
-  if [ ! -f "$f" ] || [ ! -r "$f" ]; then
+  # unreadable, or failing half-way through: counted as a loss, as promised.
+  # The -f test comes first so that nothing ever reads from a FIFO or device.
+  if [ -f "$f" ] && [ -r "$f" ]; then
+    lines="$(_pam_logical_lines "$f")" || rc=$?
+  else
+    rc=1
+  fi
+  if [ "$rc" = 1 ]; then
     _pam_fp_reaches=1
     _pam_fp_auth=1
     return 0
   fi
+  # _pam_logical_lines() hands over lines the way libpam reads them: comments
+  # cut, type and control in lower case. Nothing to normalise here any more.
   while IFS= read -r line; do
-    line="${line%%#*}"
-    # Only a line that says "include" or "substack", in some case, can be an
-    # include, and only those are worth the subshell _pam_include_target()
-    # costs. Asking it about every line made the cost take 2.8 s to work out
-    # on a real /etc/pam.d, twice per question.
-    case "${line,,}" in
+    # Only a line that says "include" or "substack" can be an include, and
+    # only those are worth the subshell _pam_include_target() costs. Asking it
+    # about every line made the cost take 2.8 s to work out on a real
+    # /etc/pam.d, twice per question.
+    case "$line" in
       *include* | *substack*)
         if inc="$(_pam_include_target "$line")"; then
           inc_file="$(pam_config_file "$inc" "$path")" || continue
@@ -812,18 +916,13 @@ _pam_fprintd_walk() {
         fi
         ;;
     esac
-    # the type is compared the way libpam compares it, without regard to case
-    lc="$line"
-    if [[ "$line" =~ ^([[:space:]]*)([^[:space:]]+)(.*)$ ]]; then
-      lc="${BASH_REMATCH[1]}${BASH_REMATCH[2],,}${BASH_REMATCH[3]}"
-    fi
-    [[ "$lc" =~ ^[[:space:]]*-?auth[[:space:]] ]] || continue
+    [[ "$line" =~ ^[[:space:]]*-?auth[[:space:]] ]] || continue
     _pam_fp_auth=1
     # the walk runs in libpam's order, so "reached yet" is simply the flag
-    if [ "$_pam_fp_reaches" = 0 ] && [[ "$lc" =~ $PAM_FPRINTD_AUTH_RE ]]; then
+    if [ "$_pam_fp_reaches" = 0 ] && [[ "$line" =~ $PAM_FPRINTD_AUTH_RE ]]; then
       _pam_fp_own=1
     fi
-  done < <(_pam_logical_lines "$f")
+  done <<<"$lines"
   return 0
 }
 
@@ -1087,95 +1186,329 @@ tpm_primary_handle_dependents() {
 # disabled the single scenario this tool exists for. See JOURNAL.md,
 # 2026-09-15.
 #
-# Modules that can authenticate with a password, and so could consume a
-# PAM_AUTHTOK they did not prompt for. Same list as
-# pam_shared_stack_is_sane_without_fprintd deliberately: one notion of "this
-# module can log somebody in" for the whole tool. pam_gnome_keyring is not in
-# it - it is the intended consumer of PAM_AUTHTOK and unlocks a keyring
-# rather than granting a session.
-PAM_PRIMARY_AUTH_RE='^[[:space:]]*-?auth[[:space:]]+(\[[^]]*\]|[^[:space:]]+)[[:space:]]+pam_(unix|sss|sssd|ldap|krb5|winbind)\.so'
+# How that is decided, since 2026-09-26: a list of the harmless, not of the
+# dangerous. Every auth-phase line that runs after our module - below the
+# keyring line, in everything included from there, and after the include in
+# every file that includes this one - has to read cleanly and name a module
+# known to leave PAM_AUTHTOK alone. Anything else is a refusal: a module this
+# tool has not vetted, a way of writing a line it does not model, an include
+# it cannot find or read. Two reviews in a row found lines libpam runs and the
+# old "known password modules" rule could not see - comments, case, absolute
+# paths, bracketed tokens, `-@include`, a Turkish locale - and each one was a
+# login bypass. Under this rule each is a stack left unwired, with the reason
+# printed. The repo owner chose this knowing it refuses stacks that work
+# today, such as one with pam_ecryptfs or pam_mount below the keyring line.
+# See JOURNAL.md, 2026-09-26.
 
-# Succeeds if the auth phase of $1 contains a primary auth module anywhere,
-# following @include / `auth include` / `auth substack`.
+# Modules allowed to run after pam_tpm_keyring_authtok in the auth phase. Each
+# one either never looks at PAM_AUTHTOK or only reads it to unlock something,
+# and none can turn it into a successful authentication:
 #
-# Used to look inside an include that sits below the insertion point: a stack
-# whose keyring line comes before `@include common-auth` puts the whole of
-# common-auth - pam_unix.so with try_first_pass and all - underneath our
-# module.
+#   permit deny                   fixed answers (autologin stacks end in permit)
+#   nologin succeed_if localuser  account attributes
+#   shells
+#   faildelay faillock            delays and failure counting
+#   echo warn env keyinit cap     messages, logging, environment, credentials
+#   group
+#   fprintd                       yes or no from the finger
+#   gnome_keyring kwallet         read the token to unlock a keyring or a
+#   kwallet5                      wallet, which is what it is for
+#   tpm_keyring_authtok           this tool's own module
 #
-# $2 is the search path includes are resolved against (PAM_CONFIG_PATH).
-_pam_stack_authenticates() {
-  local f="$1" path="${2:-$PAM_CONFIG_PATH}" depth="${3:-0}"
-  local line inc inc_file
-  # A file that cannot be read answers "yes", for the same reason the depth
-  # cap below does. Until 2026-09-25 a missing file answered "no" - and an
-  # include looked up in /etc/pam.d alone is missing exactly when libpam finds
-  # it in /usr/lib/pam.d instead, so a pam_unix.so there read as safe.
-  { [ -f "$f" ] && [ -r "$f" ]; } || return 0
-  # Include loops are legal to write and would otherwise hang an installer on
-  # a login path; libpam caps recursion, so cap it here too. Hitting the cap
-  # reports "yes, this authenticates" on purpose - the honest answer is "could
-  # not tell", and the only caller treats that as a reason to refuse. Failing
-  # open here would mean an include chain we gave up on reads as safe. Real
-  # stacks are one or two levels deep, so nothing legitimate reaches this.
-  [ "$depth" -lt 8 ] || return 0
+# None of them imports pam_get_authtok; pam_unix does (checked with nm on
+# Ubuntu 26.04). That test alone could not replace this list: pam_extrausers,
+# pam_userdb and pam_exec take the token through the general pam_get_item. A
+# module that belongs here is added once someone has read what it does with
+# the token, never by default.
+PAM_AFTER_TOKEN_MODULE_RE='^pam_(permit|deny|nologin|succeed_if|localuser|shells|faildelay|faillock|echo|warn|env|keyinit|cap|group|fprintd|gnome_keyring|kwallet|kwallet5|tpm_keyring_authtok)\.so$'
+
+# Why the last pam_auth_insertion_point_is_safe() said no, in words install.sh
+# prints next to the stack it did not wire.
+PAM_INSERTION_REFUSAL=""
+
+# Succeeds if every logical line in $1 may run after our module has set
+# PAM_AUTHTOK. $2 is the search path includes are resolved against, $3 the
+# include depth. Sets PAM_INSERTION_REFUSAL when it fails.
+#
+# The lines come from _pam_logical_lines(): comments cut, continuations
+# joined, the type and a plain control in lower case. From there the grammar
+# is strict on purpose. The type is one of the four phases (with or without
+# libpam's leading dash) or `@include`. The control is one plain word, or one
+# bracket expression that closes before a blank and holds no `[` or `\`. The
+# module is a bare name. libpam accepts more than that - a bracketed type or
+# module, `]` glued to the module, `\]` inside a bracket, `-@include` - and
+# each of those let a password module through the old check. Here they are
+# simply refused.
+_pam_lines_are_harmless() {
+  local lines="$1" path="$2" depth="$3" line type rest ctl mod inc
   while IFS= read -r line; do
-    [[ ! "$line" =~ $PAM_PRIMARY_AUTH_RE ]] || return 0
-    if [[ "$line" =~ ^[[:space:]]*@include[[:space:]]+([^[:space:]]+)[[:space:]]*$ ]]; then
-      inc="${BASH_REMATCH[1]}"
-    elif [[ "$line" =~ ^[[:space:]]*-?auth[[:space:]]+(include|substack)[[:space:]]+([^[:space:]]+) ]]; then
-      inc="${BASH_REMATCH[2]}"
+    type="" rest=""
+    read -r type rest <<<"$line"
+    case "$type" in
+      "") continue ;;
+      account | -account | session | -session | password | -password) continue ;;
+      @include)
+        inc=""
+        read -r inc _ <<<"$rest"
+        _pam_include_is_harmless "$inc" "$path" "$depth" || return 1
+        continue
+        ;;
+      auth | -auth) ;;
+      *)
+        PAM_INSERTION_REFUSAL="a line this tool does not read: $line"
+        return 1
+        ;;
+    esac
+    if [ "${rest:0:1}" = "[" ]; then
+      ctl="${rest%%]*}]"
+      rest="${rest#"$ctl"}"
+      if [[ "$ctl" == *\\* || "${ctl:1}" == *"["* || ! "$rest" =~ ^[[:space:]] ]]; then
+        PAM_INSERTION_REFUSAL="a control this tool does not read: $line"
+        return 1
+      fi
     else
+      ctl=""
+      read -r ctl rest <<<"$rest"
+      case "$ctl" in
+        include | substack)
+          inc=""
+          read -r inc _ <<<"$rest"
+          _pam_include_is_harmless "$inc" "$path" "$depth" || return 1
+          continue
+          ;;
+        required | requisite | sufficient | optional) ;;
+        *)
+          PAM_INSERTION_REFUSAL="a control this tool does not read: $line"
+          return 1
+          ;;
+      esac
+    fi
+    mod=""
+    read -r mod _ <<<"$rest"
+    if [[ ! "$mod" =~ $PAM_AFTER_TOKEN_MODULE_RE ]]; then
+      PAM_INSERTION_REFUSAL="${mod:-a line with no module} runs after the keyring line, and is not on the list of modules known to leave PAM_AUTHTOK alone"
+      return 1
+    fi
+  done <<<"$lines"
+  return 0
+}
+
+# Succeeds if the file included as $1 - found on $2 the way libpam finds it -
+# may run in full after our module. An include that cannot be found or read
+# is a refusal: libpam fails a service over a missing @include and a missing
+# `auth include` at its own line (measured; JOURNAL.md, 2026-09-26), so a
+# refusal costs at most a stack that works without the file.
+_pam_include_is_harmless() {
+  local name="$1" path="$2" depth="$3" inc_file
+  if [ -z "$name" ]; then
+    PAM_INSERTION_REFUSAL="an include that names no file"
+    return 1
+  fi
+  if ! inc_file="$(pam_config_file "$name" "$path")"; then
+    PAM_INSERTION_REFUSAL="it includes $name, which is in none of ${path//:/, }"
+    return 1
+  fi
+  _pam_file_is_harmless "$inc_file" "$path" "$((depth + 1))"
+}
+
+# Succeeds if every line of the file $1 may run after our module.
+_pam_file_is_harmless() {
+  local f="$1" path="$2" depth="$3" lines rc=0
+  # Include loops are legal to write, and libpam caps them; so does this.
+  # Real stacks are one or two levels deep.
+  if [ "$depth" -ge 8 ]; then
+    PAM_INSERTION_REFUSAL="includes nest more than 8 deep at $f"
+    return 1
+  fi
+  if [ ! -f "$f" ] || [ ! -r "$f" ]; then
+    PAM_INSERTION_REFUSAL="$f cannot be read"
+    return 1
+  fi
+  lines="$(_pam_logical_lines "$f")" || rc=$?
+  case "$rc" in
+    0) ;;
+    2)
+      PAM_INSERTION_REFUSAL="$f continues a line past a comment or blank line, which libpam 1.5 and 1.7 read differently"
+      return 1
+      ;;
+    *)
+      PAM_INSERTION_REFUSAL="$f could not be read to the end"
+      return 1
+      ;;
+  esac
+  _pam_lines_are_harmless "$lines" "$path" "$depth"
+}
+
+# Prints the logical lines in $1 that follow its first auth-phase
+# pam_gnome_keyring.so line, and fails if there is no such line.
+_pam_lines_below_keyring() {
+  local line seen=0
+  while IFS= read -r line; do
+    if [ "$seen" = 1 ]; then
+      printf '%s\n' "$line"
       continue
     fi
-    # Found nowhere is "could not tell" too. libpam fails a stack whose
-    # include it cannot load, so refusing one costs nothing - and it is also
-    # what an include from a directory this tool does not model looks like.
-    inc_file="$(pam_config_file "$inc" "$path")" || return 0
-    ! _pam_stack_authenticates "$inc_file" "$path" "$((depth + 1))" || return 0
-  done < <(_pam_logical_lines "$f")
+    case "$line" in
+      *pam_gnome_keyring*) [[ ! "$line" =~ $PAM_GNOME_KEYRING_AUTH_RE ]] || seen=1 ;;
+    esac
+  done <<<"$1"
+  [ "$seen" = 1 ]
+}
+
+# Prints the logical lines in $1 that follow the first line naming the file
+# $2 (resolved on $3). Returns 1 if no line names it, and 2 if the first one
+# that does is not an include this tool reads - `-@include`, a bracketed
+# token - since whatever follows it may then run after the file's lines
+# without a check ever seeing it. A word "names" the file when it is the file's
+# name, its absolute path, or either one in brackets.
+_pam_lines_after_include_of() {
+  local lines="$1" target="$2" path="$3" line inc type name="${2##*/}" seen=0
+  while IFS= read -r line; do
+    if [ "$seen" = 1 ]; then
+      printf '%s\n' "$line"
+      continue
+    fi
+    [[ " $line " == *[[:space:]/[]"$name"[][:space:]]* ]] || continue
+    # the other phases never run our auth-phase line, whatever they include
+    type=""
+    read -r type _ <<<"$line"
+    case "$type" in
+      account | -account | session | -session | password | -password) continue ;;
+    esac
+    inc="$(_pam_include_target "$line")" || return 2
+    [ "$(pam_config_file "$inc" "$path")" = "$target" ] || return 2
+    seen=1
+  done <<<"$lines"
+  [ "$seen" = 1 ]
+}
+
+# Succeeds if no file that includes $1 runs anything after the include that
+# our module's token could reach. libpam builds one stack out of a file and
+# what it includes, so a `pam_unix.so try_first_pass` after `auth include
+# gdm-password` in some other service would take the token as surely as one
+# in gdm-password itself - and the old check only ever looked downwards
+# (review of PR #20). Includers of includers are followed too.
+#
+# Every file on the search path counts, backups and all: a file with a dot in
+# its name is no service, but libpam reads it when something includes it, so
+# skipping it could skip a real link in the chain. That can refuse a stack
+# over a stale copy that includes it, which no stock layout has.
+_pam_includers_are_harmless() {
+  local target="$1" path="$2" depth="${3:-0}" name dir f dirs=() lines rc below
+  if [ "$depth" -ge 8 ]; then
+    PAM_INSERTION_REFUSAL="files that include $target nest more than 8 deep"
+    return 1
+  fi
+  name="${target##*/}"
+  IFS=: read -r -a dirs <<<"$path"
+  for dir in "${dirs[@]}"; do
+    [ -n "$dir" ] || continue
+    # one grep per directory picks out the only files worth parsing: an
+    # includer has to name the file it includes
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      [ "$f" != "$target" ] || continue
+      [ "$(pam_config_file "${f##*/}" "$path")" = "$f" ] || continue
+      rc=0
+      lines="$(_pam_logical_lines "$f")" || rc=$?
+      if [ "$rc" != 0 ]; then
+        PAM_INSERTION_REFUSAL="${f##*/} names ${name}, and cannot be read cleanly to find out how"
+        return 1
+      fi
+      rc=0
+      below="$(_pam_lines_after_include_of "$lines" "$target" "$path")" || rc=$?
+      [ "$rc" != 1 ] || continue
+      if [ "$rc" = 2 ]; then
+        PAM_INSERTION_REFUSAL="${f##*/} names ${name} in a line this tool does not read as an include"
+        return 1
+      fi
+      if ! _pam_lines_are_harmless "$below" "$path" 0; then
+        PAM_INSERTION_REFUSAL="${f##*/} includes ${name}, and after that: $PAM_INSERTION_REFUSAL"
+        return 1
+      fi
+      _pam_includers_are_harmless "$f" "$path" "$((depth + 1))" || return 1
+    done < <(grep -lF -- "$name" "$dir"/* 2>/dev/null)
+  done
+  return 0
+}
+
+# Succeeds if install.sh's writer and this check agree on where our line
+# goes. The writer, `sed /PAM_GNOME_KEYRING_AUTH_RE/i`, inserts above every
+# *physical* line that matches; this check looks below the first *logical*
+# one. They are the same single line only if exactly one physical line
+# matches, it carries no comment, and it is not part of a continuation.
+# Otherwise our line could land above something no check looked at - `auth
+# optional#x pam_gnome_keyring.so` above a pam_unix.so, say, which libpam
+# ignores and sed does not (review of PR #20). $2 is the file's logical lines.
+_pam_keyring_anchor_is_single() {
+  local f="$1" lines="$2" n raw prev="" logical
+  n="$(grep -cE "$PAM_GNOME_KEYRING_AUTH_RE" "$f" 2>/dev/null || true)"
+  logical="$(grep -cE "$PAM_GNOME_KEYRING_AUTH_RE" <<<"$lines" || true)"
+  if [ "$n" != 1 ] || [ "$logical" != 1 ]; then
+    PAM_INSERTION_REFUSAL="it needs exactly one auth-phase pam_gnome_keyring.so line, and has ${n:-0}"
+    return 1
+  fi
+  while IFS= read -r raw || [ -n "$raw" ]; do
+    if [[ "$raw" =~ $PAM_GNOME_KEYRING_AUTH_RE ]]; then
+      if [[ "$raw" == *"#"* || "$raw" =~ \\[[:space:]]*$ || "$prev" =~ \\[[:space:]]*$ ]]; then
+        PAM_INSERTION_REFUSAL="its pam_gnome_keyring.so line carries a comment or sits in a continued line"
+        return 1
+      fi
+      return 0
+    fi
+    prev="$raw"
+  done <"$f"
   return 1
 }
 
 # Succeeds if it is safe to insert our module immediately above the
-# auth-phase pam_gnome_keyring.so line in $1 - i.e. nothing below that point
-# could authenticate somebody using the PAM_AUTHTOK we are about to set.
+# auth-phase pam_gnome_keyring.so line in $1: nothing that runs after that
+# point, in this file or in any file that includes it, could authenticate
+# somebody with the PAM_AUTHTOK we are about to set. Sets
+# PAM_INSERTION_REFUSAL to the reason when it says no.
 #
-# Returns failure when there is no pam_gnome_keyring auth line at all: no
-# insertion point is not a safe insertion point, and a predicate that answers
-# "safe" to a question nobody asked gets reused somewhere it shouldn't be.
+# No keyring line means no insertion point, which is not the same as a safe
+# one. The check does not reason about control flags or jumps: a module off
+# the list below the keyring line is a refusal wherever the jumps would take
+# the stack, because `optional` ordering is not worth splitting hairs over on
+# a login path.
 #
-# What this proves and what it does not: it proves no password module runs
-# after ours in this service's auth phase. It is not a complete model of
-# libpam - it does not reason about control flags or jumps, and it treats any
-# primary auth module below as disqualifying whether or not it actually
-# carries try_first_pass, because `optional` ordering is not worth splitting
-# hairs over on a login path. An include below that cannot be resolved or read
-# is disqualifying too (see _pam_stack_authenticates).
+# A stack that already carries our line gets the same answer as without it:
+# the line sits above the keyring line, where nothing is looked at.
+# install.sh relies on that to re-check what it wired before.
 #
 # $2 is the search path includes are resolved against (PAM_CONFIG_PATH).
 pam_auth_insertion_point_is_safe() {
-  local f="$1" path="${2:-$PAM_CONFIG_PATH}"
-  local line inc inc_file seen_keyring=0
-  [ -f "$f" ] || return 1
-  grep -qE "$PAM_GNOME_KEYRING_AUTH_RE" < <(_pam_logical_lines "$f") || return 1
-  while IFS= read -r line; do
-    if [ "$seen_keyring" -eq 0 ]; then
-      # Everything up to and including the keyring line runs before our
-      # module does, so it cannot consume what we have not set yet.
-      [[ ! "$line" =~ $PAM_GNOME_KEYRING_AUTH_RE ]] || seen_keyring=1
-      continue
-    fi
-    [[ ! "$line" =~ $PAM_PRIMARY_AUTH_RE ]] || return 1
-    if [[ "$line" =~ ^[[:space:]]*@include[[:space:]]+([^[:space:]]+)[[:space:]]*$ ]]; then
-      inc="${BASH_REMATCH[1]}"
-    elif [[ "$line" =~ ^[[:space:]]*-?auth[[:space:]]+(include|substack)[[:space:]]+([^[:space:]]+) ]]; then
-      inc="${BASH_REMATCH[2]}"
-    else
-      continue
-    fi
-    inc_file="$(pam_config_file "$inc" "$path")" || return 1
-    ! _pam_stack_authenticates "$inc_file" "$path" 1 || return 1
-  done < <(_pam_logical_lines "$f")
-  return 0
+  local f="$1" path="${2:-$PAM_CONFIG_PATH}" lines below rc=0
+  PAM_INSERTION_REFUSAL=""
+  if [ ! -f "$f" ] || [ ! -r "$f" ]; then
+    PAM_INSERTION_REFUSAL="it cannot be read"
+    return 1
+  fi
+  lines="$(_pam_logical_lines "$f")" || rc=$?
+  case "$rc" in
+    0) ;;
+    2)
+      PAM_INSERTION_REFUSAL="it continues a line past a comment or blank line, which libpam 1.5 and 1.7 read differently"
+      return 1
+      ;;
+    *)
+      PAM_INSERTION_REFUSAL="it could not be read to the end"
+      return 1
+      ;;
+  esac
+  # Everything up to and including the keyring line runs before our module
+  # does, so it cannot consume what we have not set yet.
+  if ! below="$(_pam_lines_below_keyring "$lines")"; then
+    PAM_INSERTION_REFUSAL="it has no auth-phase pam_gnome_keyring.so line"
+    return 1
+  fi
+  _pam_keyring_anchor_is_single "$f" "$lines" || return 1
+  _pam_lines_are_harmless "$below" "$path" 0 || return 1
+  _pam_includers_are_harmless "$f" "$path" 0
 }
+
+# The sed expression that takes this tool's line back out of a PAM file.
+# Shared so that install.sh (un-wiring a stack that no longer passes the
+# check) and uninstall.sh remove exactly the same lines.
+PAM_TPM_LINE_DELETE_SED='/pam_tpm_keyring_authtok\.so/d'

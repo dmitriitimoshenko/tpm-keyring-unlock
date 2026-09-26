@@ -100,6 +100,11 @@ Use one method or the other on a given machine, not both: `./install.sh` and a
 package write the same PAM module filename, so whichever ran last wins. See
 `packaging/README.md`.
 
+After upgrading the package, run `tpm-keyring-unlock-configure` once more. It
+re-checks the PAM stacks an older version wired, and takes the helper back out
+of any that the current checks refuse. Answer `n` at "Overwrite?" to keep your
+sealed secret.
+
 ## What this protects, and what it doesn't
 
 **Protected: the disk comes out and gets read somewhere else.** The sealed
@@ -176,11 +181,27 @@ typed, it does nothing.
 Services named `*fingerprint*` are not the only ones affected. `install.sh`
 patches every `/etc/pam.d/` service with an auth-phase `pam_gnome_keyring.so`
 line, because `gdm-password` can also succeed via fingerprint once you enable
-it system-wide. It refuses to patch a stack where a password module runs
-*below* the insertion point, since that would let a token nobody typed
-authenticate a login. Includes are followed the way libpam follows them, into
-`/usr/lib/pam.d` as well, and one that cannot be found or read counts as a
-reason to refuse.
+it system-wide.
+
+Before it patches a stack, it checks everything that runs *after* the new
+line. That covers the lines below the keyring line, whatever they include
+(into `/usr/lib/pam.d` as well), and whatever follows the include in any
+other service that includes the stack. Only a short list of vetted modules may
+appear there: ones that never turn the token into a login, such as
+`pam_permit`, `pam_nologin`, `pam_env`, `pam_fprintd`, `pam_gnome_keyring` and
+`pam_kwallet5`. The full list, and why each module is on it, is in
+`bin/lib.sh`. Anything else means the stack is not patched:
+
+- an unknown module;
+- a line the tool does not read the way libpam does;
+- an include it cannot find;
+- a continuation that different libpam versions read differently.
+
+The installer prints the reason. Logins there work as before, but the keyring
+stays locked until you type its password. The stacks GDM and LightDM ship on
+Ubuntu, Debian, Fedora and Arch all pass. A stack wired by an earlier run is
+checked again on every run, and the helper is taken back out of it if it no
+longer passes.
 
 ## The fingerprint reader dropping out mid-prompt
 

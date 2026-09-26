@@ -254,21 +254,40 @@ RESEAL=false
 mapfile -t candidates < <(grep -lE "$PAM_GNOME_KEYRING_AUTH_RE" /etc/pam.d/* 2>/dev/null \
   | grep -vE "$PAM_NON_SERVICE_RE")
 targets=()
-# Stacks where a password module runs BELOW the pam_gnome_keyring auth line.
-# Our module sets PAM_AUTHTOK from the TPM before anyone has authenticated, so
-# anything down there that takes its password from PAM_AUTHTOK instead of
-# prompting would let a login through on a secret nobody typed. Collected
-# separately and reported, never patched. An include down there that cannot
-# be found or read counts too: "could not look" is not "nothing there". See
-# bin/lib.sh's pam_auth_insertion_point_is_safe and JOURNAL.md, 2026-09-15
-# and 2026-09-25.
+# Stacks the insertion check refuses. Our module sets PAM_AUTHTOK from the TPM
+# before anyone has authenticated, so whatever runs after it has to be
+# something that cannot turn that token into a login. Since 2026-09-26 that
+# means a short list of vetted modules, with everything else - an unknown
+# module, a line the check does not read, an include it cannot follow -
+# refused. Collected separately and reported with the reason, never patched.
+# See bin/lib.sh's pam_auth_insertion_point_is_safe and JOURNAL.md,
+# 2026-09-15 and 2026-09-26.
 unsafe_targets=()
+# The reason for each refusal, keyed by file, printed with the plan.
+declare -A refusal_reason=()
+# Stacks an earlier run wired that the same check refuses today. That is
+# possible because the check has been wrong in the permissive direction
+# before - until 2026-09-26 it missed an include resolved in /usr/lib/pam.d, a
+# comment after an include, keyword case and absolute module paths - and a
+# stack wired under an old verdict used to be skipped here as "already wired
+# in", never looked at again. Our line sits above the keyring line, so the
+# check gives the same answer with it in place as without it. One that fails
+# gets our line taken back out, as a planned and backed-up step. See
+# JOURNAL.md, 2026-09-26 (review of PR #20).
+unsafe_wired=()
 for c in "${candidates[@]}"; do
-  if grep -q pam_tpm_keyring_authtok.so "$c"; then continue; fi
+  if grep -q pam_tpm_keyring_authtok.so "$c"; then
+    if ! pam_auth_insertion_point_is_safe "$c"; then
+      unsafe_wired+=("$c")
+      refusal_reason["$c"]="$PAM_INSERTION_REFUSAL"
+    fi
+    continue
+  fi
   if pam_auth_insertion_point_is_safe "$c"; then
     targets+=("$c")
   else
     unsafe_targets+=("$c")
+    refusal_reason["$c"]="$PAM_INSERTION_REFUSAL"
   fi
 done
 
@@ -398,6 +417,14 @@ if [ "$FPRINTD_CONFLICT_FIX" = true ]; then
   echo "     pam_fprintd.so out of $PAM_SHARED_AUTH_STACK (common-* backed up)."
   n=$((n + 1))
 fi
+if [ "${#unsafe_wired[@]}" -gt 0 ]; then
+  echo "  $n. Take the TPM helper back OUT of $(pam_names "${unsafe_wired[@]}") (backed up):"
+  echo "     an earlier run wired it, and the check refuses it today:"
+  for c in "${unsafe_wired[@]}"; do
+    echo "       ${c##*/}: ${refusal_reason[$c]}"
+  done
+  n=$((n + 1))
+fi
 if [ "${#targets[@]}" -gt 0 ]; then
   # One 'optional' line above the existing keyring line, in each stack. The
   # diff is printed once rather than per file: it is the same two lines every
@@ -412,10 +439,12 @@ fi
 # be silent about it.
 if [ "${#unsafe_targets[@]}" -gt 0 ]; then
   echo
-  echo "  !! NOT wiring $(pam_names "${unsafe_targets[@]}"):"
-  echo "     a password module sits below their keyring auth line, which"
-  echo "     try_first_pass could turn into a login on a secret nobody typed"
-  echo "     (or an include below it could not be followed to rule that out)."
+  echo "  !! NOT wiring $(pam_names "${unsafe_targets[@]}"). What runs after the"
+  echo "     helper there has to be vetted not to turn its token into a login:"
+  for c in "${unsafe_targets[@]}"; do
+    echo "       ${c##*/}: ${refusal_reason[$c]}"
+  done
+  echo "     Logins there work as before; only the keyring stays locked. README.md."
 fi
 echo
 
@@ -592,6 +621,7 @@ fi
 
 echo "-- Login PAM stacks --"
 wired_stacks=()
+unwired_stacks=()
 if [ "${#candidates[@]}" -eq 0 ]; then
   echo "No service has an auth-phase pam_gnome_keyring.so line - password"
   echo "logins are already fixed by the mask above. See README.md."
@@ -609,7 +639,28 @@ else
       continue
     fi
     if grep -q pam_tpm_keyring_authtok.so "$TARGET"; then
-      echo "${TARGET##*/}: already wired in."
+      # Every wired stack is checked again here, not only the ones planned
+      # for removal: the package install above may have rewritten a file
+      # that passed at plan time into one that does not, and "already wired
+      # in" must not be said of a stack the check refuses. Taking our line
+      # out cannot lock anyone out - it is `optional` and never votes - so
+      # this is the uninstaller's edit, backed up the same way. One that was
+      # not in the plan still gets asked about first.
+      if pam_auth_insertion_point_is_safe "$TARGET"; then
+        echo "${TARGET##*/}: already wired in."
+        continue
+      fi
+      if [[ " ${unsafe_wired[*]} " != *" $TARGET "* ]]; then
+        echo "!! ${TARGET##*/} changed since the plan was printed, and the check" >&2
+        echo "   now refuses it: $PAM_INSERTION_REFUSAL" >&2
+        if ! confirm "Take the TPM helper back out of ${TARGET##*/}?"; then
+          echo "Left wired - re-run to reconsider it." >&2
+          continue
+        fi
+      fi
+      backup_pam_file "$TARGET"
+      sudo sed -i "$PAM_TPM_LINE_DELETE_SED" "$TARGET"
+      unwired_stacks+=("$TARGET")
       continue
     fi
     # Re-checked here, not just when the plan was built, for the same reason
@@ -617,9 +668,8 @@ else
     # rewrite a file under /etc/pam.d. This is the check that must not be
     # skipped on a stale plan - getting it wrong writes a login bypass.
     if ! pam_auth_insertion_point_is_safe "$TARGET"; then
-      echo "$TARGET has a password module below its pam_gnome_keyring.so auth" >&2
-      echo "line, or an include there that can't be followed - left untouched" >&2
-      echo "(see the note printed above)." >&2
+      echo "$TARGET is refused by the check now ($PAM_INSERTION_REFUSAL) -" >&2
+      echo "left untouched." >&2
       continue
     fi
     backup_pam_file "$TARGET"
@@ -627,6 +677,8 @@ else
     wired_stacks+=("$TARGET")
   done
   [ "${#wired_stacks[@]}" -eq 0 ] || echo "Wired: ${wired_stacks[*]##*/}"
+  [ "${#unwired_stacks[@]}" -eq 0 ] \
+    || echo "Taken back out: ${unwired_stacks[*]##*/} (backups beside them, .bak-$RUN_TS)"
 fi
 
 echo

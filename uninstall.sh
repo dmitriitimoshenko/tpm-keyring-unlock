@@ -134,7 +134,7 @@ for f in /etc/pam.d/*; do
     echo "Found the injected line in $f"
     if confirm "Remove it?"; then
       backup_pam_file "$f"
-      sudo sed -i '/pam_tpm_keyring_authtok\.so/d' "$f"
+      sudo sed -i "$PAM_TPM_LINE_DELETE_SED" "$f"
       echo "Removed (previous content backed up as $f.bak-$RUN_TS)."
     fi
   fi

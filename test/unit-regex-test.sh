@@ -763,7 +763,7 @@ check "a handle nobody uses returns empty AND exits zero" "$got" "ok:[]"
 ORDERING="$FIXTURES/ordering"
 
 for f in safe-direct safe-include safe-substack safe-continued \
-         safe-fingerprint-only safe-autologin; do
+         safe-fingerprint-only safe-autologin safe-nested safe-commented-out; do
   if pam_auth_insertion_point_is_safe "$ORDERING/$f" "$ORDERING"; then
     got=safe
   else
@@ -772,8 +772,18 @@ for f in safe-direct safe-include safe-substack safe-continued \
   check "insertion point accepted: $f" "$got" "safe"
 done
 
+# The second line of names is libpam's reading of a line that this check used
+# to read differently, each one measured with pamtester (JOURNAL.md,
+# 2026-09-26): a comment or extra words after an include, a comment ending in
+# a backslash, keyword case, a module by absolute path, pam_systemd_home, a
+# continuation libpam versions read differently, and an include that fails
+# closed one level down.
 for f in unsafe-keyring-first unsafe-unix-below unsafe-substack-below loop-below \
-         unsafe-include-missing; do
+         unsafe-include-missing \
+         unsafe-include-comment unsafe-include-extra unsafe-comment-backslash \
+         unsafe-comment-line-backslash unsafe-upper-case unsafe-include-mixed-case \
+         unsafe-at-include-upper unsafe-absolute-module unsafe-systemd-home \
+         unsafe-ambiguous unsafe-ambiguous-include unsafe-nested-missing; do
   if pam_auth_insertion_point_is_safe "$ORDERING/$f" "$ORDERING"; then
     got=safe
   else
@@ -834,14 +844,92 @@ check "a vendor-only include with no auth module in it is still safe" "$got" "sa
 
 # An absolute include path is taken as it stands, as libpam takes it. Glued
 # onto the directory ("/etc/pam.d//abs/path") it was missing, and so safe.
-printf '#%%PAM-1.0\nauth\toptional\tpam_gnome_keyring.so\n@include %s\n' \
-  "$ORDERING/common-auth" >"$WORKDIR/keyring-above-absolute"
-if pam_auth_insertion_point_is_safe "$WORKDIR/keyring-above-absolute" "$ORDERING"; then
-  got=safe
+# Both directions are checked: "refused" alone is also what an unresolvable
+# include gives, so only the safe half proves the path was really followed.
+# libpam splits a line on blanks, so an absolute path with one in it cannot be
+# written at all - from such a checkout path there is nothing to test.
+verdict() {
+  if pam_auth_insertion_point_is_safe "$@"; then echo safe; else echo refused; fi
+}
+if [[ "$FIXTURES" =~ [[:space:]] ]]; then
+  echo "skip - absolute include paths: the checkout path contains a blank"
 else
-  got=refused
+  printf '#%%PAM-1.0\nauth\toptional\tpam_gnome_keyring.so\n@include %s\n' \
+    "$ORDERING/common-auth" >"$WORKDIR/keyring-above-absolute"
+  check "an absolute @include path below the keyring line is followed" \
+    "$(verdict "$WORKDIR/keyring-above-absolute" "$ORDERING")" "refused"
+  printf '#%%PAM-1.0\nauth\toptional\tpam_gnome_keyring.so\n@include %s\n' \
+    "$FIXTURES/forms/session-only" >"$WORKDIR/keyring-above-absolute-harmless"
+  check "...and one naming a file with no auth phase is followed to a safe verdict" \
+    "$(verdict "$WORKDIR/keyring-above-absolute-harmless" "$ORDERING")" "safe"
 fi
-check "an absolute @include path below the keyring line is followed" "$got" "refused"
+
+# A read that fails after the file checked out as readable - /proc/self/mem
+# is a regular, readable file that fails every read with EIO - is "could not
+# tell", not "no lines". Linux only; skipped where that file is missing.
+if [ -f /proc/self/mem ]; then
+  printf '#%%PAM-1.0\nauth\toptional\tpam_gnome_keyring.so\n@include /proc/self/mem\n' \
+    >"$WORKDIR/keyring-above-read-error"
+  check "an include that fails mid-read is refused" \
+    "$(verdict "$WORKDIR/keyring-above-read-error" "$ORDERING" 2>&1)" "refused"
+fi
+
+# A stack an earlier version wired gets the same verdict with our line in it:
+# the line sits above the keyring line, where nothing is looked at. install.sh
+# relies on that to re-check wired stacks instead of skipping them.
+sed -E "/${PAM_GNOME_KEYRING_AUTH_RE}/i auth    optional        pam_tpm_keyring_authtok.so" \
+  "$VENDOR/etc/keyring-above-vendor-auth" >"$WORKDIR/wired-vendor-auth"
+check "a wired stack that fails the check today is still refused" \
+  "$(verdict "$WORKDIR/wired-vendor-auth" "$VENDOR_PATH")" "refused"
+sed -E "/${PAM_GNOME_KEYRING_AUTH_RE}/i auth    optional        pam_tpm_keyring_authtok.so" \
+  "$VENDOR/etc/gdm-password" >"$WORKDIR/wired-gdm-password"
+check "...and a wired stock gdm-password is still accepted" \
+  "$(verdict "$WORKDIR/wired-gdm-password" "$VENDOR_PATH")" "safe"
+
+# --- reading a line the way libpam does ------------------------------------
+# _pam_logical_lines(), which every predicate reads through. Each rule was
+# measured with pamtester first (JOURNAL.md, 2026-09-26).
+# The backslashes at the ends of these lines are the point: they are PAM
+# continuations, written literally.
+# shellcheck disable=SC1003
+printf '%s\n' \
+  'AUTH  Required pam_Unix.so ARG' \
+  'auth [SUCCESS=DONE default=die] pam_x.so' \
+  '@INCLUDE Common-Auth # trailing words' \
+  '# a comment line \' \
+  'auth optional pam_a.so # a comment \' \
+  'auth \   ' \
+  '  required pam_b.so' \
+  'auth \' \
+  '# libpam 1.7 ends the continuation here' \
+  'required pam_c.so' >"$WORKDIR/line-model"
+LOGICAL_RC=0
+LOGICAL="$(_pam_logical_lines "$WORKDIR/line-model")" || LOGICAL_RC=$?
+line_check() {
+  if grep -qE "$2" <<<"$LOGICAL"; then got=yes; else got=no; fi
+  check "$1" "$got" "${3:-yes}"
+}
+line_check "type and plain control are folded to lower case, the module is not" \
+  '^auth  required pam_Unix\.so ARG$'
+line_check "a bracketed control keeps its case, as libpam needs it" \
+  '^auth \[SUCCESS=DONE default=die\] pam_x\.so$'
+line_check "@INCLUDE is read as @include, the file name keeps its case" \
+  '^@include Common-Auth *$'
+line_check "a comment ending in a backslash continues nothing" \
+  '^auth optional pam_a\.so *$'
+line_check "a backslash with trailing blanks still continues" \
+  '^auth +required pam_b\.so$'
+line_check "a comment line inside a continuation ends it (the libpam 1.7 reading)" \
+  '^required pam_c\.so$'
+check "...which is a file libpam versions read differently: exit status 2" \
+  "$LOGICAL_RC" "2"
+rc=0
+_pam_logical_lines "$ORDERING/safe-continued" >/dev/null || rc=$?
+check "a plain continuation is not ambiguous: exit status 0" "$rc" "0"
+rc=0
+printf 'auth required pam_permit.so \\\n' >"$WORKDIR/continued-into-eof"
+_pam_logical_lines "$WORKDIR/continued-into-eof" >/dev/null || rc=$?
+check "a continuation that runs into the end of the file is ambiguous too" "$rc" "2"
 
 # An include that exists but cannot be read is "could not tell" too. Skipped
 # as root, which reads a mode-000 file regardless.
@@ -870,6 +958,120 @@ else
 fi
 check "a stack with no keyring auth line is not called safe" "$got" "refused"
 
+# --- only vetted modules may run after the helper (2026-09-26) ------------
+# The insertion check lets through nothing below the keyring line but the
+# modules on PAM_AFTER_TOKEN_MODULE_RE, read with a strict grammar. The review
+# of PR #20 found lines libpam runs that the old "known password modules"
+# rule could not see; every one of them has to come back refused here, and
+# the stacks distributions actually ship have to come back safe.
+BELOW="$WORKDIR/below-keyring"
+mkdir -p "$BELOW"
+cp "$ORDERING/common-auth" "$ORDERING/common-account" "$BELOW/"
+below_keyring() {
+  printf '#%%PAM-1.0\nauth    optional        pam_gnome_keyring.so\n%s\n' "$1" >"$BELOW/stack"
+  verdict "$BELOW/stack" "$BELOW"
+}
+
+# modules that take the token and are not pam_unix: the old list missed them
+for line in \
+  'auth sufficient pam_extrausers.so try_first_pass' \
+  'auth sufficient pam_userdb.so db=/etc/vsftpd/users' \
+  'auth sufficient pam_exec.so expose_authtok /usr/local/bin/check' \
+  'auth optional pam_brand_new.so' \
+  'auth required /usr/lib/x86_64-linux-gnu/security/pam_permit.so'; do
+  check "not on the list, refused: $line" "$(below_keyring "$line")" "refused"
+done
+
+# the ways of writing a line that libpam runs and the old check could not read
+for line in \
+  '[auth] sufficient pam_unix.so try_first_pass' \
+  '[-auth] sufficient pam_unix.so try_first_pass' \
+  'auth [default=ignore]pam_unix.so try_first_pass' \
+  'auth sufficient [pam_unix.so] try_first_pass' \
+  'auth [default=ignore\] success=ok] pam_permit.so' \
+  'auth [include] common-auth' \
+  '-@include common-auth' \
+  '[@include] common-auth' \
+  'auth weird pam_permit.so'; do
+  check "not read, refused: $line" "$(below_keyring "$line")" "refused"
+done
+
+# and what the stacks distributions ship put below the keyring line
+for line in \
+  'auth required pam_permit.so' \
+  '-auth optional pam_kwallet5.so' \
+  'auth [success=ok default=ignore] pam_echo.so hello' \
+  '@include common-account' \
+  'session include common-auth' \
+  'password required pam_unix.so'; do
+  check "vetted, safe: $line" "$(below_keyring "$line")" "safe"
+done
+
+# The refusal says why, for install.sh to print next to the stack.
+below_keyring 'auth sufficient pam_extrausers.so try_first_pass' >/dev/null
+pam_auth_insertion_point_is_safe "$BELOW/stack" "$BELOW" || true
+case "$PAM_INSERTION_REFUSAL" in
+  *pam_extrausers.so*) got=named ;;
+  *) got="$PAM_INSERTION_REFUSAL" ;;
+esac
+check "the refusal names the module it did not know" "$got" "named"
+
+# The writer and the check have to mean the same line. sed inserts above
+# every physical line matching the keyring regex; libpam ignores
+# `auth optional#x pam_gnome_keyring.so` (the comment leaves no module), and
+# the check looks below the first keyring line libpam sees - so our line
+# would land above a pam_unix.so the check never looked at.
+printf '%s\n' '#%PAM-1.0' 'auth    optional#x pam_gnome_keyring.so' \
+  'auth    sufficient      pam_unix.so try_first_pass' \
+  'auth    optional        pam_gnome_keyring.so' >"$BELOW/two-anchors"
+check "two lines sed would insert above: refused" \
+  "$(verdict "$BELOW/two-anchors" "$BELOW")" "refused"
+printf '%s\n' '#%PAM-1.0' 'auth    optional        pam_gnome_keyring.so # unlock' \
+  >"$BELOW/commented-anchor"
+check "a keyring line with a comment on it: refused" \
+  "$(verdict "$BELOW/commented-anchor" "$BELOW")" "refused"
+
+# Services that include the stack run our line too, and everything after the
+# include runs after it. libpam builds one stack out of both.
+INCLUDERS="$WORKDIR/includers"
+mkdir -p "$INCLUDERS"
+printf '%s\n' '#%PAM-1.0' 'auth    optional        pam_gnome_keyring.so' >"$INCLUDERS/cand"
+check "a stack nothing includes: safe" "$(verdict "$INCLUDERS/cand" "$INCLUDERS")" "safe"
+printf '%s\n' 'auth    include    cand' 'auth    required   pam_permit.so' >"$INCLUDERS/includer-ok"
+check "an includer that only runs vetted modules after it: still safe" \
+  "$(verdict "$INCLUDERS/cand" "$INCLUDERS")" "safe"
+printf '%s\n' 'session include cand' 'session required pam_unix.so' >"$INCLUDERS/session-only"
+check "an include in another phase does not count" \
+  "$(verdict "$INCLUDERS/cand" "$INCLUDERS")" "safe"
+printf '%s\n' 'auth    include    cand' 'auth    sufficient pam_unix.so try_first_pass' \
+  >"$INCLUDERS/includer-bad"
+check "an includer that runs pam_unix.so after it: refused" \
+  "$(verdict "$INCLUDERS/cand" "$INCLUDERS")" "refused"
+rm "$INCLUDERS/includer-bad"
+printf '%s\n' 'auth    include    mid' 'auth    sufficient pam_unix.so try_first_pass' >"$INCLUDERS/top"
+printf '%s\n' '@include cand' >"$INCLUDERS/mid"
+check "...and one that includes it through another file: refused" \
+  "$(verdict "$INCLUDERS/cand" "$INCLUDERS")" "refused"
+rm "$INCLUDERS/top" "$INCLUDERS/mid"
+printf '%s\n' '-@include cand' 'auth    sufficient pam_unix.so try_first_pass' >"$INCLUDERS/dashed"
+check "an includer written in a way this tool does not read: refused" \
+  "$(verdict "$INCLUDERS/cand" "$INCLUDERS")" "refused"
+rm "$INCLUDERS/dashed"
+
+# The case fold runs in the C locale. In a Turkish one bash folds `I` to a
+# dotless `ı`, so `INCLUDE` stopped reading as `include`. Skipped where the
+# locale is not installed.
+if locale -a 2>/dev/null | grep -qi '^tr_TR\.utf-\?8$'; then
+  printf '%s\n' '#%PAM-1.0' 'auth    optional        pam_gnome_keyring.so' \
+    'AUTH    INCLUDE         common-auth' >"$BELOW/upper-include"
+  check "a Turkish locale reads AUTH INCLUDE as libpam does (and refuses it)" \
+    "$(LC_ALL=tr_TR.UTF-8 verdict "$BELOW/upper-include" "$BELOW")" "refused"
+  printf '%s\n' '#%PAM-1.0' 'auth    optional        pam_gnome_keyring.so' \
+    'AUTH    INCLUDE         common-account' >"$BELOW/upper-harmless"
+  check "...and follows the include rather than calling it unreadable" \
+    "$(LC_ALL=tr_TR.UTF-8 verdict "$BELOW/upper-harmless" "$BELOW")" "safe"
+fi
+
 # --- the predicates have to give the SAME answer every time ---------------
 #
 # Reported as mtriam/tpm-keyring-unlock#1: under `set -o pipefail` (which
@@ -889,7 +1091,9 @@ STABILITY_DIR="$(mktemp -d)"
 CLEANUP+=("$STABILITY_DIR")
 {
   echo "auth    optional    pam_gnome_keyring.so"
-  for i in $(seq 1 400); do echo "auth    optional    pam_filler_$i.so"; done
+  # pam_echo because the insertion check only lets vetted modules run below
+  # the keyring line; the padding still has to come back "safe" every time
+  for i in $(seq 1 400); do echo "auth    optional    pam_echo.so filler $i"; done
 } >"$STABILITY_DIR/padded-stack"
 
 verdicts=""

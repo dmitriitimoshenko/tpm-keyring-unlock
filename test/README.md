@@ -67,9 +67,11 @@ actually runs there, never skips.
   depends on this" apart from "couldn't check".
   And `pam_auth_insertion_point_is_safe`, which decides whether `install.sh`
   may wire the module into a given stack at all: the module sets
-  `PAM_AUTHTOK` from the TPM before anyone has authenticated, so nothing
-  *below* the insertion point may be a password module that would take that
-  token instead of prompting. Both directions are asserted, and the accepting
+  `PAM_AUTHTOK` from the TPM before anyone has authenticated, so whatever
+  runs after it - below the keyring line, in what that includes, and after
+  the include in any service that includes the stack - may only be a module
+  on the vetted list (`PAM_AFTER_TOKEN_MODULE_RE`), read with a strict
+  grammar. Both directions are asserted, and the accepting
   ones matter most — a false "safe" writes a login bypass, but a false
   "unsafe" refuses `gdm-fingerprint`, which is the entire scenario this tool
   exists for. Fixtures in `test/fixtures/pam.d/ordering/` cover a direct
@@ -86,10 +88,29 @@ actually runs there, never skips.
   vendor directory and carries `pam_unix.so`
   (`vendor/etc/keyring-above-vendor-auth`), an absolute include path and an
   unreadable include are all refused, while a vendor-only include with no
-  auth module in it is still accepted. The real `@include`-based
-  `gdm-password` fixture is asserted accepted separately, and so is the stock
-  Ubuntu 26.04 one: either breaking would refuse every supported
-  Debian-family install. The PAM control flow
+  auth module in it is still accepted, and so is an absolute include naming a
+  file with no auth phase - which is what proves the path is followed rather
+  than merely failed on. Lines are read the way libpam reads them
+  (`_pam_logical_lines`, with its own checks), and a fixture per way the
+  check used to read one differently has to be refused: a comment or extra
+  words after an include, a comment ending in a backslash, `AUTH` /
+  `Include` / `@INCLUDE`, a module by absolute path, `pam_systemd_home.so`,
+  a continuation that libpam 1.5 and 1.7 read differently, an include that
+  fails closed one level down, and a read that fails half-way
+  (`/proc/self/mem`). A stack with this tool's line already in it gets the
+  same verdict as without - `install.sh` relies on that to re-check wired
+  stacks. Off the list and refused: `pam_extrausers`, `pam_userdb`, `pam_exec
+  expose_authtok`, an unknown module, a module by absolute path, and every
+  bracketed or `-@include` spelling the review of PR #20 found libpam
+  running; on it and accepted: `pam_permit`, `pam_kwallet5`, a bracketed
+  control on `pam_echo`, lines of the other phases. Also refused: a stack
+  with two lines `sed` would insert above, a keyring line with a comment, and
+  a stack another service includes and follows with `pam_unix.so` - directly,
+  through a second file, or in a spelling this tool does not read. Under a
+  Turkish locale `AUTH INCLUDE` still reads as libpam reads it. The real
+  `@include`-based `gdm-password` fixture is asserted
+  accepted separately, and so is the stock Ubuntu 26.04 one: either breaking
+  would refuse every supported Debian-family install. The PAM control flow
   of the generated stack is covered by `runtime-test.sh` below, against real
   libpam.
 - **`test/runtime-test.sh`** (one container, distro doesn't matter) — the
