@@ -6237,3 +6237,32 @@ The pipefail stability fixture now pads with `pam_echo`, since
 - Candidate discovery still reads `/etc/pam.d` only (noted on 2026-09-25).
 - The cost walk runs two or three times per question with nothing cached:
   0.76 s on this machine. It is left as it is.
+
+## Release 1.5.0 (2026-09-26)
+
+Carries #20 and #21 to the packages. Until this release, the Build Service
+served 1.4.1 on all seven targets (checked on download.opensuse.org), and so
+did the AUR recipe. Anyone installing from a package still had the "sudo keeps
+fingerprint" text and the old insertion check.
+
+**Why 1.5.0 and not 1.4.2.** Behaviour changes in a way a user notices. The
+installer can now refuse a stack it used to wire, and on a re-run it takes its
+line back out of one it wired before. The minor version says so.
+
+**The upgrade note, in both changelogs.** Stacks wired by an older version are
+re-checked only when the configure step runs again, and the OBS packages print
+nothing on upgrade. The AUR hook and README already said to re-run it. Now
+`debian.changelog` and, for the first time since 1.4.0, the spec's
+`%changelog` carry the same instruction, including answering `n` at
+"Overwrite?" to keep the sealed secret. `apt changelog` and `rpm -q
+--changelog` show it.
+
+Checked before the PR, since a packaging mistake only shows at release time:
+
+- the release workflow's five-file version check, replicated locally: all 1.5.0;
+- `dpkg-parsechangelog` on Debian 12 parses the new entry;
+- `rpmspec` on Fedora reads the new `%changelog` entry;
+- `rpmlint` gives the same four warnings as on main, and nothing new.
+
+The AUR checksum is the zero placeholder `bump-version.sh` leaves; the workflow
+writes the real one back once the tag exists.
