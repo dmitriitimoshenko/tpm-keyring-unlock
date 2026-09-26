@@ -611,20 +611,21 @@ mapfile -t losers < <(pam_fprintd_services_losing_fingerprint \
   "$FORMS/common-auth" "$FORMS")
 losers_str=" ${losers[*]} "
 
-for want in sudo other upper-case dashed-substack chain-top chain-mid; do
+for want in sudo other upper-case dashed-substack chain-top chain-mid own-below; do
   case "$losers_str" in *" $FORMS/$want "*) got=listed ;; *) got=absent ;; esac
   check "spelled another way: $want loses fingerprint" "$got" "listed"
 done
 
-# own-below and own-via-include keep fingerprint through a line of their own;
+# own-via-include keeps fingerprint through a line of its own that runs before
+# the shared stack (own-below's runs after it, so it loses fingerprint anyway);
 # fp-snippet and session-only never reach the shared stack; polkit-1 has no
 # auth phase, so its cost is other's.
-for unwanted in own-below own-via-include fp-snippet session-only polkit-1 common-auth; do
+for unwanted in own-via-include fp-snippet session-only polkit-1 common-auth; do
   case "$losers_str" in *" $FORMS/$unwanted "*) got=listed ;; *) got=absent ;; esac
   check "spelled another way: $unwanted is not listed" "$got" "absent"
 done
 
-check "spelled another way: exactly six services lose fingerprint" "${#losers[@]}" "6"
+check "spelled another way: exactly seven services lose fingerprint" "${#losers[@]}" "7"
 
 # libpam authenticates a polkit whose file has no auth phase with other's, and
 # other loses fingerprint here - so the question has to name polkit, and the
@@ -638,7 +639,7 @@ check "a sudo reached by auth include, and a polkit with no auth phase, are name
 # twice. uninstall.sh names these before it re-enables the profile.
 mapfile -t twice < <(pam_fprintd_services_asking_twice "$FORMS/common-auth" "$FORMS")
 check "services with a fingerprint line of their own are the ones that ask twice" \
-  "${twice[*]##*/}" "own-below own-via-include"
+  "${twice[*]##*/}" "own-via-include"
 
 # A service file the installing user cannot read is counted as a loss, not
 # dropped and not left to print "Permission denied" into the cost. Skipped as

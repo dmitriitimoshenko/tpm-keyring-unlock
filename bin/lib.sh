@@ -766,8 +766,12 @@ _pam_include_target() {
 # declares local:
 #
 #   _pam_fp_reaches  the shared stack is included somewhere on the way
-#   _pam_fp_own      a file other than the shared stack has a pam_fprintd
-#                    auth line, so the service keeps fingerprint regardless
+#   _pam_fp_own      a pam_fprintd auth line outside the shared stack runs
+#                    *before* it, so the service keeps fingerprint regardless.
+#                    One below it does not count: pam-auth-update's
+#                    common-auth ends in `requisite pam_deny.so`, so a wrong
+#                    password stops the stack before such a line is reached
+#                    (measured with pamtester; JOURNAL.md, 2026-09-26)
 #   _pam_fp_auth     there is an auth-phase line at all; libpam gives a
 #                    service with none the auth phase of "other" instead
 #
@@ -815,7 +819,10 @@ _pam_fprintd_walk() {
     fi
     [[ "$lc" =~ ^[[:space:]]*-?auth[[:space:]] ]] || continue
     _pam_fp_auth=1
-    if [[ "$lc" =~ $PAM_FPRINTD_AUTH_RE ]]; then _pam_fp_own=1; fi
+    # the walk runs in libpam's order, so "reached yet" is simply the flag
+    if [ "$_pam_fp_reaches" = 0 ] && [[ "$lc" =~ $PAM_FPRINTD_AUTH_RE ]]; then
+      _pam_fp_own=1
+    fi
   done < <(_pam_logical_lines "$f")
   return 0
 }
@@ -824,8 +831,9 @@ _pam_fprintd_walk() {
 # for which _pam_fprintd_walk() answers what $1 asks:
 #
 #   loses  reaches the shared stack $2 and has no fingerprint line of its own
-#   twice  reaches it *and* has one - with fingerprint back in the shared
-#          stack, such a service tries the reader twice before the password
+#   twice  reaches it *and* has one that runs before it - with fingerprint
+#          back in the shared stack, such a service tries the reader twice
+#          before the password
 #
 # Only files with an auth phase of their own are listed, and only the copy
 # libpam actually reads: /usr/lib/pam.d/polkit-1 counts when /etc/pam.d has no
@@ -870,7 +878,7 @@ pam_fprintd_services_losing_fingerprint() {
 }
 
 # Prints the services that reach the shared stack $1 *and* carry a pam_fprintd
-# line of their own - what README's per-service recipe produces. With
+# line of their own above it - what README's per-service recipe produces. With
 # fingerprint back in the shared stack, they try the reader twice before the
 # password; uninstall.sh says so before it re-enables the profile.
 pam_fprintd_services_asking_twice() {

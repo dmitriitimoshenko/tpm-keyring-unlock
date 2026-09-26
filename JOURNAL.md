@@ -5872,3 +5872,23 @@ some case, can be an include, so the walk now checks that with a glob first:
 0.46 s, and the same 17 services and "sudo -i and polkit". The unit suite's
 time is unchanged against main's (8.7 s against 8.3 s), since the pipefail
 stability checks dominate it.
+
+### Addendum: a fingerprint line below the shared stack is not an alternative
+
+From a second review (`xhigh`) of the combined work. The walk counted a
+service's own pam_fprintd line anywhere on the way as "keeps fingerprint".
+One *below* `@include common-auth` never runs as an alternative to a wrong
+password: pam-auth-update's common-auth ends in `requisite pam_deny.so`, which
+ends the stack first. Checked with pamtester on libpam 1.5.2. With pam_deny
+standing in for a wrong password and pam_permit for a matching finger, the
+line above the include lets the user in and the same line below it does not.
+So the `forms/own-below` fixture was a loser listed as a keeper: the cost was
+understated, which is the unsafe direction for a default-yes question. The
+uninstaller's "tries the reader twice before the password" was wrong for it,
+too.
+
+The walk runs in libpam's order, so the fix is one condition: a fingerprint
+line counts as the service's own only while the shared stack has not been
+reached yet. This machine's sudo has its line above the include and is
+unaffected: 17 services, "sudo -i and polkit", and sudo is still the one that
+would ask twice.
