@@ -3,7 +3,7 @@
 # Built by OBS from the tarball that _service pulls from the git tag.
 #
 Name:           tpm-keyring-unlock
-Version:        1.4.1
+Version:        1.5.0
 Release:        0
 Summary:        TPM-backed unlock of the GNOME login keyring at login
 License:        MIT
@@ -72,5 +72,11 @@ tpm-keyring-unlock-configure afterwards to seal a password and wire up PAM.
 %{_bindir}/tpm-keyring-unlock-deconfigure
 
 %changelog
+* Sat Sep 26 2026 Dmitrii Timoshenko <dmitrii.timoshenko16@gmail.com> - 1.5.0-0
+- After upgrading, run tpm-keyring-unlock-configure once more: it re-checks
+  the PAM stacks an older version wired and takes the helper back out of
+  any the stricter checks now refuse. Answer n at "Overwrite?" to keep the
+  sealed secret.
+
 * Wed Sep 16 2026 Dmitrii Timoshenko <dmitrii.timoshenko16@gmail.com> - 1.4.0-0
 - Initial packaging: files only; tpm-keyring-unlock-configure does the rest.

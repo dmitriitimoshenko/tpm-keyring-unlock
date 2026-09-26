@@ -1,3 +1,13 @@
+tpm-keyring-unlock (1.5.0-1) unstable; urgency=medium
+
+  * Release 1.5.0. See JOURNAL.md for the full history.
+  * After upgrading, run tpm-keyring-unlock-configure once more. It
+    re-checks the PAM stacks an older version wired and takes the helper
+    back out of any the stricter checks now refuse. Answer n at
+    "Overwrite?" to keep the sealed secret.
+
+ -- Dmitrii <dmitrii.timoshenko16@gmail.com>  Sat, 26 Sep 2026 12:58:24 +0200
+
 tpm-keyring-unlock (1.4.1-1) unstable; urgency=medium
 
   * Release 1.4.1. See JOURNAL.md for the full history.
