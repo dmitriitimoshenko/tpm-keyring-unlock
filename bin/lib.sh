@@ -1477,9 +1477,13 @@ _pam_keyring_anchor_is_single() {
 # the line sits above the keyring line, where nothing is looked at.
 # install.sh relies on that to re-check what it wired before.
 #
-# $2 is the search path includes are resolved against (PAM_CONFIG_PATH).
+# $2 is the search path includes are resolved against (PAM_CONFIG_PATH). $3,
+# when given, is the service file $1's content is about to replace: $1 is then
+# a draft in a scratch directory, and the files that include a stack are
+# looked for by the name of the real one. pam_keyring_lines_can_be_added()
+# checks a file that does not exist yet that way.
 pam_auth_insertion_point_is_safe() {
-  local f="$1" path="${2:-$PAM_CONFIG_PATH}" lines below rc=0
+  local f="$1" path="${2:-$PAM_CONFIG_PATH}" as="${3:-$1}" lines below rc=0
   PAM_INSERTION_REFUSAL=""
   if [ ! -f "$f" ] || [ ! -r "$f" ]; then
     PAM_INSERTION_REFUSAL="it cannot be read"
@@ -1505,10 +1509,261 @@ pam_auth_insertion_point_is_safe() {
   fi
   _pam_keyring_anchor_is_single "$f" "$lines" || return 1
   _pam_lines_are_harmless "$below" "$path" 0 || return 1
-  _pam_includers_are_harmless "$f" "$path" 0
+  _pam_includers_are_harmless "$as" "$path" 0
 }
 
-# The sed expression that takes this tool's line back out of a PAM file.
-# Shared so that install.sh (un-wiring a stack that no longer passes the
-# check) and uninstall.sh remove exactly the same lines.
+# The line install.sh writes into a stack, and the sed expression that takes
+# it back out. Shared so that install.sh (wiring a stack, or un-wiring one
+# that no longer passes the check) and uninstall.sh agree on exactly which
+# line is this tool's.
+PAM_TPM_LINE='auth    optional        pam_tpm_keyring_authtok.so'
 PAM_TPM_LINE_DELETE_SED='/pam_tpm_keyring_authtok\.so/d'
+
+# --- a fingerprint stack with no keyring line at all ------------------------
+#
+# Everything above anchors on the auth-phase pam_gnome_keyring.so line a stack
+# already has. Fedora's /etc/pam.d/gdm-fingerprint has none, in any phase:
+# GDM's pam-redhat files leave the keyring out of the fingerprint stack, since
+# a finger never produces a password to unlock it with. So the candidate grep
+# in install.sh never matched it, the file was passed over without a word,
+# and fingerprint logins on Fedora kept prompting for the keyring password.
+# The same distribution's gdm-password does carry the lines. GitHub issue #23.
+#
+# For gdm-fingerprint, and only for it, install.sh therefore adds the keyring
+# lines as well as its own:
+#
+#   PAM_TPM_LINE, then PAM_KEYRING_AUTH_LINE    after the stack's last line
+#                                               in the auth phase
+#   PAM_KEYRING_SESSION_LINE                    after its last line in the
+#                                               session phase
+#
+# After the last line, not after the authenticator. Nothing in the file then
+# runs after our module, so only the files that include this one are left for
+# the insertion check to vet - and on Fedora, postlogin's auth phase
+# (pam_ecryptfs, once ecryptfs is switched on) stays above it, where the token
+# does not exist yet. The session line goes last for the reason gdm-password
+# puts its own after `session include password-auth`: pam_gnome_keyring starts
+# the daemon there, which has to come after pam_selinux's `open` and after
+# pam_systemd, or the daemon runs in GDM's SELinux context without the user's
+# runtime directory.
+#
+# No password-phase line: gdm-fingerprint's password phase is a pam_deny.so.
+PAM_KEYRING_AUTH_LINE='auth    optional        pam_gnome_keyring.so'
+PAM_KEYRING_SESSION_LINE='session optional        pam_gnome_keyring.so auto_start'
+
+# The only service this is done for: the one GDM verifies a finger through.
+PAM_FINGERPRINT_SERVICE=gdm-fingerprint
+
+# Filters stdin to stdout. `add` writes the three lines in the places described
+# above, `remove` takes exactly those three lines out again, byte for byte and
+# nothing else. A line belongs to the auth phase if its type is auth or -auth,
+# to the session phase if it is session or -session, and to both if it is an
+# @include, which pulls in every phase. awk prints every line with a newline,
+# so `add` also ends a last line that had none.
+#
+# C locale, so that the type is folded the way libpam folds it (see
+# _pam_logical_lines). Physical lines, which is only right for a file with no
+# continuations - pam_keyring_lines_can_be_added() requires that.
+_pam_keyring_lines_rewrite() {
+  LC_ALL=C awk -v mode="$1" -v tpm="$PAM_TPM_LINE" -v auth="$PAM_KEYRING_AUTH_LINE" \
+    -v session="$PAM_KEYRING_SESSION_LINE" '
+    function phase(l,   w, n, t) {
+      sub(/#.*/, "", l)
+      n = split(l, w)
+      if (n == 0) return ""
+      t = tolower(w[1])
+      if (t == "auth" || t == "-auth") return "auth"
+      if (t == "session" || t == "-session") return "session"
+      if (t == "@include" || t == "-@include") return "both"
+      return "other"
+    }
+
+    mode == "remove" {
+      if ($0 != tpm && $0 != auth && $0 != session) print
+      next
+    }
+
+    {
+      line[NR] = $0
+      p = phase($0)
+      if (p == "auth" || p == "both") last_auth = NR
+      if (p == "session" || p == "both") last_session = NR
+    }
+
+    END {
+      if (mode != "add") exit
+      for (i = 1; i <= NR; i++) {
+        print line[i]
+        if (i == last_auth) { print tpm; print auth }
+        if (i == last_session) print session
+      }
+    }'
+}
+
+pam_keyring_lines_add() {
+  _pam_keyring_lines_rewrite add
+}
+
+pam_keyring_lines_remove() {
+  _pam_keyring_lines_rewrite remove
+}
+
+# Succeeds if install.sh may add the keyring lines to the service file $1:
+#
+# - it names neither pam_gnome_keyring nor this tool's module anywhere, comments
+#   included. A file with a keyring line in some other phase is somebody's own
+#   arrangement, and adding a second one is not this tool's call;
+# - it has no continuations, so the filter's physical lines are libpam's
+#   logical ones, and it reads to the end;
+# - it has an auth and a session phase of its own. A file without one gets
+#   that phase from "other", and a single line added would replace all of it;
+# - the file as it would be afterwards passes pam_auth_insertion_point_is_safe(),
+#   includers and all. The draft is written to a scratch directory and checked
+#   there, under the real file's name.
+#
+# Sets PAM_INSERTION_REFUSAL when it says no. $2 is the include search path.
+pam_keyring_lines_can_be_added() {
+  local f="$1" path="${2:-$PAM_CONFIG_PATH}" lines line t rc=0 scratch verdict=0
+  local has_auth=0 has_session=0
+  PAM_INSERTION_REFUSAL=""
+  if [ ! -f "$f" ] || [ ! -r "$f" ]; then
+    PAM_INSERTION_REFUSAL="it cannot be read"
+    return 1
+  fi
+  if grep -q pam_tpm_keyring_authtok "$f"; then
+    PAM_INSERTION_REFUSAL="this tool's line is in it, but no auth-phase keyring line - edited by hand since it was wired?"
+    return 1
+  fi
+  if grep -q pam_gnome_keyring "$f"; then
+    PAM_INSERTION_REFUSAL="it names pam_gnome_keyring.so, but in no auth line - an arrangement of its own"
+    return 1
+  fi
+  if ! pam_config_has_no_line_continuations "$f"; then
+    PAM_INSERTION_REFUSAL="it has no keyring line, and continues a line with a backslash"
+    return 1
+  fi
+  lines="$(_pam_logical_lines "$f")" || rc=$?
+  if [ "$rc" != 0 ]; then
+    PAM_INSERTION_REFUSAL="it could not be read to the end"
+    return 1
+  fi
+  while IFS= read -r line; do
+    t=""
+    read -r t _ <<<"$line"
+    case "$t" in
+      auth | -auth) has_auth=1 ;;
+      session | -session) has_session=1 ;;
+      @include | -@include) has_auth=1 has_session=1 ;;
+    esac
+  done <<<"$lines"
+  if [ "$has_auth" = 0 ] || [ "$has_session" = 0 ]; then
+    PAM_INSERTION_REFUSAL="it has no keyring line, and no auth or no session phase of its own to add one to"
+    return 1
+  fi
+  if ! scratch="$(mktemp -d)"; then
+    PAM_INSERTION_REFUSAL="no scratch directory to check the edited file in"
+    return 1
+  fi
+  pam_keyring_lines_add <"$f" >"$scratch/${f##*/}"
+  pam_auth_insertion_point_is_safe "$scratch/${f##*/}" "$path" "$f" || verdict=1
+  rm -rf -- "$scratch"
+  return "$verdict"
+}
+
+# Succeeds if $1 carries the three lines install.sh adds, each exactly once and
+# exactly where it puts them, and nothing else that names the keyring - proved
+# by round trip, as pam_fprintd_stack_is_generated() proves the attempt stack:
+# take the lines out, put them back, and require the file byte for byte. This
+# is what lets the uninstaller take the keyring lines out too. Anything else
+# with our module in it - every stack wired above an existing keyring line -
+# loses only our line.
+pam_keyring_lines_are_ours() {
+  local f="$1" l
+  [ -f "$f" ] || return 1
+  for l in "$PAM_TPM_LINE" "$PAM_KEYRING_AUTH_LINE" "$PAM_KEYRING_SESSION_LINE"; do
+    [ "$(grep -cxF -- "$l" "$f" 2>/dev/null || true)" = 1 ] || return 1
+  done
+  # `< <(...)`, not a pipe into grep -q: see _pam_logical_lines().
+  if grep -qE 'pam_gnome_keyring|pam_tpm_keyring_authtok' < <(pam_keyring_lines_remove <"$f"); then
+    return 1
+  fi
+  pam_keyring_lines_remove <"$f" | pam_keyring_lines_add | cmp -s - "$f"
+}
+
+# Prints the newest .bak-<timestamp> copy of $1 that adding the three lines
+# turns into what is on disk now, byte for byte, if there is one. Restoring it
+# is exact even for a file the filter could not give back byte for byte - one
+# whose last line had no newline - and a stale copy can never pass, for the
+# same reason as in pam_fprintd_exact_original().
+pam_keyring_exact_original() {
+  local f="$1" bak baks=()
+  mapfile -t baks < <(printf '%s\n' "$f".bak-* | sort -r)
+  for bak in "${baks[@]}"; do
+    [ -f "$bak" ] || continue
+    if grep -qE 'pam_gnome_keyring|pam_tpm_keyring_authtok' "$bak"; then continue; fi
+    pam_keyring_lines_add <"$bak" | cmp -s - "$f" || continue
+    echo "$bak"
+    return 0
+  done
+  return 1
+}
+
+# --- SELinux ----------------------------------------------------------------
+#
+# The helper runs in whatever SELinux domain the PAM stack runs in. Under GDM -
+# and under every display manager Fedora packages - that is xdm_t, and
+# Fedora's policy does not let xdm_t open the TPM. Every tpm2_* call the helper
+# makes then fails with "Failed to open specified TCTI device file
+# /dev/tpmrm0: Permission denied", root or not, at every fingerprint login and
+# unlock, and the keyring stays locked. A typed password never needs it.
+# Measured on Fedora 44, enforcing, in a VM with a software TPM: the AVC is
+# `denied { read write } ... scontext=...xdm_t... tcontext=...tpm_device_t...
+# tclass=chr_file`. GitHub issue #23, JOURNAL.md 2026-10-05.
+#
+# The fix is the one-rule policy module in selinux/, which install.sh loads
+# with semodule. It lets all of xdm_t open the TPM, not only the helper -
+# README.md, "SELinux", says what that gives up.
+
+SELINUX_MODULE_NAME=tpm_keyring_unlock
+
+# Succeeds if SELinux is enabled, enforcing or permissive.
+selinux_is_enabled() {
+  [ -e "${SELINUXFS:-/sys/fs/selinux}/enforce" ]
+}
+
+# Asks the running kernel whether the domain in $1 (default: GDM's) may open
+# the TPM device $2 (default /dev/tpmrm0) for reading and writing. Returns 0
+# for yes, 1 for no, and 2 when it cannot ask - no selinuxfs, or a type the
+# loaded policy does not have.
+#
+# selinuxfs's `access` file is the kernel's own access-decision interface:
+# write "scontext tcontext class", read back the allowed permissions as a hex
+# mask. It is open to every process, so this needs neither root nor setools,
+# and it answers for the policy actually loaded, whoever's module granted what.
+selinux_domain_may_use_tpm() {
+  local scon="${1:-system_u:system_r:xdm_t:s0}" dev="${2:-/dev/tpmrm0}"
+  local fs="${SELINUXFS:-/sys/fs/selinux}" tcon idx perm bit want=0 allowed="" rest fd
+  tcon="$(stat -c %C -- "$dev" 2>/dev/null)" || return 2
+  [ -n "$tcon" ] || return 2
+  idx="$(cat "$fs/class/chr_file/index" 2>/dev/null)" || return 2
+  for perm in open read write; do
+    bit="$(cat "$fs/class/chr_file/perms/$perm" 2>/dev/null)" || return 2
+    want=$(( want | (1 << (bit - 1)) ))
+  done
+  # The braces matter. `exec {fd}<>file 2>/dev/null` would send this whole
+  # shell's stderr to /dev/null for good - exec applies every redirection on
+  # its line to the shell itself - and install.sh's prompts, which `read -p`
+  # writes to stderr, vanished with it. The VM test caught exactly that: the
+  # plan printed, and the question after it never appeared.
+  { exec {fd}<>"$fs/access"; } 2>/dev/null || return 2
+  # One write, one read, on the same descriptor: that is the transaction. The
+  # answer carries no newline, so read's status is no use - its content is.
+  if ! printf '%s %s %s' "$scon" "$tcon" "$idx" 1>&"$fd" 2>/dev/null; then
+    exec {fd}>&-
+    return 2
+  fi
+  read -r allowed rest <&"$fd" || true
+  exec {fd}>&-
+  [[ "$allowed" =~ ^[0-9a-fA-F]+$ ]] || return 2
+  [ $(( 0x$allowed & want )) -eq "$want" ]
+}

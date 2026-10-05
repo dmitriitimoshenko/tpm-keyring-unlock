@@ -62,6 +62,8 @@ tpm-keyring-unlock-configure afterwards to seal a password and wire up PAM.
 %{_libdir}/security/pam_tpm_keyring_authtok.so
 %dir %{_libexecdir}/%{name}
 %{_libexecdir}/%{name}/lib.sh
+# Loaded by tpm-keyring-unlock-configure on SELinux systems, never here.
+%{_libexecdir}/%{name}/tpm_keyring_unlock.cil
 %{_libexecdir}/%{name}/seal.sh
 %{_libexecdir}/%{name}/configure.sh
 %{_libexecdir}/%{name}/deconfigure.sh

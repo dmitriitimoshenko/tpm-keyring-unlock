@@ -113,6 +113,23 @@ actually runs there, never skips.
   would refuse every supported Debian-family install. The PAM control flow
   of the generated stack is covered by `runtime-test.sh` below, against real
   libpam.
+  And the keyring lines `install.sh` adds to a `gdm-fingerprint` that has
+  none (GitHub issue #23), against `test/fixtures/pam.d/fedora44/`: the stock
+  Fedora 44 files from gdm-50.3-1.fc44 and pam-1.7.2-2.fc44, with
+  authselect's local profile generated as Workstation runs it. The edited
+  file has to match `test/fixtures/expected/fedora44-gdm-fingerprint`, read
+  by eye rather than computed by the code under test; it has to pass the
+  insertion check as the candidate it becomes; taking the lines out has to
+  give the original back byte for byte, and the exact pre-install copy has
+  to be found over a stale one. A postlogin with `pam_ecryptfs` in its auth
+  phase still allows the edit, since the new lines go after it; a service
+  that includes `gdm-fingerprint` and runs `pam_unix.so` afterwards does
+  not. Refused, each with its reason: a keyring line in another phase only,
+  our line with no keyring line under it, a continuation, no session or no
+  auth phase of its own. A hand edit to one of the three lines, a fourth
+  keyring line or a moved session line make the file no longer provably
+  ours, so `uninstall.sh` takes only its own line out. The stacks Fedora 44
+  ships with a keyring line keep their verdict.
 - **`test/runtime-test.sh`** (one container, distro doesn't matter) — the
   compiled PAM module's actual fork/exec/pipe/timeout/`PAM_AUTHTOK` logic,
   using `pamtester` + a fake helper script standing in for
@@ -134,6 +151,10 @@ actually runs there, never skips.
   to record success would break fingerprint login outright), that a bad
   scan falls through to the next attempt, that three bad scans fail, and
   that a mismatch dies on the spot.
+  And the same for Fedora's `gdm-fingerprint` once it has the keyring lines,
+  built from the fixture tree and the shipped filter: a matched finger
+  reaches our line and the keyring line after `auth substack` and `auth
+  include postlogin`, and a mismatch or a bad scan still fails the stack.
 - **`test/distro/Dockerfile.{ubuntu,debian,fedora,arch,opensuse}`** +
   **`test/distro/test-packaging.sh`** — on each distro's own real base
   image: install the declared dependencies via that distro's real package
@@ -290,6 +311,45 @@ the concurrent-unseal `flock` check) still gates normally. Locally,
 failure there - which is where it actually catches product regressions,
 since the CI-specific PCR7 drift appears to be an environment quirk
 unrelated to `bin/seal.sh`/`pam/tpm-keyring-unseal.sh`'s own logic.
+
+## The SELinux VM layer: `test/vm/run-selinux-test.sh`
+
+```bash
+test/vm/run-selinux-test.sh   # or: make test-vm-selinux
+```
+
+The same machinery on Fedora's cloud image, with SELinux enforcing as it
+ships, a `swtpm` TPM and Secure Boot on. Ubuntu has no SELinux, so nothing
+above can see what GitHub issue #23 reported: GDM runs its PAM stacks as
+`xdm_t`, and Fedora's policy keeps that domain away from the TPM.
+
+- **install.sh on Fedora 44's own gdm stacks** (`test/fixtures/pam.d/fedora44`,
+  copied in, since the image has no gdm): `gdm-fingerprint`, which has no
+  keyring line, ends up exactly as `test/fixtures/expected/fedora44-gdm-fingerprint`
+  with its label kept, `gdm-password` is wired the ordinary way, and the
+  policy module is planned and loaded.
+- **The helper from GDM's domain.** A copy of `pamtester` labelled
+  `xdm_exec_t` and started by systemd runs as `xdm_t`, the way systemd
+  starts gdm itself, with its output on a journal stream named
+  `gdm-session-worker`, the way gdm hands it to its session worker. It runs
+  the real, edited `gdm-fingerprint`, through authselect's `fingerprint-auth`
+  with `with-fingerprint` on; only `pam_fprintd` is a stand-in
+  (`pam_flow_stub`, which always matches). With the module: authenticated,
+  `PAM_AUTHTOK` set, `pam_gnome_keyring` given the token, no AVC. Without it:
+  login unaffected, nothing unsealed, the `tpm_device_t` denial from the
+  issue, and the helper's own message naming its context instead of blaming
+  an evicted primary.
+- **The lock directory.** Created first by the `sudo` run README suggests,
+  so it is `var_run_t`, which `xdm_t` may not write a file in. GDM's runs
+  have to work regardless.
+- **A second install.sh run** plans the module again once it has been
+  removed, and finds `gdm-fingerprint` already wired.
+- **uninstall.sh** restores `gdm-fingerprint` and `gdm-password` byte for
+  byte and removes the module, after which `xdm_t` is denied again.
+
+Opt-in and not in CI: it fetches a ~580 MB image once (cached, re-verified
+against Fedora's published checksum every run) and installs packages from
+Fedora's mirrors at boot.
 
 ## What even the VM layer doesn't cover, and why
 

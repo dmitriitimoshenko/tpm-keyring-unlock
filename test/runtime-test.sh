@@ -214,6 +214,45 @@ check "three mismatches: all three attempts run, then the stack fails" \
 check "aborted conversation: dies on the spot, no further attempts" \
   "$(flow_case abort success success)" "failure fp1,"
 
+echo
+echo "-- control flow of Fedora's gdm-fingerprint, given its keyring lines"
+echo "   (bin/lib.sh's pam_keyring_lines_add; GitHub issue #23) --"
+# Fedora ships gdm-fingerprint with no keyring line, and install.sh now adds
+# one after the stack's last auth line, which there is `auth include
+# postlogin`, after `auth substack fingerprint-auth`. Built from the stock
+# Fedora 44 files and the shipped filter, with pam_flow_stub standing in for
+# the finger, for our module and for pam_gnome_keyring. What is under test is
+# libpam's reading of that position: a matched finger has to reach the new
+# lines, and a failed one must still fail the stack. postlogin's auth phase is
+# empty unless ecryptfs is on, so a marker stands in for that line, to show it
+# runs before ours.
+F44_FIXTURES="$REPO_DIR/test/fixtures/pam.d/fedora44"
+f44_flow_case() {
+  sed "s/pam_fprintd\.so/pam_flow_stub.so mark=fp ret=$1/" \
+    "$F44_FIXTURES/fingerprint-auth" >/etc/pam.d/f44-fingerprint-auth
+  { printf 'auth\toptional\tpam_flow_stub.so mark=postlogin\n'; cat "$F44_FIXTURES/postlogin"; } \
+    >/etc/pam.d/f44-postlogin
+  pam_keyring_lines_add <"$F44_FIXTURES/gdm-fingerprint" \
+    | sed -e 's/fingerprint-auth/f44-fingerprint-auth/; s/postlogin/f44-postlogin/' \
+          -e 's/pam_tpm_keyring_authtok\.so/pam_flow_stub.so mark=tpm/' \
+          -e 's/pam_gnome_keyring\.so/pam_flow_stub.so mark=keyring/' \
+    >/etc/pam.d/f44-gdm-fingerprint
+  rm -f "$FLOW_LOG"
+  local r
+  if pamtester f44-gdm-fingerprint testsuccess authenticate >/dev/null 2>&1; then r=success; else r=failure; fi
+  printf '%s %s' "$r" "$(tr '\n' ',' <"$FLOW_LOG" 2>/dev/null || true)"
+}
+
+check "a matched finger reaches the helper and the keyring, after postlogin" \
+  "$(f44_flow_case success)" "success fp,postlogin,tpm,keyring,"
+# The helper still runs after a failed finger, as it does on every stack this
+# tool wires (README.md, "What this protects"). The stack's answer does not
+# change: still a failure.
+check "a mismatched finger still fails the stack" \
+  "$(f44_flow_case auth_err)" "failure fp,postlogin,tpm,keyring,"
+check "so does a bad scan" \
+  "$(f44_flow_case authinfo_unavail)" "failure fp,postlogin,tpm,keyring,"
+
 if [ "$fail" -eq 0 ]; then
   echo "All runtime tests passed."
 else

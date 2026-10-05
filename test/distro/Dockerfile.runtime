@@ -14,6 +14,7 @@ COPY pam/pam_tpm_keyring_authtok.c pam/pam_tpm_keyring_authtok.c
 COPY test/fixtures/pam_spy_authtok.c test/fixtures/pam_spy_authtok.c
 COPY test/fixtures/pam_flow_stub.c test/fixtures/pam_flow_stub.c
 COPY test/fixtures/pam_autoreap_children.c test/fixtures/pam_autoreap_children.c
+COPY test/fixtures/pam.d/fedora44 test/fixtures/pam.d/fedora44
 COPY test/runtime-test.sh test/runtime-test.sh
 
 CMD ["bash", "test/runtime-test.sh"]

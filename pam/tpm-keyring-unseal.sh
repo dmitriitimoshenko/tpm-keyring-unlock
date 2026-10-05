@@ -116,6 +116,16 @@ fi
 # symlink and no race. /run itself is root-owned and mode 755, so a directory
 # created here can only have been created by root. See JOURNAL.md,
 # 2026-09-15.
+#
+# The lock is taken on the directory itself, opened for reading, not on a file
+# written inside it. Under SELinux the directory carries the label of whoever
+# created it first after boot: xdm_var_run_t when GDM's PAM stack (domain
+# xdm_t) gets there first, plain var_run_t when it was a `sudo` run from a
+# terminal - the check README suggests. xdm_t may not write a file in the
+# latter, so the old `exec 9>"$LOCK_DIR/unseal.lock"` failed every GDM unseal
+# until the next reboot. xdm_t may open and lock the directory under either
+# label, and flock(2) works on a directory just as on a file. Measured on
+# Fedora 44, enforcing; GitHub issue #23, JOURNAL.md 2026-10-05.
 LOCK_DIR=/run/tpm-keyring-unlock
 if [ -L "$LOCK_DIR" ] || { [ -e "$LOCK_DIR" ] && [ ! -d "$LOCK_DIR" ]; }; then
   echo "tpm-keyring-unseal: $LOCK_DIR exists and is not a directory - refusing." >&2
@@ -123,7 +133,7 @@ if [ -L "$LOCK_DIR" ] || { [ -e "$LOCK_DIR" ] && [ ! -d "$LOCK_DIR" ]; }; then
 fi
 mkdir -p "$LOCK_DIR"
 chmod 700 "$LOCK_DIR"
-exec 9>"$LOCK_DIR/unseal.lock"
+exec 9<"$LOCK_DIR"
 flock -w 10 9 || exit 1
 
 WORKDIR=$(mktemp -d)
@@ -138,6 +148,25 @@ trap 'rm -rf "$WORKDIR"' EXIT
 cat <&7 >"$WORKDIR/seal.priv"
 cat <&8 >"$WORKDIR/seal.pub"
 exec 7<&- 8<&-
+
+# Whether this process may open the TPM at all - asked before anything below
+# can blame the persisted primary for a load that failed for another reason.
+# Under SELinux that is the policy's call, not the file mode's: GDM's PAM
+# stacks run as xdm_t, which Fedora's policy keeps away from the TPM unless
+# selinux/tpm_keyring_unlock.cil is loaded. Every tpm2_* call then fails, and
+# the fast path below used to report that as an evicted primary (GitHub issue
+# #23). Opening the resource manager and closing it again sends the TPM
+# nothing. The context goes in the message because it is the whole diagnosis:
+# under GDM this lands in the journal as gdm-session-worker.
+if ! TPM_OPEN_ERR="$({ : <>/dev/tpmrm0; } 2>&1)"; then
+  echo "tpm-keyring-unseal: cannot open /dev/tpmrm0 (${TPM_OPEN_ERR##*: }) as" \
+    "$(id -Z 2>/dev/null || id -un)." >&2
+  if [ -e /sys/fs/selinux/enforce ]; then
+    echo "tpm-keyring-unseal: SELinux has to let that domain use the TPM -" \
+      "see README.md, 'SELinux'." >&2
+  fi
+  exit 1
+fi
 
 # Fast path: if bin/seal.sh has persisted the primary into the TPM's own NV
 # storage (see JOURNAL.md, 2026-08-16), reference that handle directly - no

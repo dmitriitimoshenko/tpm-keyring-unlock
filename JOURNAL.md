@@ -6266,3 +6266,248 @@ Checked before the PR, since a packaging mistake only shows at release time:
 
 The AUR checksum is the zero placeholder `bump-version.sh` leaves; the workflow
 writes the real one back once the tag exists.
+
+## Fedora: gdm-fingerprint was passed over, and SELinux kept the helper from the TPM (2026-10-05, GitHub issue #23)
+
+Reported from a Fedora 44 laptop (Framework 13 AMD, gdm-50.3-1.fc44,
+selinux-policy-targeted-44.11-1.fc44, SELinux enforcing, Secure Boot on),
+with two hand-made fixes that worked there. Both problems fail closed:
+nothing leaks, no login changes, the keyring simply stays locked at
+fingerprint logins and asks for its password. Both were reproduced before
+anything was changed.
+
+### 1. gdm-fingerprint was never a candidate
+
+The reporter guessed right that Fedora's `gdm-fingerprint` has no
+`pam_gnome_keyring` line. Checked against the package itself
+(gdm-50.3-1.fc44, extracted in a `fedora:44` container): none in any phase.
+GDM's pam-redhat files leave the keyring out of the fingerprint stack, since
+a finger yields no password. The mechanism was slightly different from the
+guess, though. install.sh's candidates are the `/etc/pam.d` files matching
+`PAM_GNOME_KEYRING_AUTH_RE`, so this file was never a candidate, the
+insertion check never saw it, and nothing reported it. The reporter's
+"unsafe verdicts: 200/200" was the check's correct answer ("it has no
+auth-phase pam_gnome_keyring.so line") to a question install.sh never asked.
+
+PR #21's table checked Fedora 44's `gdm-password`, `-autologin` and
+`-switchable-auth`. Nobody noticed that the stack this tool exists for was
+missing from it. That is the false-refuse the 2026-09-15 entry warned about,
+reached by a different road: it never looks like a security bug, only like
+the tool not working.
+
+**Fix.** For `gdm-fingerprint` only, install.sh adds three lines (bin/lib.sh,
+`pam_keyring_lines_add`): our line and `auth optional pam_gnome_keyring.so`
+after the stack's last auth-phase line, and `session optional
+pam_gnome_keyring.so auto_start` after its last session-phase line. That is
+what the same distribution's `gdm-password` carries. The decisions:
+
+- **After the last line, not after the authenticator.** The reporter put the
+  lines between `auth substack fingerprint-auth` and `auth include
+  postlogin`. Here nothing in the file runs after our module. postlogin's
+  auth phase is empty by default, but authselect's `with-ecryptfs` puts
+  `pam_ecryptfs` there, which is not on the vetted list. Placed the
+  reporter's way, the stack would be refused as soon as ecryptfs was on;
+  placed last, pam_ecryptfs runs before the token exists.
+- **The session line last** as well: after `pam_selinux.so open` and after
+  `pam_systemd` (in fingerprint-auth's session phase), as `gdm-password`
+  has it. pam_gnome_keyring starts the daemon there.
+- **No password-phase line**: gdm-fingerprint's password phase is
+  `pam_deny.so`.
+- **gdm-fingerprint only.** Fedora's `gdm-smartcard` has no keyring line
+  either, but a smartcard PIN is not the keyring password, and smartcard
+  unlock is not this tool's job.
+- **Preconditions** (`pam_keyring_lines_can_be_added`): no mention of
+  pam_gnome_keyring or our module anywhere, so someone's own session-only
+  keyring line is left alone; no continuations, so physical lines are
+  logical ones; an auth and a session phase of its own, since a file without
+  one gets that phase from `other`; `pam_gnome_keyring.so` installed (checked
+  in install.sh); and the edited file has to pass
+  `pam_auth_insertion_point_is_safe`. The draft is checked in a scratch
+  directory, so the function gained a third argument, the file the content
+  stands for, which the includer walk uses for the name.
+- **Undo** uses the attempt stack's pattern. A round trip proves the three
+  lines are ours (`pam_keyring_lines_are_ours`), and the pre-install copy is
+  restored when it is provably the direct ancestor
+  (`pam_keyring_exact_original`). Otherwise the three lines are taken out.
+  install.sh's own un-wiring path takes all three out too when they are
+  provably ours. A hand-fixed file like the reporter's, with their own
+  spacing, is not "ours": uninstall.sh takes only our module line out of it,
+  as from any stack.
+- The "!! NOT wiring" heading said every refusal was about vetting what runs
+  after the helper. gdm-fingerprint can now be refused for other reasons, so
+  the heading says less.
+
+Verified: unit tests against `test/fixtures/pam.d/fedora44/` (the stock
+files, authselect's local profile generated as Workstation runs it, with
+`with-fingerprint` and `with-silent-lastlog`), with a checked-in expected
+file. Control flow on Debian's libpam 1.5.2 in the runtime container: a
+matched finger reaches our line and the keyring line after postlogin, and a
+mismatch or bad scan still fails the stack. And on Fedora's libpam 1.7.2 in
+the new VM test, below.
+
+### 2. Under SELinux the helper never reaches the TPM from GDM
+
+Reproduced on Fedora 44 Cloud (selinux-policy-targeted-44.11-1.fc44, the
+reporter's version) under qemu with swtpm and OVMF Secure Boot, enforcing.
+`/usr/libexec/gdm-session-worker` is `bin_t` and runs in gdm's `xdm_t`, and
+so does the helper it forks. Getting a PAM stack into `xdm_t` without a
+desktop: systemd starting a copy of pamtester labelled `xdm_exec_t` -
+`init_t` executing `xdm_exec_t` transitions to `xdm_t`, the rule that puts
+gdm there. `id -Z` from the same harness gives
+`system_u:system_r:xdm_t:s0-s0:c0.c1023`, the reporter's scontext.
+
+The two denials were exactly the reporter's:
+
+    avc:  denied  { read write } for comm="tpm2_load" name="tpmrm0" dev="devtmpfs"
+      scontext=system_u:system_r:xdm_t:s0-s0:c0.c1023
+      tcontext=system_u:object_r:tpm_device_t:s0 tclass=chr_file permissive=0
+    avc:  denied  { write } for comm="bash" name="unseal.lock" dev="tmpfs"
+      scontext=system_u:system_r:xdm_t:s0-s0:c0.c1023
+      tcontext=unconfined_u:object_r:var_run_t:s0 tclass=file permissive=0
+
+The first happens on every run that needs the helper: `sesearch -A -s xdm_t
+-t tpm_device_t` is empty, and no boolean exists. Password logins are
+untouched, because a typed password never reaches the helper. The second
+happens only when `/run/tpm-keyring-unlock` was created first by an
+unconfined process, such as the `sudo /usr/local/sbin/tpm-keyring-unseal
+$USER` that seal.sh's last line and README's troubleshooting suggest. When
+`xdm_t` creates it first it is `xdm_var_run_t` (`type_transition xdm_t
+var_run_t:dir xdm_var_run_t`) and it works, until the next manual run in
+the same boot.
+
+Also found: with the TPM denied, `tpm2_load` fails, and the fast path then
+reported "the persisted TPM primary ... has been evicted". The diagnosis was
+wrong, and it sat right next to the real error.
+
+**TPM fix.** One rule, `selinux/tpm_keyring_unlock.cil`:
+`(allow xdm_t tpm_device_t (chr_file (open read write)))`. Measured with the
+module loaded: the helper unseals from `xdm_t` with no AVC, on the fast path
+and on the slow one (`primary.handle` pointed at an empty slot). With `xdm_t`
+made permissive (`semanage permissive -a xdm_t`), no further denial is
+logged on either path. These are the same three permissions the reporter's
+permissive login listed.
+
+**Lock fix.** The helper now locks the directory itself
+(`exec 9<"$LOCK_DIR"`), not a file written inside it. `xdm_t` may open and
+lock the directory under either label - every domain may for `var_run_t`
+(`allow domain var_run_t:dir { ioctl lock read }`, plus the base `open`), and
+`xdm_t` manages `xdm_var_run_t` - and flock(2) works on a directory.
+Measured: a `var_run_t` directory left by `sudo`, with a stale `unseal.lock`
+in it, works from `xdm_t`, and so does an `xdm_var_run_t` one. While root
+held the directory lock for 6 s, the `xdm_t` run waited it out (5854 ms). A
+non-root user cannot open it
+(`flock: cannot open lock file /run/tpm-keyring-unlock: Permission denied`),
+so the 2026-09-15 property holds. Rejected:
+
+- The reporter's `semanage fcontext -t xdm_var_run_t` plus a tmpfiles.d
+  entry. It works, but it is three moving parts (a local fcontext rule, a
+  tmpfiles.d file, a relabel) for what one line does, and the label would
+  still depend on who creates the directory first unless tmpfiles.d gets
+  there at boot.
+- Locking the helper script itself. `bin_t`, so every domain may lock it,
+  and it works (measured). But only root may open it only while the helper
+  stays `0700`. A root-owned `0700` directory in `/run` does not depend on
+  packaging getting a mode right.
+
+**Diagnosis.** Before any `tpm2_*` call the helper opens `/dev/tpmrm0` and,
+if it cannot, says so with its own context:
+`cannot open /dev/tpmrm0 (Permission denied) as system_u:system_r:xdm_t:s0-s0:c0.c1023`,
+plus a pointer to README. The reporter also asked for the helper's stderr to
+be logged from the PAM module. Under GDM it already is: gdm-session-worker-job.c
+(`session_worker_job_setup_journal_fds`) gives the worker's stdout and
+stderr journal streams named `gdm-session-worker`, so the helper's messages
+were in the journal all along. What was missing was a message naming the
+cause. The C module is unchanged. Capturing stderr there would have meant a
+poll loop over two pipes in the one file that runs as root at every login,
+for nothing under GDM.
+
+**Installer.** install.sh asks the kernel whether `xdm_t` may open the TPM,
+through selinuxfs's `access` file. That needs no root and no setools, and it
+answers for the policy actually loaded. When the answer is no and a stack is
+or will be wired, loading the module is a plan step, and the plan says what
+it costs. It is a plan step rather than a question of its own because the
+tool does nothing at GDM fingerprint logins without it. uninstall.sh offers
+to remove the module, looked up in the module store rather than inferred
+from the kernel's answer: a distribution policy or an admin's own module
+(the reporter's `tpmkeyring`) can grant the same access, and neither is ours
+to remove. On the reporter's machine install.sh will therefore load nothing,
+and their fcontext and tmpfiles.d entries are harmless with the directory
+lock.
+
+**Why not a domain of the helper's own.** It would keep the TPM away from
+the rest of GDM: the rule as shipped lets every root process in `xdm_t` open
+the TPM, and a compromised GDM worker could then send it any command - extend
+PCRs, or clear it where the lockout password is empty, as it usually is.
+But the helper is a shell script running tpm2-tools, getent and coreutils,
+so a domain for it means dozens of rules (executables, libraries, locale,
+nsswitch, the user's home, /tmp, /run, the pipe back to the module), and only
+a real Fedora login exercises them all. Every missing rule is a silent
+failure at login, which is the bug being fixed. A compromised `xdm_t` could
+also still execute the helper with an environment of its choosing
+(`BASH_ENV`, `PATH`) and run code in the new domain. Recorded in README,
+"SELinux", along with what the shipped rule gives up.
+
+### A bug the VM test caught in this very change
+
+`selinux_domain_may_use_tpm()` first opened the access file with
+`exec {fd}<>"$fs/access" 2>/dev/null`. `exec` applies every redirection on
+its line to the shell itself, so from the SELinux check onwards install.sh's
+stderr was `/dev/null`. `read -p` writes its prompt to stderr, so the plan
+printed and the "Proceed" question never appeared: pty-drive waited out its
+420 s for it. Now `{ exec {fd}<>"$fs/access"; } 2>/dev/null`, which keeps the
+descriptor and restores stderr after the braces (checked in a throwaway
+shell). The unit suite could not have caught this, since the function needs
+a real selinuxfs. Grepped the other scripts for the same pattern: no other
+instance.
+
+Also from the harness: `systemd-run --pipe` fails with "Connection reset by
+peer" when its stdout is a pipe made by sshd. The journal shows dbus-broker
+(`system_dbusd_t`) denied reading the `sshd_session_t` fifo. The harness
+gives it a pipe of the remote shell's own.
+
+### Test layer
+
+`test/vm/run-selinux-test.sh` (`make test-vm-selinux`) boots Fedora 44 Cloud
+with swtpm and Secure Boot. It copies the stock gdm stacks in, enables
+authselect's `with-fingerprint`, and puts `pam_flow_stub` in place of
+`pam_fprintd`. Then it runs install.sh, the edited `gdm-fingerprint` as
+`xdm_t` with its output on a `gdm-session-worker` journal stream, the same
+without the module, a second install.sh run, and uninstall.sh. Opt-in, and
+not in CI: a ~580 MB image, and Fedora's mirrors at boot. The Ubuntu VM
+test's race check now holds the directory lock, and it copies `selinux/`
+for `make install`.
+
+### Verified
+
+- `test/unit-regex-test.sh`: 314 checks pass, the new ones included.
+- `test/run-all.sh`: regex, runtime and the five distribution containers
+  pass. The arm64 cross-build is SKIPPED here (no binfmt handler on this
+  host); the C module is unchanged.
+- `make test-vm` (Ubuntu 24.04, swtpm, Secure Boot): 40 of 40, including the
+  race check against the directory lock, the reboot round trip and both
+  install paths.
+- `make test-vm-selinux` (Fedora 44, enforcing): 38 of 38, in 1m49s with the
+  image cached.
+- `rpmbuild -bb` on Fedora 44 and `dpkg-buildpackage -b` on Debian 13, main
+  and this branch side by side: the module ships 0644 in both, and `rpmlint`
+  and `lintian` report nothing main did not. The Debian build needed
+  `dh_fixperms -X tpm_keyring_unlock.cil` first: debhelper 13.24's
+  `dh_fixperms` makes everything under `usr/libexec` executable, and lintian
+  flagged the result as `executable-not-elf-or-script`.
+- shellcheck: nothing new beyond notes of kinds the files already carry
+  (SC2094 on `cmp` pipelines that only read, SC2034 on variables the sourcing
+  scripts use).
+
+### Not done
+
+- The Build Service has no `Fedora_44` target (the reporter's last note).
+  That is OBS project configuration, not something in this repository, and
+  README still lists 42 and 43.
+- The `doctor` command the reporter suggested does not exist. The plan now
+  states the SELinux situation, and README's troubleshooting has the
+  journal and audit commands.
+- Other confined login domains (`local_login_t` for console logins, sshd's)
+  are not in the module. On Fedora those stacks have no keyring line, so
+  install.sh never wires them.
+- openSUSE Tumbleweed, SELinux by default since 2025: its policy derives
+  from Fedora's and has both types, so the module should load. Not run.

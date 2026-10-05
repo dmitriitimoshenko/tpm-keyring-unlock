@@ -130,13 +130,39 @@ fi
 for f in /etc/pam.d/*; do
   [ -f "$f" ] || continue
   if [[ "$f" =~ $PAM_NON_SERVICE_RE ]]; then continue; fi
-  if grep -q pam_tpm_keyring_authtok.so "$f"; then
-    echo "Found the injected line in $f"
-    if confirm "Remove it?"; then
+  if ! grep -q pam_tpm_keyring_authtok.so "$f"; then continue; fi
+  # A gdm-fingerprint that had no keyring line of its own got the keyring
+  # lines from install.sh along with ours (Fedora's; GitHub issue #23). Those
+  # are this tool's too, so they go as well - but only when the round trip
+  # proves them ours, exactly where install.sh puts them. Restored from the
+  # pre-install copy when one provably is the file's direct ancestor, which is
+  # exact to the byte; otherwise the three lines are taken out.
+  if pam_keyring_lines_are_ours "$f"; then
+    echo "Found the TPM helper in $f, with the two keyring lines install.sh"
+    echo "added next to it - the file had none of its own."
+    ORIGINAL="$(pam_keyring_exact_original "$f" || true)"
+    if confirm "Remove all three, back to the file as it was?"; then
       backup_pam_file "$f"
-      sudo sed -i "$PAM_TPM_LINE_DELETE_SED" "$f"
-      echo "Removed (previous content backed up as $f.bak-$RUN_TS)."
+      if [ -n "$ORIGINAL" ]; then
+        # cp *onto* the existing file, so its mode, owner and label stay.
+        sudo cp "$ORIGINAL" "$f"
+        echo "Restored exactly, from $ORIGINAL"
+      else
+        REWRITTEN="$(mktemp)"
+        pam_keyring_lines_remove <"$f" >"$REWRITTEN"
+        sudo cp "$REWRITTEN" "$f"
+        rm -f "$REWRITTEN"
+        echo "Removed the three lines (no pre-install copy of this file was found)."
+      fi
+      echo "Previous content backed up as $f.bak-$RUN_TS."
     fi
+    continue
+  fi
+  echo "Found the injected line in $f"
+  if confirm "Remove it?"; then
+    backup_pam_file "$f"
+    sudo sed -i "$PAM_TPM_LINE_DELETE_SED" "$f"
+    echo "Removed (previous content backed up as $f.bak-$RUN_TS)."
   fi
 done
 
@@ -361,6 +387,37 @@ elif [ -n "$found_module" ] || [ -f "$HELPER_DST" ]; then
     fi
   else
     echo "Left the PAM module and helper in place."
+  fi
+fi
+
+# --- 2b. the SELinux policy module ----------------------------------------
+# install.sh loads it so GDM's logins (domain xdm_t) may open the TPM -
+# GitHub issue #23, bin/lib.sh. Machine-wide like the module and the helper,
+# but the configure step's doing rather than a package's, so it is offered
+# with or without --no-build. Looked up in the module store, not inferred from
+# whether xdm_t may open the TPM: the distribution's policy, or an admin's own
+# module, can grant the same access, and neither is this tool's to remove.
+if command -v semodule >/dev/null 2>&1 && [ -d /var/lib/selinux ]; then
+  # Captured, not piped into grep -q: under pipefail an early exit there can
+  # read a loaded module as a missing one (see bin/lib.sh, _pam_logical_lines).
+  SELINUX_MODULES="$(sudo semodule -l 2>/dev/null || true)"
+  if grep -qx "$SELINUX_MODULE_NAME" <<<"$SELINUX_MODULES"; then
+    echo
+    SELINUX_PROMPT="Remove the SELinux module $SELINUX_MODULE_NAME? GDM logins lose the TPM again."
+    if [ -n "$OTHER_SEALED" ]; then
+      echo "Reminder: these users' GDM logins reach the TPM through it too:"
+      echo "$OTHER_SEALED" | sed 's/^/  /'
+      SELINUX_PROMPT="Remove the SELinux module $SELINUX_MODULE_NAME anyway, taking GDM auto-unlock away from the users listed above?"
+    fi
+    if confirm "$SELINUX_PROMPT"; then
+      if sudo semodule -r "$SELINUX_MODULE_NAME"; then
+        echo "Removed $SELINUX_MODULE_NAME."
+      else
+        echo "semodule -r $SELINUX_MODULE_NAME failed - left in place." >&2
+      fi
+    else
+      echo "Left $SELINUX_MODULE_NAME loaded."
+    fi
   fi
 fi
 

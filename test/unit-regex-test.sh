@@ -1072,6 +1072,160 @@ if locale -a 2>/dev/null | grep -qi '^tr_TR\.utf-\?8$'; then
     "$(LC_ALL=tr_TR.UTF-8 verdict "$BELOW/upper-harmless" "$BELOW")" "safe"
 fi
 
+# --- a gdm-fingerprint with no keyring line at all (GitHub issue #23) -------
+# Fedora ships gdm-fingerprint with no pam_gnome_keyring.so line in any phase,
+# so the candidate grep never matched it and install.sh passed it over without
+# a word: fingerprint logins kept prompting. install.sh now adds the keyring
+# lines along with its own, after the last auth line and the last session
+# line. The fixture tree is the stock Fedora 44 set - gdm-50.3-1.fc44 and
+# pam-1.7.2-2.fc44, plus authselect-1.7.1's local profile generated with
+# with-fingerprint and with-silent-lastlog - and the expected result is
+# checked in, read by eye, rather than computed by the code under test.
+F44="$FIXTURES/fedora44"
+EXPECTED="$REPO_DIR/test/fixtures/expected"
+yes_no() {
+  if "$@"; then echo yes; else echo "no: $PAM_INSERTION_REFUSAL"; fi
+}
+is_ours() {
+  if pam_keyring_lines_are_ours "$1"; then echo yes; else echo no; fi
+}
+
+if grep -qE "$PAM_GNOME_KEYRING_AUTH_RE" "$F44/gdm-fingerprint"; then got=candidate; else got=passed-over; fi
+check "Fedora's gdm-fingerprint is no keyring candidate by itself" "$got" "passed-over"
+check "...so the keyring lines may be added to it" \
+  "$(yes_no pam_keyring_lines_can_be_added "$F44/gdm-fingerprint" "$F44")" "yes"
+
+F44_WIRED="$WORKDIR/f44-gdm-fingerprint-wired"
+pam_keyring_lines_add <"$F44/gdm-fingerprint" >"$F44_WIRED"
+if cmp -s "$F44_WIRED" "$EXPECTED/fedora44-gdm-fingerprint"; then got=as-expected; else got=differs; fi
+check "the three lines land after the last auth and the last session line" "$got" "as-expected"
+check "the edited file is recognised as install.sh's" \
+  "$(is_ours "$F44_WIRED")" "yes"
+if pam_keyring_lines_remove <"$F44_WIRED" | cmp -s - "$F44/gdm-fingerprint"; then got=identical; else got=differs; fi
+check "...and taking them out gives the original back byte for byte" "$got" "identical"
+check "the stock file is not mistaken for one install.sh edited" \
+  "$(is_ours "$F44/gdm-fingerprint")" "no"
+check "nor is a stack wired the ordinary way" \
+  "$(is_ours "$FIXTURES/already-patched")" "no"
+
+# On a re-run the edited file is an ordinary candidate, with our line right
+# above its keyring line, and it has to pass the check there - or install.sh
+# would take it straight back out.
+F44_TREE="$WORKDIR/f44-tree"
+mkdir -p "$F44_TREE"
+cp "$F44"/* "$F44_TREE/"
+cp "$F44_WIRED" "$F44_TREE/gdm-fingerprint"
+check "the edited gdm-fingerprint passes the insertion check as it sits" \
+  "$(verdict "$F44_TREE/gdm-fingerprint" "$F44_TREE")" "safe"
+if grep -qE "$PAM_GNOME_KEYRING_AUTH_RE" "$F44_TREE/gdm-fingerprint"; then got=candidate; else got=passed-over; fi
+check "...as the candidate it now is" "$got" "candidate"
+
+# The pre-install copy that install.sh's edit provably came from is what
+# uninstall.sh restores; a stale one is never taken.
+cp "$F44/gdm-fingerprint" "$F44_TREE/gdm-fingerprint.bak-20260101000000"
+printf '# stale\n' | cat - "$F44/gdm-fingerprint" >"$F44_TREE/gdm-fingerprint.bak-20260201000000"
+check "the exact pre-install copy is found, and the stale newer one skipped" \
+  "$(pam_keyring_exact_original "$F44_TREE/gdm-fingerprint" || echo none)" \
+  "$F44_TREE/gdm-fingerprint.bak-20260101000000"
+rm -f "$F44_TREE"/gdm-fingerprint.bak-*
+
+# The stacks Fedora 44 does ship with a keyring line keep their verdict
+# (PR #21's table), and the two with none, other than gdm-fingerprint, are
+# still left alone: smartcard and the greeter's own session are not this
+# tool's business.
+for f in gdm-password gdm-autologin gdm-switchable-auth; do
+  check "Fedora 44 $f still passes the insertion check" "$(verdict "$F44/$f" "$F44")" "safe"
+done
+for f in gdm-smartcard gdm-launch-environment; do
+  if grep -qE "$PAM_GNOME_KEYRING_AUTH_RE" "$F44/$f"; then got=candidate; else got=passed-over; fi
+  check "Fedora 44 $f is no candidate" "$got" "passed-over"
+done
+
+# Switching on authselect's with-ecryptfs puts pam_ecryptfs into postlogin's
+# auth phase. pam_ecryptfs is not on the vetted list - but our lines go after
+# postlogin, so it runs before the token exists and nothing has to vet it.
+awk '/^session/ && !done { print "auth        optional                   pam_ecryptfs.so unwrap"; done = 1 } { print }' \
+  "$F44/postlogin" >"$F44_TREE/postlogin"
+cp "$F44/gdm-fingerprint" "$F44_TREE/gdm-fingerprint"
+if grep -q '^auth.*pam_ecryptfs' "$F44_TREE/postlogin"; then got=present; else got=missing; fi
+check "(the ecryptfs fixture really has its auth line)" "$got" "present"
+check "with ecryptfs in postlogin's auth phase, the lines may still be added" \
+  "$(yes_no pam_keyring_lines_can_be_added "$F44_TREE/gdm-fingerprint" "$F44_TREE")" "yes"
+cp "$F44/postlogin" "$F44_TREE/postlogin"
+
+# A service that includes gdm-fingerprint and runs pam_unix after it would
+# take the token the edited file hands on. The draft is checked in a scratch
+# directory, so the includers have to be looked up under the real name.
+printf '%s\n' 'auth    include    gdm-fingerprint' \
+  'auth    sufficient pam_unix.so try_first_pass' >"$F44_TREE/includes-fingerprint"
+check "an includer that runs pam_unix.so after gdm-fingerprint: refused" \
+  "$(yes_no pam_keyring_lines_can_be_added "$F44_TREE/gdm-fingerprint" "$F44_TREE")" \
+  "no: includes-fingerprint includes gdm-fingerprint, and after that: pam_unix.so runs after the keyring line, and is not on the list of modules known to leave PAM_AUTHTOK alone"
+rm -f "$F44_TREE/includes-fingerprint"
+
+# What the filter will not take on, each with its reason.
+keyringless() {
+  printf '%s\n' "$@" >"$F44_TREE/gdm-fingerprint"
+  yes_no pam_keyring_lines_can_be_added "$F44_TREE/gdm-fingerprint" "$F44_TREE"
+}
+case "$(keyringless 'auth substack fingerprint-auth' 'session optional pam_gnome_keyring.so auto_start')" in
+  "no: "*pam_gnome_keyring*) got=refused ;; *) got=accepted ;;
+esac
+check "a keyring line in another phase only: left alone" "$got" "refused"
+case "$(keyringless 'auth substack fingerprint-auth' "$PAM_TPM_LINE" 'session include postlogin')" in
+  "no: this tool's line"*) got=refused ;; *) got=accepted ;;
+esac
+check "our line with no keyring line under it: left alone, and said so" "$got" "refused"
+# shellcheck disable=SC1003
+case "$(keyringless 'auth substack \' '  fingerprint-auth' 'session include postlogin')" in
+  "no: "*) got=refused ;; *) got=accepted ;;
+esac
+check "a continued line: refused" "$got" "refused"
+case "$(keyringless 'auth substack fingerprint-auth')" in
+  "no: "*session*) got=refused ;; *) got=accepted ;;
+esac
+check "no session phase of its own (it would be other's): refused" "$got" "refused"
+case "$(keyringless 'session include postlogin')" in
+  "no: "*) got=refused ;; *) got=accepted ;;
+esac
+check "no auth phase of its own: refused" "$got" "refused"
+
+# Where the lines go: an @include pulls in every phase, so it counts as the
+# last auth and the last session line; keywords are read case-blind, as
+# libpam reads them.
+printf '%s\n' 'AUTH  substack  fingerprint-auth' 'session include postlogin' \
+  '@include gdm-extra' '# trailing comment' | pam_keyring_lines_add >"$WORKDIR/placement"
+check "the lines go after an @include, the last line of both phases" \
+  "$(sed -n '4,6p' "$WORKDIR/placement" | tr '\n' '|')" \
+  "$PAM_TPM_LINE|$PAM_KEYRING_AUTH_LINE|$PAM_KEYRING_SESSION_LINE|"
+
+# A last line with no newline: the filter ends it, so taking the lines out
+# again is one byte off - which is why uninstall.sh restores the backup when
+# there is one, and why that is exact.
+printf 'auth substack fingerprint-auth\nsession include postlogin' >"$F44_TREE/gdm-fingerprint"
+cp "$F44_TREE/gdm-fingerprint" "$F44_TREE/gdm-fingerprint.bak-20260101000000"
+pam_keyring_lines_add <"$F44_TREE/gdm-fingerprint.bak-20260101000000" >"$F44_TREE/gdm-fingerprint"
+check "no final newline: the edit is still recognised" \
+  "$(is_ours "$F44_TREE/gdm-fingerprint")" "yes"
+ORIG="$(pam_keyring_exact_original "$F44_TREE/gdm-fingerprint" || true)"
+if [ -n "$ORIG" ] && cmp -s "$ORIG" "$F44_TREE/gdm-fingerprint.bak-20260101000000"; then got=exact; else got=missing; fi
+check "...and the byte-exact original is there to restore" "$got" "exact"
+rm -f "$F44_TREE"/gdm-fingerprint.bak-*
+
+# Edited since install.sh wrote it: no longer provably ours, so uninstall.sh
+# takes only its own line out, as from any other stack.
+sed 's/pam_gnome_keyring.so auto_start/pam_gnome_keyring.so auto_start only_if=gdm/' \
+  "$F44_WIRED" >"$F44_TREE/gdm-fingerprint"
+check "a hand edit to one of the three lines: not ours any more" \
+  "$(is_ours "$F44_TREE/gdm-fingerprint")" "no"
+{ cat "$F44_WIRED"; echo 'session optional        pam_gnome_keyring.so'; } >"$F44_TREE/gdm-fingerprint"
+check "a fourth keyring line someone added: not ours any more" \
+  "$(is_ours "$F44_TREE/gdm-fingerprint")" "no"
+awk -v l="$PAM_KEYRING_SESSION_LINE" '$0 != l' "$F44_WIRED" \
+  | awk -v l="$PAM_KEYRING_SESSION_LINE" '{print} /^account/ && !d {print l; d=1}' >"$F44_TREE/gdm-fingerprint"
+check "the session line moved somewhere else: not ours any more" \
+  "$(is_ours "$F44_TREE/gdm-fingerprint")" "no"
+
 # --- the predicates have to give the SAME answer every time ---------------
 #
 # Reported as mtriam/tpm-keyring-unlock#1: under `set -o pipefail` (which
@@ -1144,6 +1298,26 @@ for _ in $(seq 1 200); do
   fi
 done
 check "pam_shared_stack_is_sane_without_fprintd: 200 identical verdicts under pipefail" \
+  "$(printf '%s' "$verdicts" | tr -d 'y' | wc -c)" "0"
+
+# pam_keyring_lines_are_ours() asks grep -q whether anything keyring-ish is
+# left once its lines are out. Padded so that a filter on the left of a pipe
+# would still be writing when grep leaves - the answer must stay "ours".
+{
+  echo "auth    substack    fingerprint-auth"
+  for i in $(seq 1 400); do echo "account optional    pam_echo.so filler $i"; done
+  echo "session include     postlogin"
+} | pam_keyring_lines_add >"$STABILITY_DIR/padded-keyringless"
+
+verdicts=""
+for _ in $(seq 1 200); do
+  if pam_keyring_lines_are_ours "$STABILITY_DIR/padded-keyringless"; then
+    verdicts="${verdicts}y"
+  else
+    verdicts="${verdicts}n"
+  fi
+done
+check "pam_keyring_lines_are_ours: 200 identical verdicts under pipefail" \
   "$(printf '%s' "$verdicts" | tr -d 'y' | wc -c)" "0"
 
 echo

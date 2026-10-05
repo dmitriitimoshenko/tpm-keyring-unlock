@@ -34,7 +34,7 @@ MODULE      := pam/pam_tpm_keyring_authtok.so
 
 INSTALL     ?= install
 
-.PHONY: all test test-regex test-runtime test-packaging test-vm build install uninstall clean
+.PHONY: all test test-regex test-runtime test-packaging test-vm test-vm-selinux build install uninstall clean
 
 # MUST stay the first rule in this file. `make` with no target is what every
 # packaging recipe runs (rpm's %make_build, dh_auto_build), and before this
@@ -59,6 +59,12 @@ test-regex:
 # clean SKIPPED if any are missing. See test/README.md.
 test-vm:
 	./test/vm/run-vm-test.sh
+
+# The same, on Fedora with SELinux enforcing: install.sh against Fedora's
+# gdm stacks, the helper run from GDM's SELinux domain, and the policy module.
+# Opt-in like test-vm, and not in CI: it fetches a ~580 MB image.
+test-vm-selinux:
+	./test/vm/run-selinux-test.sh
 
 # Just the PAM module runtime-behavior test (pamtester + fake helper).
 test-runtime:
@@ -96,6 +102,10 @@ install: build
 	$(INSTALL) -m 0755 $(MODULE) $(DESTDIR)$(PAMDIR)/pam_tpm_keyring_authtok.so
 	$(INSTALL) -m 0700 pam/tpm-keyring-unseal.sh $(DESTDIR)$(HELPER_PATH)
 	$(INSTALL) -m 0644 bin/lib.sh $(DESTDIR)$(LIBEXECDIR)/lib.sh
+	# The SELinux module the configure step loads where SELinux keeps GDM away
+	# from the TPM. Shipped, never loaded by the package: it widens a domain's
+	# rights, which is the admin's call, made when the configure step asks.
+	$(INSTALL) -m 0644 selinux/tpm_keyring_unlock.cil $(DESTDIR)$(LIBEXECDIR)/tpm_keyring_unlock.cil
 	$(INSTALL) -m 0755 bin/seal.sh $(DESTDIR)$(LIBEXECDIR)/seal.sh
 	$(INSTALL) -m 0755 install.sh $(DESTDIR)$(LIBEXECDIR)/configure.sh
 	$(INSTALL) -m 0755 uninstall.sh $(DESTDIR)$(LIBEXECDIR)/deconfigure.sh
