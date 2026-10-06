@@ -149,7 +149,7 @@ git commit -am "Release 1.5.0" && <open a PR, merge to main>
 On merge, `.github/workflows/release.yml` sees `VERSION` change and does the
 rest: tags `v1.5.0`, waits for GitHub to publish the tarball, writes that
 tarball's sha256 into `packaging/aur/PKGBUILD` and commits it back, then
-commits `packaging/obs/*` to the Build Service and waits for all seven targets
+commits `packaging/obs/*` to the Build Service and waits for all eight targets
 to build. A red target fails the job.
 
 The checksum round-trip is not decoration. A PKGBUILD cannot carry the hash of

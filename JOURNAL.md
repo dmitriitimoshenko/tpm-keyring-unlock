@@ -6531,7 +6531,8 @@ for `make install`.
 
 - The Build Service has no `Fedora_44` target (the reporter's last note).
   That is OBS project configuration, not something in this repository, and
-  README still lists 42 and 43.
+  README still lists 42 and 43. **[Superseded 2026-10-06: added with
+  release 1.5.1, see that entry.]**
 - The `doctor` command the reporter suggested does not exist. The plan now
   states the SELinux situation, and README's troubleshooting has the
   journal and audit commands.
@@ -6829,3 +6830,42 @@ keyring line, by name.
   it. Nothing in a stock layout includes gdm-fingerprint.
 - No recogniser for the shape PR #24 first wrote (6).
 - The confined-login path of the SELinux check (12) is unmeasured.
+
+## Release 1.5.1 (2026-10-06)
+
+Carries #24 to the packages: Fedora's keyring-less gdm-fingerprint wired,
+the SELinux module that lets GDM reach the TPM, and everything the review of
+#24 changed. Until this release all seven Build Service targets served 1.5.0,
+which does nothing for a fingerprint login on Fedora - the issue #23 setup.
+
+**Why 1.5.1.** The repo owner's call. It fits: the tool now does on Fedora
+what it already claimed to, and on Debian and Ubuntu the visible change is
+small - a stack whose keyring line is gone gets our line taken out, and stacks
+in /usr/lib/pam.d are listed.
+
+**Fedora 44 on the Build Service.** The project built Fedora 42 and 43, never
+44, which is the release issue #23 came from and the one the SELinux VM test
+runs. OBS offers `Fedora:44/standard`, so the project gets a `Fedora_44`
+repository - after the release workflow has committed the 1.5.1 sources, so
+that 1.5.0, which does nothing there, is never published for it. README
+lists 44 first and uses it in the example. Fedora 42 stays: it is past its
+end of life, but dropping the repository would take the packages away from
+anyone still on it, for no gain.
+
+**The changelogs** say what changed for Fedora and repeat the upgrade note
+1.5.0 introduced: run `tpm-keyring-unlock-configure` once more, answer `n` at
+"Overwrite?" to keep the sealed secret. On Fedora that run is what wires
+gdm-fingerprint and plans the module.
+
+**Where else it goes.** The GitHub release for the tag is not made by the
+workflow; it is written by hand, as for every earlier tag, with the upgrade
+note on top. The AUR still has no package - registration was closed, and the
+page now sits behind a bot check no tool here gets through - so the recipe in
+`packaging/aur` is the Arch path, with the checksum the workflow pins. The
+ArchWiki link waits on the AUR package (see the 2026-09-16 entries).
+
+Checked before the PR: the release workflow's five-file version check,
+replicated locally; `dpkg-parsechangelog` on Debian 13 reads the new entry;
+`rpmspec` on Fedora 44 reads the new `%changelog`; a `rpmbuild -bb` and a
+`dpkg-buildpackage -b` of the tree build, with the same `rpmlint` and
+`lintian` findings as before.
