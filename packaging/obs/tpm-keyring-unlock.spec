@@ -3,7 +3,7 @@
 # Built by OBS from the tarball that _service pulls from the git tag.
 #
 Name:           tpm-keyring-unlock
-Version:        1.5.0
+Version:        1.5.1
 Release:        0
 Summary:        TPM-backed unlock of the GNOME login keyring at login
 License:        MIT
@@ -85,6 +85,16 @@ fi
 %{_bindir}/tpm-keyring-unlock-deconfigure
 
 %changelog
+* Tue Oct 06 2026 Dmitrii Timoshenko <dmitrii.timoshenko16@gmail.com> - 1.5.1-0
+- Fedora: tpm-keyring-unlock-configure now wires gdm-fingerprint, which
+  ships with no keyring line, adding the keyring lines with the module
+  between them. None of the added lines can vote.
+- Under SELinux it loads a one-rule policy module so that GDM's logins can
+  reach the TPM. Erasing the package unloads it.
+- After upgrading, run tpm-keyring-unlock-configure once more: it re-checks
+  the PAM stacks an older version wired. Answer n at "Overwrite?" to keep
+  the sealed secret.
+
 * Sat Sep 26 2026 Dmitrii Timoshenko <dmitrii.timoshenko16@gmail.com> - 1.5.0-0
 - After upgrading, run tpm-keyring-unlock-configure once more: it re-checks
   the PAM stacks an older version wired and takes the helper back out of

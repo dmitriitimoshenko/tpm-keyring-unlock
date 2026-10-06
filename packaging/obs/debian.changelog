@@ -1,3 +1,18 @@
+tpm-keyring-unlock (1.5.1-1) unstable; urgency=medium
+
+  * Release 1.5.1. See JOURNAL.md for the full history.
+  * Fedora's gdm-fingerprint, which ships with no keyring line, is wired
+    now: the configure step adds the keyring lines with the module between
+    them. None of the added lines can vote, so the stack lets in exactly
+    whom it let in before.
+  * Under SELinux the configure step loads a one-rule policy module so
+    that GDM's logins can reach the TPM. Removing this package unloads it.
+  * After upgrading, run tpm-keyring-unlock-configure once more. It
+    re-checks the PAM stacks an older version wired. Answer n at
+    "Overwrite?" to keep the sealed secret.
+
+ -- Dmitrii <dmitrii.timoshenko16@gmail.com>  Tue, 06 Oct 2026 21:10:08 +0200
+
 tpm-keyring-unlock (1.5.0-1) unstable; urgency=medium
 
   * Release 1.5.0. See JOURNAL.md for the full history.

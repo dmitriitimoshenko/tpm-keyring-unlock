@@ -69,10 +69,10 @@ sudo zypper addrepo https://download.opensuse.org/repositories/home:/dmitrii.tim
 sudo zypper refresh && sudo zypper install tpm-keyring-unlock
 ```
 
-**Fedora** (42, 43 - swap the repository name):
+**Fedora** (44, 43, 42 - swap the repository name):
 
 ```bash
-sudo dnf config-manager addrepo --from-repofile=https://download.opensuse.org/repositories/home:/dmitrii.timoshenko/Fedora_42/home:dmitrii.timoshenko.repo
+sudo dnf config-manager addrepo --from-repofile=https://download.opensuse.org/repositories/home:/dmitrii.timoshenko/Fedora_44/home:dmitrii.timoshenko.repo
 sudo dnf install tpm-keyring-unlock
 ```
 
