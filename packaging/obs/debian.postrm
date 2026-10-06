@@ -1,0 +1,19 @@
+#!/bin/sh
+# tpm-keyring-unlock-configure may have loaded the SELinux module, which lets
+# every process in GDM's domain open the TPM (README.md, "SELinux"). With the
+# package removed no helper is left to need it, so removal takes it out, and
+# never fails over it. OBS turns this file into debian/postrm.
+set -e
+
+case "$1" in
+  remove | purge)
+    if command -v semodule >/dev/null 2>&1 \
+      && semodule -l 2>/dev/null | grep -qx tpm_keyring_unlock; then
+      semodule -r tpm_keyring_unlock >/dev/null 2>&1 || true
+    fi
+    ;;
+esac
+
+#DEBHELPER#
+
+exit 0

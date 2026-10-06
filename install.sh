@@ -33,6 +33,10 @@ SEAL_SH="$REPO_DIR/bin/seal.sh"
 # shellcheck source=bin/lib.sh
 source "$LIB_SH"
 
+# Same two layouts for the SELinux policy module.
+SELINUX_CIL="$REPO_DIR/selinux/$SELINUX_MODULE_NAME.cil"
+[ -f "$SELINUX_CIL" ] || SELINUX_CIL="$REPO_DIR/$SELINUX_MODULE_NAME.cil"
+
 # --no-build: the PAM module and the helper are already on disk, put there by
 # a distribution package, so this run must not compile or install them - it
 # only does the parts a package is not allowed to do (sealing a secret, which
@@ -65,14 +69,9 @@ confirm() {
 
 # One timestamp for the whole run, so a file touched by two different steps
 # below gets exactly one backup, holding its pristine pre-run content -
-# rather than a second backup of the already-half-edited file.
+# rather than a second backup of the already-half-edited file. bin/lib.sh's
+# backup_pam_file() and pam_file_write() name the copies with it.
 RUN_TS="$(date +%Y%m%d%H%M%S)"
-
-# Backs a PAM file up before its first modification in this run.
-backup_pam_file() {
-  local f="$1" bak="$1.bak-$RUN_TS"
-  [ -e "$bak" ] || sudo cp "$f" "$bak"
-}
 
 # Removes pam_fprintd from the shared auth stack, the only supported way.
 # A function because it is called from two places: the planned step below, and
@@ -250,9 +249,14 @@ fi
 RESEAL=false
 [ -f "$DATA_DIR/seal.priv" ] && RESEAL=true
 
-# 1d. login PAM stacks that need the helper wired in
-mapfile -t candidates < <(grep -lE "$PAM_GNOME_KEYRING_AUTH_RE" /etc/pam.d/* 2>/dev/null \
-  | grep -vE "$PAM_NON_SERVICE_RE")
+# 1d. login PAM stacks that need the helper wired in - and every stack that
+# carries it already, keyring line or not. One whose keyring line was taken
+# out by hand after an earlier run wired it used to fall out of this list, so
+# its re-check never ran and our line stayed ahead of whatever came after it,
+# unvetted (review of PR #24). Now it is re-checked like the rest, and the
+# check, which has no keyring line to anchor on, plans our line's removal.
+mapfile -t candidates < <(grep -lE "$PAM_GNOME_KEYRING_AUTH_RE|pam_tpm_keyring_authtok\.so" \
+  /etc/pam.d/* 2>/dev/null | grep -vE "$PAM_NON_SERVICE_RE")
 targets=()
 # Stacks the insertion check refuses. Our module sets PAM_AUTHTOK from the TPM
 # before anyone has authenticated, so whatever runs after it has to be
@@ -275,11 +279,16 @@ declare -A refusal_reason=()
 # gets our line taken back out, as a planned and backed-up step. See
 # JOURNAL.md, 2026-09-26 (review of PR #20).
 unsafe_wired=()
+# Whether a stack an earlier run wired still passes: nothing to do to it, but
+# it makes the SELinux step below worth asking about.
+WIRED_OK=false
 for c in "${candidates[@]}"; do
   if grep -q pam_tpm_keyring_authtok.so "$c"; then
-    if ! pam_auth_insertion_point_is_safe "$c"; then
+    if ! pam_wired_stack_is_safe "$c"; then
       unsafe_wired+=("$c")
       refusal_reason["$c"]="$PAM_INSERTION_REFUSAL"
+    else
+      WIRED_OK=true
     fi
     continue
   fi
@@ -289,6 +298,48 @@ for c in "${candidates[@]}"; do
     unsafe_targets+=("$c")
     refusal_reason["$c"]="$PAM_INSERTION_REFUSAL"
   fi
+done
+
+# 1d'. gdm-fingerprint with no keyring line at all, which is how Fedora ships
+# it (GitHub issue #23). The grep above never matched it, so until now it was
+# passed over without a word, and fingerprint logins kept asking for the
+# keyring password. It is the one stack this tool exists for, so it is either
+# planned here - the keyring lines added along with ours, where gdm-password
+# has them, and unable to vote - or listed below with the reason it is not.
+# One that carries our line already is the re-check's, above. See bin/lib.sh,
+# pam_keyring_lines_can_be_added().
+keyring_add_targets=()
+FINGERPRINT_STACK="/etc/pam.d/$PAM_FINGERPRINT_SERVICE"
+if [ -f "$FINGERPRINT_STACK" ] && ! grep -qE "$PAM_GNOME_KEYRING_AUTH_RE" "$FINGERPRINT_STACK" \
+  && ! grep -q pam_tpm_keyring_authtok.so "$FINGERPRINT_STACK"; then
+  # The lines name pam_gnome_keyring.so, so it has to be there to name: a
+  # missing module locks nobody out behind a control that cannot vote, but it
+  # is an error logged at every fingerprint login, for a keyring nothing can
+  # unlock anyway.
+  KEYRING_MODULE_DIR="$(find_pam_module_dir || true)"
+  if [ -z "$KEYRING_MODULE_DIR" ] || [ ! -f "$KEYRING_MODULE_DIR/pam_gnome_keyring.so" ]; then
+    unsafe_targets+=("$FINGERPRINT_STACK")
+    refusal_reason["$FINGERPRINT_STACK"]="it has no keyring line, and pam_gnome_keyring.so is not installed to add one with (gnome-keyring-pam on Fedora)"
+  elif pam_keyring_lines_can_be_added "$FINGERPRINT_STACK"; then
+    keyring_add_targets+=("$FINGERPRINT_STACK")
+  else
+    unsafe_targets+=("$FINGERPRINT_STACK")
+    refusal_reason["$FINGERPRINT_STACK"]="$PAM_INSERTION_REFUSAL"
+  fi
+fi
+
+# 1d''. Stacks libpam reads from the distribution's own directory,
+# /usr/lib/pam.d: a keyring stack there, or gdm-fingerprint itself. This tool
+# edits /etc/pam.d only, and every grep above reads nothing else, so such a
+# stack was passed over in silence - the way issue #23 went unnoticed (review
+# of PR #24). Wiring it means a copy in /etc/pam.d first, which then replaces
+# the vendor file for good, package updates and all. That is the admin's call
+# to make, as README's polkit recipe makes it, so it is listed with what to
+# do rather than done. See bin/lib.sh, pam_stacks_outside().
+mapfile -t vendor_stacks < <(pam_stacks_outside /etc/pam.d)
+for c in "${vendor_stacks[@]}"; do
+  unsafe_targets+=("$c")
+  refusal_reason["$c"]="libpam reads it from ${c%/*}, and this tool edits /etc/pam.d only: copy it there, then re-run (README.md, 'How it works')"
 done
 
 # 1e. fingerprint stacks that drop the reader after one unlucky scan or one
@@ -372,6 +423,47 @@ if { [ "$UNLIMIT_FPRINTD" = true ] || [ "$FPRINTD_STACK_PRESENT" = true ]; } \
   echo
 fi
 
+# 1g. SELinux. The helper runs in the domain of the PAM stack that starts it,
+# which under GDM is xdm_t, and Fedora's policy does not let xdm_t open the
+# TPM: every fingerprint login and unlock then fails to unseal, while this
+# installer reports the stacks as wired (GitHub issue #23). The kernel is
+# asked, not the module list - what matters is whether the access is allowed,
+# whoever's policy allows it, and the kernel can answer that without root.
+# Only asked when a stack is or will be wired: otherwise the helper never
+# runs, and the policy has no reason to change. And only acted on once a
+# stack really is wired, at the very end of step 3 - see there. See bin/lib.sh,
+# selinux_domain_may_use_tpm().
+SELINUX_FIX=false
+SELINUX_NOTE=()
+if selinux_is_enabled \
+  && { [ "${#targets[@]}" -gt 0 ] || [ "${#keyring_add_targets[@]}" -gt 0 ] || [ "$WIRED_OK" = true ]; }; then
+  SELINUX_RC=0
+  selinux_domain_may_use_tpm || SELINUX_RC=$?
+  case "$SELINUX_RC" in
+    0) ;;
+    1)
+      if command -v semodule >/dev/null 2>&1 && [ -f "$SELINUX_CIL" ]; then
+        SELINUX_FIX=true
+      else
+        SELINUX_NOTE=("SELinux keeps GDM's logins (xdm_t) away from the TPM, and there is"
+          "no semodule or no $SELINUX_MODULE_NAME.cil here to change that with. Until"
+          "it changes, the keyring stays locked at GDM logins. README.md, 'SELinux'.")
+      fi
+      ;;
+    *)
+      # The kernel answers this only for a domain allowed to ask it
+      # (security:compute_av), which a confined login need not be - so the
+      # note names this login's domain rather than leaving it at "could not".
+      SELF_DOMAIN="$(id -Z 2>/dev/null || true)"
+      SELINUX_NOTE=("SELinux is on, and whether GDM's logins (xdm_t) may open the TPM"
+        "could not be checked. Either the policy lacks a type it needs, or the"
+        "kernel will not answer this login's domain (${SELF_DOMAIN:-unknown}): a confined"
+        "login may not ask. If the keyring stays locked at GDM logins, README.md,"
+        "'SELinux', says how to check by hand.")
+      ;;
+  esac
+fi
+
 # --- 2. print the full plan and ask for approval exactly once ------------
 # Every path listed below is in the same directory, so the lists print as bare
 # service names with the directory named once.
@@ -422,8 +514,27 @@ if [ "${#unsafe_wired[@]}" -gt 0 ]; then
   echo "     an earlier run wired it, and the check refuses it today:"
   for c in "${unsafe_wired[@]}"; do
     echo "       ${c##*/}: ${refusal_reason[$c]}"
+    # The keyring lines an earlier run added along with ours go with it, back
+    # to the copy taken before they were added - but only when that copy is
+    # there to prove they were ours. Lines of the same shape somebody wrote
+    # stay (bin/lib.sh, pam_keyring_exact_original).
+    if pam_keyring_exact_original "$c" >/dev/null; then
+      echo "       (and the two keyring lines it added there, from the pre-install copy)"
+    elif pam_keyring_lines_are_ours "$c"; then
+      echo "       (its two keyring lines stay: no pre-install copy proves they are this tool's)"
+    fi
   done
   n=$((n + 1))
+fi
+if [ "${#keyring_add_targets[@]}" -gt 0 ]; then
+  # Printed from the file itself, so it shows where the lines land in it.
+  for c in "${keyring_add_targets[@]}"; do
+    echo "  $n. Give ${c##*/} the keyring lines it has none of, with the TPM helper"
+    echo "     between them (backed up). None of the three can vote, so the stack"
+    echo "     lets in exactly whom it let in before:"
+    pam_keyring_lines_preview "$c"
+    n=$((n + 1))
+  done
 fi
 if [ "${#targets[@]}" -gt 0 ]; then
   # One 'optional' line above the existing keyring line, in each stack. The
@@ -433,18 +544,35 @@ if [ "${#targets[@]}" -gt 0 ]; then
   echo "       $(pam_names "${targets[@]}")"
   echo "     + auth  optional  pam_tpm_keyring_authtok.so  <-- new, above the"
   echo "       auth  optional  pam_gnome_keyring.so         existing line"
+  n=$((n + 1))
+fi
+# Last, because that is when it happens: only once a stack is wired, so a run
+# that stops early, or ends with every stack refused, leaves the policy as it
+# found it (review of PR #24).
+if [ "$SELINUX_FIX" = true ]; then
+  echo "  $n. Load the SELinux module $SELINUX_MODULE_NAME (sudo), once a stack is wired."
+  echo "     GDM runs the helper as xdm_t, which may not open the TPM; this lets"
+  echo "     every xdm_t process open it, not only the helper. README.md, 'SELinux'."
+  n=$((n + 1))
 fi
 # Reported whether or not anything is being wired up: a refused stack is the
 # one case where the tool declines to do what the user asked, so it must not
 # be silent about it.
 if [ "${#unsafe_targets[@]}" -gt 0 ]; then
   echo
-  echo "  !! NOT wiring $(pam_names "${unsafe_targets[@]}"). What runs after the"
-  echo "     helper there has to be vetted not to turn its token into a login:"
+  # Not only the vetting check any more: gdm-fingerprint can also be refused
+  # for having no keyring line this tool may add (GitHub issue #23), so the
+  # heading promises no more than "here is why".
+  echo "  !! NOT wiring $(pam_names "${unsafe_targets[@]}"), each for the reason given:"
   for c in "${unsafe_targets[@]}"; do
     echo "       ${c##*/}: ${refusal_reason[$c]}"
   done
   echo "     Logins there work as before; only the keyring stays locked. README.md."
+fi
+if [ "${#SELINUX_NOTE[@]}" -gt 0 ]; then
+  echo
+  echo "  !! ${SELINUX_NOTE[0]}"
+  for note_line in "${SELINUX_NOTE[@]:1}"; do echo "     $note_line"; done
 fi
 echo
 
@@ -603,10 +731,7 @@ if [ "$UNLIMIT_FPRINTD" = true ]; then
       rm -f "$REWRITTEN"
       continue
     fi
-    backup_pam_file "$TARGET"
-    # cp *onto* the existing file rather than replacing it, so its mode and
-    # ownership stay exactly as the distro shipped them.
-    sudo cp "$REWRITTEN" "$TARGET"
+    pam_file_write "$TARGET" "$REWRITTEN"
     rm -f "$REWRITTEN"
     rewritten_stacks+=("$TARGET")
   done
@@ -621,10 +746,11 @@ fi
 
 echo "-- Login PAM stacks --"
 wired_stacks=()
+already_wired=()
 unwired_stacks=()
-if [ "${#candidates[@]}" -eq 0 ]; then
-  echo "No service has an auth-phase pam_gnome_keyring.so line - password"
-  echo "logins are already fixed by the mask above. See README.md."
+if [ "${#candidates[@]}" -eq 0 ] && [ "${#keyring_add_targets[@]}" -eq 0 ]; then
+  echo "No service in /etc/pam.d has an auth-phase pam_gnome_keyring.so line -"
+  echo "password logins are already fixed by the mask above. See README.md."
 else
   for TARGET in "${candidates[@]}"; do
     # Same race the fprintd step above guards against: this list was built
@@ -633,21 +759,21 @@ else
     # straight through to backup_pam_file -> sudo cp on a missing path, which
     # under `set -e` aborts the run with nothing but cp's error, after the
     # fprintd edits are already written. See JOURNAL.md, 2026-09-15.
-    if [ ! -f "$TARGET" ] || ! grep -qE "$PAM_GNOME_KEYRING_AUTH_RE" "$TARGET"; then
-      echo "$TARGET changed since the plan above was printed (gone, or no" >&2
-      echo "auth-phase pam_gnome_keyring.so line any more) - left untouched." >&2
+    if [ ! -f "$TARGET" ]; then
+      echo "$TARGET is gone since the plan above was printed - left alone." >&2
       continue
     fi
     if grep -q pam_tpm_keyring_authtok.so "$TARGET"; then
       # Every wired stack is checked again here, not only the ones planned
-      # for removal: the package install above may have rewritten a file
-      # that passed at plan time into one that does not, and "already wired
-      # in" must not be said of a stack the check refuses. Taking our line
-      # out cannot lock anyone out - it is `optional` and never votes - so
-      # this is the uninstaller's edit, backed up the same way. One that was
-      # not in the plan still gets asked about first.
-      if pam_auth_insertion_point_is_safe "$TARGET"; then
+      # for removal, keyring line or not: the package install above may have
+      # rewritten a file that passed at plan time into one that does not, and
+      # "already wired in" must not be said of a stack the check refuses.
+      # Taking our line out cannot lock anyone out - it never votes - so this
+      # is the uninstaller's edit, backed up the same way. One that was not in
+      # the plan still gets asked about first.
+      if pam_wired_stack_is_safe "$TARGET"; then
         echo "${TARGET##*/}: already wired in."
+        already_wired+=("$TARGET")
         continue
       fi
       if [[ " ${unsafe_wired[*]} " != *" $TARGET "* ]]; then
@@ -658,9 +784,24 @@ else
           continue
         fi
       fi
-      backup_pam_file "$TARGET"
-      sudo sed -i "$PAM_TPM_LINE_DELETE_SED" "$TARGET"
+      # The keyring lines an earlier run added along with ours (GitHub issue
+      # #23) go too, but only when the copy taken right before they were added
+      # proves they were ours - and then that copy goes back, exactly. Lines
+      # of the same shape somebody wrote stay where they are (review of PR
+      # #24). Neither the keyring lines nor ours can vote.
+      ORIGINAL="$(pam_keyring_exact_original "$TARGET" || true)"
+      if [ -n "$ORIGINAL" ]; then
+        pam_file_write "$TARGET" "$ORIGINAL"
+      else
+        backup_pam_file "$TARGET"
+        sudo sed -i "$PAM_TPM_LINE_DELETE_SED" "$TARGET"
+      fi
       unwired_stacks+=("$TARGET")
+      continue
+    fi
+    if ! grep -qE "$PAM_GNOME_KEYRING_AUTH_RE" "$TARGET"; then
+      echo "$TARGET changed since the plan above was printed (no auth-phase" >&2
+      echo "pam_gnome_keyring.so line any more) - left untouched." >&2
       continue
     fi
     # Re-checked here, not just when the plan was built, for the same reason
@@ -673,12 +814,67 @@ else
       continue
     fi
     backup_pam_file "$TARGET"
-    sudo sed -E -i "/${PAM_GNOME_KEYRING_AUTH_RE}/i auth    optional        pam_tpm_keyring_authtok.so" "$TARGET"
+    sudo sed -E -i "/${PAM_GNOME_KEYRING_AUTH_RE}/i ${PAM_TPM_LINE}" "$TARGET"
+    wired_stacks+=("$TARGET")
+  done
+  for TARGET in "${keyring_add_targets[@]}"; do
+    # Re-proved against what is on disk now, for the reason every stack above
+    # is: the package install between the plan and this write can replace the
+    # file, and a gdm upgrade ships its own gdm-fingerprint. That includes a
+    # file that has gained a keyring line of its own since, which the check
+    # refuses by name.
+    PAM_INSERTION_REFUSAL=""
+    if [ ! -f "$TARGET" ] || ! pam_keyring_lines_can_be_added "$TARGET"; then
+      echo "$TARGET changed since the plan was printed${PAM_INSERTION_REFUSAL:+ ($PAM_INSERTION_REFUSAL)}" >&2
+      echo "- left untouched. Re-run to reconsider it." >&2
+      continue
+    fi
+    REWRITTEN="$(mktemp)"
+    pam_keyring_lines_add <"$TARGET" >"$REWRITTEN"
+    # Login-critical file, so refuse anything that is not recognisably the
+    # same file plus exactly our three lines: the round trip has to hold, and
+    # taking them out has to give back every line of the original, in order.
+    # `awk 1` ends a last line that had no newline, as the filter does.
+    if ! pam_keyring_lines_are_ours "$REWRITTEN" \
+      || ! pam_keyring_lines_remove <"$REWRITTEN" | cmp -s - <(awk 1 "$TARGET"); then
+      echo "Unexpected result adding the keyring lines to $TARGET - left it untouched." >&2
+      rm -f "$REWRITTEN"
+      continue
+    fi
+    pam_file_write "$TARGET" "$REWRITTEN"
+    rm -f "$REWRITTEN"
     wired_stacks+=("$TARGET")
   done
   [ "${#wired_stacks[@]}" -eq 0 ] || echo "Wired: ${wired_stacks[*]##*/}"
   [ "${#unwired_stacks[@]}" -eq 0 ] \
     || echo "Taken back out: ${unwired_stacks[*]##*/} (backups beside them, .bak-$RUN_TS)"
+fi
+
+# The SELinux module, last, and only once a stack is wired. It widens all of
+# xdm_t, and was loaded before the seal and the PAM edits until the review of
+# PR #24: a seal that failed (which ends the run here, under `set -e`), or a
+# run whose every stack was refused at the moment of writing, left GDM able to
+# open the TPM for no helper at all.
+if [ "$SELINUX_FIX" = true ]; then
+  echo
+  echo "-- SELinux --"
+  if [ "${#wired_stacks[@]}" -eq 0 ] && [ "${#already_wired[@]}" -eq 0 ]; then
+    echo "No stack ended up wired, so $SELINUX_MODULE_NAME is not loaded: nothing here"
+    echo "would use it."
+  else
+    # Not fatal either way: the PAM edits above are just as safe without it,
+    # they only stay useless at GDM logins until the policy lets xdm_t
+    # through. Asked of the kernel again afterwards rather than trusting
+    # semodule's exit status, because that is the only answer the helper will
+    # get.
+    echo "Loading $SELINUX_MODULE_NAME (semodule rebuilds the policy; a few seconds)."
+    if sudo semodule -i "$SELINUX_CIL" && selinux_domain_may_use_tpm; then
+      echo "Loaded. Undo: sudo semodule -r $SELINUX_MODULE_NAME"
+    else
+      echo "xdm_t still may not open the TPM, so GDM logins will not unseal until" >&2
+      echo "it can. See README.md, 'SELinux'." >&2
+    fi
+  fi
 fi
 
 echo

@@ -17,6 +17,8 @@ override_dh_auto_install:
 
 # dh_fixperms would reset the unseal helper to 0755. It runs as root and
 # unseals the keyring password, so it stays 0700 - the same mode install.sh
-# gives it.
+# gives it. It would also mark the SELinux policy module executable, as it
+# does everything under /usr/libexec, and that is data: lintian's
+# executable-not-elf-or-script. It keeps the 0644 `make install` gives it.
 override_dh_fixperms:
-	dh_fixperms -X tpm-keyring-unseal
+	dh_fixperms -X tpm-keyring-unseal -X tpm_keyring_unlock.cil

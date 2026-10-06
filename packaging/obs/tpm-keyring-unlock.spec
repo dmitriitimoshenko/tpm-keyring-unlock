@@ -56,12 +56,25 @@ tpm-keyring-unlock-configure afterwards to seal a password and wire up PAM.
   PAMDIR=%{_libdir}/security \
   LIBEXECDIR=%{_libexecdir}/%{name}
 
+%postun
+# tpm-keyring-unlock-configure may have loaded the SELinux module, which lets
+# every process in GDM's domain open the TPM (README.md, "SELinux"). With the
+# package erased no helper is left to need it, so a full erase - never an
+# upgrade - takes it out, and never fails the transaction over it.
+if [ "$1" -eq 0 ] && command -v semodule >/dev/null 2>&1; then
+  if semodule -l 2>/dev/null | grep -qx tpm_keyring_unlock; then
+    semodule -r tpm_keyring_unlock >/dev/null 2>&1 || :
+  fi
+fi
+
 %files
 %license LICENSE
 %doc README.md SECURITY.md
 %{_libdir}/security/pam_tpm_keyring_authtok.so
 %dir %{_libexecdir}/%{name}
 %{_libexecdir}/%{name}/lib.sh
+# Loaded by tpm-keyring-unlock-configure on SELinux systems, never here.
+%{_libexecdir}/%{name}/tpm_keyring_unlock.cil
 %{_libexecdir}/%{name}/seal.sh
 %{_libexecdir}/%{name}/configure.sh
 %{_libexecdir}/%{name}/deconfigure.sh

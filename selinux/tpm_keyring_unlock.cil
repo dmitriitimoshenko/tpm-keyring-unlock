@@ -1,0 +1,21 @@
+; tpm-keyring-unlock: let the unseal helper reach the TPM from a GDM login.
+;
+; GDM runs its PAM stacks in the SELinux domain xdm_t, and so does everything
+; they start - pam_tpm_keyring_authtok's helper and the tpm2_* tools it runs
+; included. Fedora's policy does not let xdm_t open the TPM, so without this
+; rule every fingerprint login and unlock fails to unseal, with "Failed to
+; open specified TCTI device file /dev/tpmrm0: Permission denied" (GitHub
+; issue #23). A typed password never needs the helper.
+;
+; This is all of xdm_t, not only the helper: every process GDM runs as root
+; may open the TPM with it, and file permissions keep everything else out
+; (/dev/tpmrm0 is root:tss 0660). README.md, "SELinux", says what that gives
+; up and why no narrower domain was written instead.
+;
+; open, read and write are all the helper uses, on its fast path and on the
+; slow one that recreates the primary: measured on Fedora 44, enforcing, and
+; again with xdm_t made permissive, which logged no other denial.
+;
+; install.sh loads this with `semodule -i`; uninstall.sh offers
+; `semodule -r tpm_keyring_unlock`.
+(allow xdm_t tpm_device_t (chr_file (open read write)))

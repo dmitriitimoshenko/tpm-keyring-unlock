@@ -34,6 +34,7 @@ make test-regex  # just the PAM-line detection regex (no docker needed)
 make test-runtime    # just the PAM module's runtime behavior
 make test-packaging  # just the per-distro dependency/compile/detection checks
 make test-vm      # real TPM/Secure Boot round trip in a VM (opt-in, see below)
+make test-vm-selinux  # the same on Fedora, SELinux enforcing (opt-in, not in CI)
 make build        # compile the module locally, no tests
 ```
 

@@ -45,6 +45,21 @@ The unseal helper must stay `0700 root:root`: it unseals a keyring password
 and PAM runs it as root. `debian.rules` excludes it from `dh_fixperms`, and
 the spec sets `%attr(0700,root,root)`.
 
+`make install` also ships `tpm_keyring_unlock.cil`, the SELinux policy module,
+beside `lib.sh`. No package loads it: it lets GDM's whole SELinux domain open
+the TPM, which is the admin's decision, so `tpm-keyring-unlock-configure`
+plans it where the loaded policy needs it, and
+`tpm-keyring-unlock-deconfigure` offers to remove it. Removing the package
+takes it out as well, if it is loaded: the spec's `%postun` on a full erase
+(never on an upgrade), `debian.postrm` on remove, and the AUR install
+script's `post_remove`. With the helper gone nothing needs it, and leaving it
+would leave all of GDM able to open the TPM for nothing. None of them can
+fail the removal over it. Run the deconfigure step first all the same: the
+PAM lines are not something a package takes out. README.md, "SELinux", has
+the reasoning. It is data, so `debian.rules` keeps it out of `dh_fixperms`
+too, which would make it executable along with everything else under
+`/usr/libexec`.
+
 ## OBS (openSUSE, Fedora, RHEL, Debian, Ubuntu)
 
 Files in `obs/`. One OBS package directory holds both recipes - OBS picks the
@@ -115,6 +130,10 @@ written:
 the one known gap, and they matter for Debian proper rather than for OBS or the
 AUR. The two permission tags on the helper are recorded in
 `debian.lintian-overrides` as deliberate.
+
+Rebuilt with the SELinux module added (2026-10-05): Fedora 44 `rpmbuild -bb`
+ships it `0644`, with the same eight `rpmlint` findings as before it; Debian 13
+`dpkg-buildpackage -b` ships it `0644`, with the same `lintian` tags as before.
 
 ## Releasing
 

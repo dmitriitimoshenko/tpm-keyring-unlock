@@ -629,10 +629,11 @@ if wait_for_ssh "$B1_SSHPORT"; then
   # racing on a few instructions. Not a contrivance: GDM runs
   # gdm-fingerprint and gdm-password as parallel PAM conversations and both
   # land in this script, so one of them waiting on the other is the ordinary
-  # case on a real login screen.
+  # case on a real login screen. The lock is the directory itself, not a file
+  # in it, since 2026-10-05 (GitHub issue #23) - flock(1) takes either.
   GOT_RACE="$(vm_ssh "$B1_SSHPORT" '
      sudo mkdir -p /run/tpm-keyring-unlock
-     sudo sh -c "flock /run/tpm-keyring-unlock/unseal.lock -c \"sleep 5\" >/dev/null 2>&1 &"
+     sudo sh -c "flock /run/tpm-keyring-unlock -c \"sleep 5\" >/dev/null 2>&1 &"
      sleep 0.5
      sudo bash ~/tpm-keyring-unlock/pam/tpm-keyring-unseal.sh mallory >/tmp/race.out 2>/tmp/race.err &
      helper=$!
@@ -722,8 +723,10 @@ if [ "$B1_OK" -eq 1 ]; then
     # TPM, Secure Boot on, and a machine that can be thrown away.
     echo
     echo "-- install.sh end to end (real TPM, fixture PAM stack) --"
-    vm_scp "$B2_SSHPORT" "$REPO_DIR/install.sh" "$REPO_DIR/uninstall.sh" \
-      "$REPO_DIR/Makefile" "ubuntu@127.0.0.1:~/tpm-keyring-unlock/"
+    # selinux/ too: `make install` below ships the policy module, even on a
+    # machine without SELinux, where nothing ever loads it.
+    vm_scp "$B2_SSHPORT" -r "$REPO_DIR/install.sh" "$REPO_DIR/uninstall.sh" \
+      "$REPO_DIR/Makefile" "$REPO_DIR/selinux" "ubuntu@127.0.0.1:~/tpm-keyring-unlock/"
     vm_scp "$B2_SSHPORT" "$REPO_DIR/test/fixtures/pam.d/shared/gdm-password" \
       "ubuntu@127.0.0.1:~/gdm-password.fixture"
 

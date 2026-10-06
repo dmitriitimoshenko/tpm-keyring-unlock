@@ -1072,6 +1072,323 @@ if locale -a 2>/dev/null | grep -qi '^tr_TR\.utf-\?8$'; then
     "$(LC_ALL=tr_TR.UTF-8 verdict "$BELOW/upper-harmless" "$BELOW")" "safe"
 fi
 
+# --- a gdm-fingerprint with no keyring line at all (GitHub issue #23) -------
+# Fedora ships gdm-fingerprint with no pam_gnome_keyring.so line in any phase,
+# so the candidate grep never matched it and install.sh passed it over without
+# a word: fingerprint logins kept prompting. install.sh now adds the keyring
+# lines along with its own, after the last auth line and the last session
+# line. The fixture tree is the stock Fedora 44 set - gdm-50.3-1.fc44 and
+# pam-1.7.2-2.fc44, plus authselect-1.7.1's local profile generated with
+# with-fingerprint and with-silent-lastlog - and the expected result is
+# checked in, read by eye, rather than computed by the code under test.
+F44="$FIXTURES/fedora44"
+EXPECTED="$REPO_DIR/test/fixtures/expected"
+yes_no() {
+  if "$@"; then echo yes; else echo "no: $PAM_INSERTION_REFUSAL"; fi
+}
+is_ours() {
+  if pam_keyring_lines_are_ours "$1"; then echo yes; else echo no; fi
+}
+
+if grep -qE "$PAM_GNOME_KEYRING_AUTH_RE" "$F44/gdm-fingerprint"; then got=candidate; else got=passed-over; fi
+check "Fedora's gdm-fingerprint is no keyring candidate by itself" "$got" "passed-over"
+check "...so the keyring lines may be added to it" \
+  "$(yes_no pam_keyring_lines_can_be_added "$F44/gdm-fingerprint" "$F44")" "yes"
+
+F44_WIRED="$WORKDIR/f44-gdm-fingerprint-wired"
+pam_keyring_lines_add <"$F44/gdm-fingerprint" >"$F44_WIRED"
+if cmp -s "$F44_WIRED" "$EXPECTED/fedora44-gdm-fingerprint"; then got=as-expected; else got=differs; fi
+check "the auth lines land after the last auth line, the session one ahead of postlogin" \
+  "$got" "as-expected"
+check "the edited file is recognised as install.sh's" \
+  "$(is_ours "$F44_WIRED")" "yes"
+if pam_keyring_lines_remove <"$F44_WIRED" | cmp -s - "$F44/gdm-fingerprint"; then got=identical; else got=differs; fi
+check "...and taking them out gives the original back byte for byte" "$got" "identical"
+check "the stock file is not mistaken for one install.sh edited" \
+  "$(is_ours "$F44/gdm-fingerprint")" "no"
+check "nor is a stack wired the ordinary way" \
+  "$(is_ours "$FIXTURES/already-patched")" "no"
+
+# On a re-run the edited file is an ordinary candidate, with our line right
+# above its keyring line, and it has to pass the check there - or install.sh
+# would take it straight back out.
+F44_TREE="$WORKDIR/f44-tree"
+mkdir -p "$F44_TREE"
+cp "$F44"/* "$F44_TREE/"
+cp "$F44_WIRED" "$F44_TREE/gdm-fingerprint"
+check "the edited gdm-fingerprint passes the insertion check as it sits" \
+  "$(verdict "$F44_TREE/gdm-fingerprint" "$F44_TREE")" "safe"
+if grep -qE "$PAM_GNOME_KEYRING_AUTH_RE" "$F44_TREE/gdm-fingerprint"; then got=candidate; else got=passed-over; fi
+check "...as the candidate it now is" "$got" "candidate"
+check "...and the re-check install.sh gives a wired stack lets it stay" \
+  "$(yes_no pam_wired_stack_is_safe "$F44_TREE/gdm-fingerprint" "$F44_TREE")" "yes"
+
+# The pre-install copy that install.sh's edit provably came from is what
+# uninstall.sh restores; a stale one is never taken.
+cp "$F44/gdm-fingerprint" "$F44_TREE/gdm-fingerprint.bak-20260101000000"
+printf '# stale\n' | cat - "$F44/gdm-fingerprint" >"$F44_TREE/gdm-fingerprint.bak-20260201000000"
+check "the exact pre-install copy is found, and the stale newer one skipped" \
+  "$(pam_keyring_exact_original "$F44_TREE/gdm-fingerprint" || echo none)" \
+  "$F44_TREE/gdm-fingerprint.bak-20260101000000"
+rm -f "$F44_TREE"/gdm-fingerprint.bak-*
+
+# The stacks Fedora 44 does ship with a keyring line keep their verdict
+# (PR #21's table), and the two with none, other than gdm-fingerprint, are
+# still left alone: smartcard and the greeter's own session are not this
+# tool's business.
+for f in gdm-password gdm-autologin gdm-switchable-auth; do
+  check "Fedora 44 $f still passes the insertion check" "$(verdict "$F44/$f" "$F44")" "safe"
+done
+for f in gdm-smartcard gdm-launch-environment; do
+  if grep -qE "$PAM_GNOME_KEYRING_AUTH_RE" "$F44/$f"; then got=candidate; else got=passed-over; fi
+  check "Fedora 44 $f is no candidate" "$got" "passed-over"
+done
+
+# Switching on authselect's with-ecryptfs puts pam_ecryptfs into postlogin's
+# auth phase. pam_ecryptfs is not on the vetted list - but our lines go after
+# postlogin, so it runs before the token exists and nothing has to vet it.
+awk '/^session/ && !done { print "auth        optional                   pam_ecryptfs.so unwrap"; done = 1 } { print }' \
+  "$F44/postlogin" >"$F44_TREE/postlogin"
+cp "$F44/gdm-fingerprint" "$F44_TREE/gdm-fingerprint"
+if grep -q '^auth.*pam_ecryptfs' "$F44_TREE/postlogin"; then got=present; else got=missing; fi
+check "(the ecryptfs fixture really has its auth line)" "$got" "present"
+check "with ecryptfs in postlogin's auth phase, the lines may still be added" \
+  "$(yes_no pam_keyring_lines_can_be_added "$F44_TREE/gdm-fingerprint" "$F44_TREE")" "yes"
+cp "$F44/postlogin" "$F44_TREE/postlogin"
+
+# A service that includes gdm-fingerprint and runs pam_unix after it would
+# take the token the edited file hands on. The draft is checked in a scratch
+# directory, so the includers have to be looked up under the real name.
+printf '%s\n' 'auth    include    gdm-fingerprint' \
+  'auth    sufficient pam_unix.so try_first_pass' >"$F44_TREE/includes-fingerprint"
+check "an includer that runs pam_unix.so after gdm-fingerprint: refused" \
+  "$(yes_no pam_keyring_lines_can_be_added "$F44_TREE/gdm-fingerprint" "$F44_TREE")" \
+  "no: includes-fingerprint includes gdm-fingerprint, and after that: pam_unix.so runs after the keyring line, and is not on the list of modules known to leave PAM_AUTHTOK alone"
+rm -f "$F44_TREE/includes-fingerprint"
+
+# What the filter will not take on, each with its reason.
+keyringless() {
+  printf '%s\n' "$@" >"$F44_TREE/gdm-fingerprint"
+  yes_no pam_keyring_lines_can_be_added "$F44_TREE/gdm-fingerprint" "$F44_TREE"
+}
+case "$(keyringless 'auth substack fingerprint-auth' 'session optional pam_gnome_keyring.so auto_start')" in
+  "no: "*pam_gnome_keyring*) got=refused ;; *) got=accepted ;;
+esac
+check "a keyring line in another phase only: left alone" "$got" "refused"
+case "$(keyringless 'auth substack fingerprint-auth' "$PAM_TPM_LINE" 'session include postlogin')" in
+  "no: this tool's line"*) got=refused ;; *) got=accepted ;;
+esac
+check "our line with no keyring line under it: left alone, and said so" "$got" "refused"
+# shellcheck disable=SC1003
+case "$(keyringless 'auth substack \' '  fingerprint-auth' 'session include postlogin')" in
+  "no: "*) got=refused ;; *) got=accepted ;;
+esac
+check "a continued line: refused" "$got" "refused"
+case "$(keyringless 'auth substack fingerprint-auth')" in
+  "no: "*session*) got=refused ;; *) got=accepted ;;
+esac
+check "no session phase of its own (it would be other's): refused" "$got" "refused"
+case "$(keyringless 'session include postlogin')" in
+  "no: "*) got=refused ;; *) got=accepted ;;
+esac
+check "no auth phase of its own: refused" "$got" "refused"
+
+# Where the lines go: an @include pulls in every phase, so it counts as the
+# last auth and the last session line; keywords are read case-blind, as
+# libpam reads them.
+printf '%s\n' 'AUTH  substack  fingerprint-auth' 'session include postlogin' \
+  '@include gdm-extra' '# trailing comment' | pam_keyring_lines_add >"$WORKDIR/placement"
+check "the lines go after an @include, the last line of both phases" \
+  "$(sed -n '4,6p' "$WORKDIR/placement" | tr '\n' '|')" \
+  "$PAM_TPM_LINE|$PAM_KEYRING_AUTH_LINE|$PAM_KEYRING_SESSION_LINE|"
+
+# A last line with no newline: the filter ends it, so taking the lines out
+# again is one byte off - which is why uninstall.sh restores the backup when
+# there is one, and why that is exact.
+printf 'auth substack fingerprint-auth\nsession include postlogin' >"$F44_TREE/gdm-fingerprint"
+cp "$F44_TREE/gdm-fingerprint" "$F44_TREE/gdm-fingerprint.bak-20260101000000"
+pam_keyring_lines_add <"$F44_TREE/gdm-fingerprint.bak-20260101000000" >"$F44_TREE/gdm-fingerprint"
+check "no final newline: the edit is still recognised" \
+  "$(is_ours "$F44_TREE/gdm-fingerprint")" "yes"
+ORIG="$(pam_keyring_exact_original "$F44_TREE/gdm-fingerprint" || true)"
+if [ -n "$ORIG" ] && cmp -s "$ORIG" "$F44_TREE/gdm-fingerprint.bak-20260101000000"; then got=exact; else got=missing; fi
+check "...and the byte-exact original is there to restore" "$got" "exact"
+rm -f "$F44_TREE"/gdm-fingerprint.bak-*
+
+# Edited since install.sh wrote it: no longer provably ours, so uninstall.sh
+# takes only its own line out, as from any other stack.
+sed 's/pam_gnome_keyring.so auto_start/pam_gnome_keyring.so auto_start only_if=gdm/' \
+  "$F44_WIRED" >"$F44_TREE/gdm-fingerprint"
+check "a hand edit to one of the three lines: not ours any more" \
+  "$(is_ours "$F44_TREE/gdm-fingerprint")" "no"
+{ cat "$F44_WIRED"; echo 'session optional        pam_gnome_keyring.so'; } >"$F44_TREE/gdm-fingerprint"
+check "a fourth keyring line someone added: not ours any more" \
+  "$(is_ours "$F44_TREE/gdm-fingerprint")" "no"
+awk -v l="$PAM_KEYRING_SESSION_LINE" '$0 != l' "$F44_WIRED" \
+  | awk -v l="$PAM_KEYRING_SESSION_LINE" '{print} /^account/ && !d {print l; d=1}' >"$F44_TREE/gdm-fingerprint"
+check "the session line moved somewhere else: not ours any more" \
+  "$(is_ours "$F44_TREE/gdm-fingerprint")" "no"
+
+# --- what the review of PR #24 found in the add path --------------------------
+#
+# Each check below failed, or had nothing to check, on the code as PR #24
+# first had it. What libpam makes of the lines themselves is measured in
+# test/runtime-test.sh.
+REVIEW="$WORKDIR/review24"
+mkdir -p "$REVIEW"
+cp "$F44"/* "$REVIEW/"
+review_add() {
+  printf '%s\n' "$@" >"$REVIEW/gdm-fingerprint"
+  yes_no pam_keyring_lines_can_be_added "$REVIEW/gdm-fingerprint" "$REVIEW"
+}
+
+# None of the added lines can vote, so the stack decides what it did before.
+check "the auth keyring line cannot vote" \
+  "$PAM_KEYRING_AUTH_LINE" "auth    [default=ignore] pam_gnome_keyring.so"
+check "nor can the session one" \
+  "$PAM_KEYRING_SESSION_LINE" "session [default=ignore] pam_gnome_keyring.so auto_start"
+
+# A phase counts only with a module in it, the way libpam strings them
+# together. Any @include used to count for both phases.
+printf '%s\n' 'session optional pam_umask.so' >"$REVIEW/session-only"
+check "an @include of a session-only file gives no auth phase" \
+  "$(review_add '@include session-only' 'account required pam_nologin.so')" \
+  "no: it has no keyring line, and no auth phase of its own to add one to"
+check "nor does an auth include of one" \
+  "$(review_add 'auth include session-only' 'session required pam_unix.so')" \
+  "no: it has no keyring line, and no auth phase of its own to add one to"
+check "an auth phase that comes wholly through an include counts" \
+  "$(review_add 'auth include fingerprint-auth' 'session include postlogin')" "yes"
+check "an include found nowhere is refused, not guessed at" \
+  "$(review_add 'auth include no-such-file' 'session include postlogin')" \
+  "no: it has no keyring line, and what its auth phase includes could not be followed"
+check "a file with an auth-phase keyring line of its own is not for this path" \
+  "$(yes_no pam_keyring_lines_can_be_added "$F44/gdm-password" "$F44")" \
+  "no: it has an auth-phase pam_gnome_keyring.so line of its own"
+
+# A backslash with blanks after it continues the line for libpam (1.5.2 and
+# 1.7.2) and for _pam_logical_lines(); the precondition only knew a backslash
+# that was the very last byte.
+printf 'auth substack fingerprint-auth \\ \nauth include postlogin\nsession include postlogin\n' \
+  >"$REVIEW/cont-blank"
+if pam_config_has_no_line_continuations "$REVIEW/cont-blank"; then got=none; else got=continued; fi
+check "a backslash with a blank after it is a continuation" "$got" "continued"
+cp "$REVIEW/cont-blank" "$REVIEW/gdm-fingerprint"
+case "$(yes_no pam_keyring_lines_can_be_added "$REVIEW/gdm-fingerprint" "$REVIEW")" in
+  "no: "*backslash*) got=refused ;; *) got=accepted ;;
+esac
+check "...so the keyring lines are not added to such a file" "$got" "refused"
+printf 'auth substack fingerprint-auth # \\\nauth include postlogin\n' >"$REVIEW/cont-comment"
+if pam_config_has_no_line_continuations "$REVIEW/cont-comment"; then got=none; else got=continued; fi
+check "...while a backslash behind a # continues nothing" "$got" "none"
+if [ "$(id -u)" != 0 ]; then
+  printf 'auth required pam_unix.so\n' >"$REVIEW/unreadable"
+  chmod 000 "$REVIEW/unreadable"
+  if pam_config_has_no_line_continuations "$REVIEW/unreadable"; then got=none; else got=refused; fi
+  check "a file grep cannot read gives no answer either" "$got" "refused"
+  chmod 600 "$REVIEW/unreadable"
+fi
+
+# A jump whose range takes in the place a line is added counts that line, and
+# lands somewhere else - one that ran past the end of its phase, which libpam
+# fails as a bad jump, stops failing.
+check "a jump that ran past the end of the auth phase: refused" \
+  "$(review_add 'auth required pam_env.so' 'auth sufficient pam_fprintd.so' \
+    'auth [success=1 default=ignore] pam_succeed_if.so user ingroup nofinger' \
+    'session include postlogin')" \
+  "no: a jump in its auth phase reaches where the new line goes, and would land elsewhere with it there"
+printf '%s\n' 'session [success=1 default=ignore] pam_succeed_if.so quiet' \
+  'session [default=2] pam_unix.so' >"$REVIEW/overruns"
+check "a jump in an include that runs on into the file around it: refused" \
+  "$(review_add 'auth substack fingerprint-auth' 'session required pam_unix.so' 'session include overruns')" \
+  "no: a jump in its session phase reaches where the new line goes, and would land elsewhere with it there"
+printf '%s\n' 'auth [success=2 default=ignore] pam_unix.so' 'auth required pam_deny.so' >"$REVIEW/substacked"
+check "a substack keeps its jumps to itself" \
+  "$(review_add 'auth substack substacked' 'session include postlogin')" "yes"
+check "Fedora's fingerprint-auth jumps, but not as far as the session line" \
+  "$(yes_no pam_keyring_lines_can_be_added "$F44/gdm-fingerprint" "$F44")" "yes"
+
+# The session line goes where gdm-password has its own, ahead of postlogin -
+# out of the reach of postlogin's jumps - and after the last session line when
+# something follows postlogin.
+got="$(printf '%s\n' 'auth substack fingerprint-auth' 'session include postlogin' \
+  'session required pam_unix.so' | pam_keyring_lines_add | tail -n 1)"
+check "with a line after postlogin, the session line goes after the last one" \
+  "$got" "$PAM_KEYRING_SESSION_LINE"
+
+# The plan shows the lines where they land in this very file.
+check "the plan's preview of Fedora's gdm-fingerprint" \
+  "$(pam_keyring_lines_preview "$F44/gdm-fingerprint")" \
+  "$(printf '%s\n' \
+    '       auth        include       postlogin' \
+    "     + $PAM_TPM_LINE" \
+    "     + $PAM_KEYRING_AUTH_LINE" \
+    '       ...' \
+    '       session     include       fingerprint-auth' \
+    "     + $PAM_KEYRING_SESSION_LINE" \
+    '       session     include       postlogin')"
+
+# Shape is not provenance. The same lines written by hand, then wired the
+# ordinary way: install.sh's backup of that file has the keyring lines in it,
+# so no keyring-free ancestor adds up to the file, and they stay.
+PROV="$WORKDIR/provenance"
+mkdir -p "$PROV"
+cp "$F44_WIRED" "$PROV/gdm-fingerprint"
+grep -v pam_tpm_keyring_authtok "$F44_WIRED" >"$PROV/gdm-fingerprint.bak-20260101000000"
+check "keyring lines written by hand in install.sh's shape have its shape" \
+  "$(is_ours "$PROV/gdm-fingerprint")" "yes"
+check "...but no pre-install copy proves them this tool's" \
+  "$(pam_keyring_exact_original "$PROV/gdm-fingerprint" || echo none)" "none"
+cp "$F44/gdm-fingerprint" "$PROV/gdm-fingerprint.bak-20250101000000"
+check "the copy install.sh takes before adding them is that proof" \
+  "$(pam_keyring_exact_original "$PROV/gdm-fingerprint" || echo none)" \
+  "$PROV/gdm-fingerprint.bak-20250101000000"
+
+# A stack carrying our line with no keyring line under it fails the re-check
+# install.sh gives every wired stack, so our line is planned back out rather
+# than left ahead of whatever runs there. Such a stack used to drop out of
+# install.sh's candidate list, and with it out of every check.
+printf '%s\n' 'auth required pam_fprintd.so' "$PAM_TPM_LINE" \
+  'auth sufficient pam_unix.so try_first_pass' >"$PROV/keyring-gone"
+check "our line with its keyring line gone: the re-check refuses it" \
+  "$(yes_no pam_wired_stack_is_safe "$PROV/keyring-gone" "$PROV")" \
+  "no: it has no auth-phase pam_gnome_keyring.so line"
+# And a file the keyring lines were added to is held, on every run, to the
+# jump check they were added under: an include can change.
+REWIRED="$WORKDIR/rewired"
+mkdir -p "$REWIRED"
+cp "$F44"/* "$REWIRED/"
+cp "$F44_WIRED" "$REWIRED/gdm-fingerprint"
+printf '%s\n' 'session [default=3] pam_unix.so' >>"$REWIRED/fingerprint-auth"
+check "an include that later jumps into the session line: the re-check refuses it" \
+  "$(yes_no pam_wired_stack_is_safe "$REWIRED/gdm-fingerprint" "$REWIRED")" \
+  "no: a jump in its session phase reaches where the new line goes, and would land elsewhere with it there"
+
+# What libpam reads from the vendor directory is listed, not passed over: the
+# fingerprint service, or a keyring stack. Shadowed copies and non-service
+# names are not.
+VEND="$WORKDIR/vendor-only"
+mkdir -p "$VEND/etc" "$VEND/usr-lib"
+cp "$F44/gdm-fingerprint" "$VEND/usr-lib/gdm-fingerprint"
+cp "$F44/gdm-fingerprint" "$VEND/usr-lib/gdm-fingerprint.rpmnew"
+printf '%s\n' 'auth optional pam_gnome_keyring.so' >"$VEND/usr-lib/keyring-shadowed"
+cp "$VEND/usr-lib/keyring-shadowed" "$VEND/etc/keyring-shadowed"
+printf '%s\n' 'auth optional pam_gnome_keyring.so' >"$VEND/usr-lib/keyring-vendor"
+printf '%s\n' 'session optional pam_umask.so' >"$VEND/usr-lib/no-keyring"
+check "stacks read from the vendor directory are named, not passed over" \
+  "$(pam_stacks_outside "$VEND/etc" "$VEND/etc:$VEND/usr-lib" | tr '\n' ' ')" \
+  "$VEND/usr-lib/gdm-fingerprint $VEND/usr-lib/keyring-vendor "
+
+# On a 64-bit Fedora or openSUSE /lib/security and /usr/lib/security hold the
+# 32-bit modules once 32-bit PAM is installed; the native directory comes
+# first.
+dirs=" ${PAM_MODULE_DIR_CANDIDATES[*]} "
+case "${dirs%% /usr/lib64/security *}" in
+  *" /lib/security"* | *" /usr/lib/security"*) got=32-bit-first ;;
+  *) got=native-first ;;
+esac
+check "/usr/lib64/security is tried before the directories 32-bit PAM fills" "$got" "native-first"
+
 # --- the predicates have to give the SAME answer every time ---------------
 #
 # Reported as mtriam/tpm-keyring-unlock#1: under `set -o pipefail` (which
@@ -1144,6 +1461,26 @@ for _ in $(seq 1 200); do
   fi
 done
 check "pam_shared_stack_is_sane_without_fprintd: 200 identical verdicts under pipefail" \
+  "$(printf '%s' "$verdicts" | tr -d 'y' | wc -c)" "0"
+
+# pam_keyring_lines_are_ours() asks grep -q whether anything keyring-ish is
+# left once its lines are out. Padded so that a filter on the left of a pipe
+# would still be writing when grep leaves - the answer must stay "ours".
+{
+  echo "auth    substack    fingerprint-auth"
+  for i in $(seq 1 400); do echo "account optional    pam_echo.so filler $i"; done
+  echo "session include     postlogin"
+} | pam_keyring_lines_add >"$STABILITY_DIR/padded-keyringless"
+
+verdicts=""
+for _ in $(seq 1 200); do
+  if pam_keyring_lines_are_ours "$STABILITY_DIR/padded-keyringless"; then
+    verdicts="${verdicts}y"
+  else
+    verdicts="${verdicts}n"
+  fi
+done
+check "pam_keyring_lines_are_ours: 200 identical verdicts under pipefail" \
   "$(printf '%s' "$verdicts" | tr -d 'y' | wc -c)" "0"
 
 echo
