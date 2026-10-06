@@ -49,11 +49,16 @@ the spec sets `%attr(0700,root,root)`.
 beside `lib.sh`. No package loads it: it lets GDM's whole SELinux domain open
 the TPM, which is the admin's decision, so `tpm-keyring-unlock-configure`
 plans it where the loaded policy needs it, and
-`tpm-keyring-unlock-deconfigure` offers to remove it. Run the deconfigure
-step before removing the package, or the module stays loaded. README.md,
-"SELinux", has the reasoning. It is data, so `debian.rules` keeps it out of
-`dh_fixperms` too, which would make it executable along with everything else
-under `/usr/libexec`.
+`tpm-keyring-unlock-deconfigure` offers to remove it. Removing the package
+takes it out as well, if it is loaded: the spec's `%postun` on a full erase
+(never on an upgrade), `debian.postrm` on remove, and the AUR install
+script's `post_remove`. With the helper gone nothing needs it, and leaving it
+would leave all of GDM able to open the TPM for nothing. None of them can
+fail the removal over it. Run the deconfigure step first all the same: the
+PAM lines are not something a package takes out. README.md, "SELinux", has
+the reasoning. It is data, so `debian.rules` keeps it out of `dh_fixperms`
+too, which would make it executable along with everything else under
+`/usr/libexec`.
 
 ## OBS (openSUSE, Fedora, RHEL, Debian, Ubuntu)
 

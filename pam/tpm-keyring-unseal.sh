@@ -149,6 +149,17 @@ cat <&7 >"$WORKDIR/seal.priv"
 cat <&8 >"$WORKDIR/seal.pub"
 exec 7<&- 8<&-
 
+# Every tpm2_* call below goes to the kernel's resource manager, named here
+# rather than left to the tools. The PAM module starts this script with an
+# empty environment, so without it tpm2-tools pick a TCTI themselves, and
+# their first choice is tpm2-abrmd whenever it runs. The check right below
+# would then test a device the tools do not use (review of PR #24), and the
+# unsealed password would pass through the abrmd daemon on its way here. The
+# kernel's own resource manager is what install.sh requires and what the
+# SELinux module opens up.
+TPM_DEVICE=/dev/tpmrm0
+export TPM2TOOLS_TCTI="device:$TPM_DEVICE"
+
 # Whether this process may open the TPM at all - asked before anything below
 # can blame the persisted primary for a load that failed for another reason.
 # Under SELinux that is the policy's call, not the file mode's: GDM's PAM
@@ -158,8 +169,8 @@ exec 7<&- 8<&-
 # #23). Opening the resource manager and closing it again sends the TPM
 # nothing. The context goes in the message because it is the whole diagnosis:
 # under GDM this lands in the journal as gdm-session-worker.
-if ! TPM_OPEN_ERR="$({ : <>/dev/tpmrm0; } 2>&1)"; then
-  echo "tpm-keyring-unseal: cannot open /dev/tpmrm0 (${TPM_OPEN_ERR##*: }) as" \
+if ! TPM_OPEN_ERR="$({ : <>"$TPM_DEVICE"; } 2>&1)"; then
+  echo "tpm-keyring-unseal: cannot open $TPM_DEVICE (${TPM_OPEN_ERR##*: }) as" \
     "$(id -Z 2>/dev/null || id -un)." >&2
   if [ -e /sys/fs/selinux/enforce ]; then
     echo "tpm-keyring-unseal: SELinux has to let that domain use the TPM -" \

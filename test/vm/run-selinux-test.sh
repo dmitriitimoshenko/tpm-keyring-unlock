@@ -15,7 +15,9 @@
 #   those runs;
 # - a second install.sh run plans the module again once it is gone, and finds
 #   the stacks already wired;
-# - uninstall.sh puts gdm-fingerprint back byte for byte and removes the module.
+# - uninstall.sh puts gdm-fingerprint back byte for byte and removes the module;
+# - and, with no pre-install copy to prove the keyring lines are its own, takes
+#   out only its own line.
 #
 # The finger is pam_flow_stub standing in for pam_fprintd, which needs a
 # reader. Everything else on the auth path is real: libpam, the authselect
@@ -303,6 +305,12 @@ check "gdm-password is wired the ordinary way, our line above its keyring line" 
   "adjacent"
 check "the module is loaded" \
   "$(vm_ssh 'sudo semodule -l | grep -cx tpm_keyring_unlock')" "1"
+# Last, once a stack is wired: a run that stops early must not leave all of
+# xdm_t able to open the TPM for nothing (review of PR #24).
+check "...after the PAM stacks are wired, not before" \
+  "$(awk '/^-- Login PAM stacks --/ { p = NR } /^-- SELinux --/ { s = NR }
+      END { print (p && s > p) ? "after" : "before" }' "$WORK/install.out")" \
+  "after" "$WORK/install.out"
 check "the kernel now lets xdm_t open the TPM" \
   "$(vm_ssh 'source ~/tpm-keyring-unlock/bin/lib.sh; selinux_domain_may_use_tpm; echo $?')" "0"
 
@@ -373,6 +381,26 @@ check "the SELinux module is gone" \
   "$(vm_ssh 'sudo semodule -l | grep -cx tpm_keyring_unlock')" "0" "$WORK/uninstall.out"
 check "...and xdm_t may not open the TPM again" \
   "$(vm_ssh 'source ~/tpm-keyring-unlock/bin/lib.sh; selinux_domain_may_use_tpm; echo $?')" "1"
+
+# --- keyring lines nothing proves are this tool's ------------------------------
+# The same three lines, but with no pre-install copy beside the file: written
+# by hand from README, say, and wired by install.sh the ordinary way. The
+# shape alone cannot tell them from install.sh's, so uninstall.sh takes out
+# only its own line and says why the other two stay (review of PR #24).
+echo
+echo "-- uninstall.sh, keyring lines without a pre-install copy --"
+vm_ssh 'sudo rm -f /etc/pam.d/gdm-fingerprint.bak-*
+  sudo cp ~/tpm-keyring-unlock/test/fixtures/expected/fedora44-gdm-fingerprint /etc/pam.d/gdm-fingerprint
+  sudo restorecon /etc/pam.d/gdm-fingerprint' >/dev/null 2>&1
+vm_drive "$WORK/uninstall2.out" 'cd ~/tpm-keyring-unlock && ./uninstall.sh' '*\[Y/n\] ='
+check "uninstall.sh completes again" "$?" "0" "$WORK/uninstall2.out"
+check "it says no pre-install copy proves the keyring lines are its own" \
+  "$(grep -c 'no pre-install copy (.bak-\*) proves this tool put them there' "$WORK/uninstall2.out")" \
+  "1" "$WORK/uninstall2.out"
+check "...takes its own line out" \
+  "$(vm_ssh 'grep -c pam_tpm_keyring_authtok /etc/pam.d/gdm-fingerprint')" "0" "$WORK/uninstall2.out"
+check "...and leaves both keyring lines where they were" \
+  "$(vm_ssh 'grep -c pam_gnome_keyring /etc/pam.d/gdm-fingerprint')" "2" "$WORK/uninstall2.out"
 
 echo
 if [ "$FAIL" -eq 0 ]; then

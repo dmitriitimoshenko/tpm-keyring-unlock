@@ -7,14 +7,22 @@
 # touched, which directory the module gets installed to).
 
 # Candidate directories for the PAM modules directory (wherever pam_unix.so
-# lives) across distros and architectures.
+# lives) across distros and architectures, the native one first.
+#
+# /usr/lib64/security comes before /lib/security and /usr/lib/security on
+# purpose. On a 64-bit Fedora or openSUSE /lib is /usr/lib, and once a 32-bit
+# PAM package is installed (pam.i686, pam-32bit) /usr/lib/security holds its
+# 32-bit modules, which a 64-bit libpam never loads. Taken first, it sent the
+# module where no login looks for it and had install.sh call gdm-fingerprint's
+# pam_gnome_keyring.so "not installed". Arch's /usr/lib64 is a link to
+# /usr/lib, so there it is the same directory as before. Review of PR #24.
 PAM_MODULE_DIR_CANDIDATES=(
   /lib/x86_64-linux-gnu/security
   /usr/lib/x86_64-linux-gnu/security
   /lib/aarch64-linux-gnu/security
   /usr/lib/aarch64-linux-gnu/security
-  /lib/security
   /usr/lib64/security
+  /lib/security
   /usr/lib/security
 )
 
@@ -306,20 +314,30 @@ _pam_print_logical_line() {
   printf '%s\n' "$l"
 }
 
-# Succeeds if no line in $1 ends in a backslash continuation.
+# Succeeds if no line in $1 continues onto the next, read the way libpam reads
+# it (see _pam_logical_lines): a backslash ending the line, blanks after it
+# allowed, on a line with no `#` in it - a `#` ends the line right there.
+# Fails, too, when $1 cannot be read.
 #
-# The rewriter in _pam_fprintd_rewrite_stack() works on physical lines: it
-# appends "timeout=-1 max-tries=1" to the end of the pam_fprintd.so line,
-# which on a continued line lands *after* the trailing backslash - turning the
-# continuation into a module argument and orphaning the line below it. The
-# write-time invariant does not catch it either (the orphan is a non-fprintd
-# line, identical on both sides). Rather than teach the awk to fold and unfold
-# continuations, refuse the file: no distro ships one, and this is a login
-# path. See JOURNAL.md, 2026-09-15.
+# The rewriters work on physical lines. _pam_fprintd_rewrite_stack() appends
+# "max-tries=1" to the end of the pam_fprintd.so line, which on a continued
+# line lands *after* the trailing backslash - turning the continuation into a
+# module argument and orphaning the line below it. The write-time invariant
+# does not catch it either (the orphan is a non-fprintd line, identical on
+# both sides). _pam_keyring_lines_rewrite() inserts whole lines, and one
+# inserted after a continued line becomes that line's arguments. Rather than
+# teach the awk to fold and unfold continuations, refuse the file: no distro
+# ships one, and this is a login path. See JOURNAL.md, 2026-09-15.
+#
+# Until the review of PR #24 this matched only a backslash that was the very
+# last byte, so `\` followed by a blank passed as no continuation while libpam
+# (1.5.2 and 1.7.2, measured) and _pam_logical_lines() joined the next line on.
 pam_config_has_no_line_continuations() {
-  local f="$1"
+  local f="$1" rc=0
   [ -f "$f" ] || return 1
-  ! grep -qE '\\$' "$f"
+  grep -qE '^[^#]*\\[[:space:]]*$' "$f" 2>/dev/null || rc=$?
+  # 1 is grep's "no such line"; 2, an unreadable file, is no answer at all
+  [ "$rc" = 1 ]
 }
 
 # Succeeds if $1 is a PAM service whose auth phase offers fingerprint and no
@@ -474,9 +492,14 @@ PAM_FPRINTD_RETRY_LINE_RE='^\s*-?auth\s+\[[^]]*authinfo_unavail=ignore[^]]*\]\s+
 #   aborted conversation, a system error, no enrolled prints), which should
 #   not be silently retried three times.
 # - success=N is a *relative jump* over the remaining attempts, not "done", so
-#   a match still falls through to the keyring lines below. Verified against
-#   real libpam in test/runtime-test.sh - a jump that failed to record success
-#   would break fingerprint login outright.
+#   a match still falls through to the keyring lines below. The jump itself
+#   records no result: libpam counts the match only through a vote around it,
+#   on the gdm-fingerprint Debian and Ubuntu ship pam_nologin's above and the
+#   optional keyring line's below. Measured on libpam 1.5.2 and 1.7.2 in the
+#   review of PR #24. This note used to say the jump recorded the success,
+#   and test/runtime-test.sh only seemed to agree because its stand-in for
+#   our module voted. A fingerprint-only stack with no vote on either side
+#   would refuse a matched finger once rewritten; none ships one (JOURNAL.md).
 # - The service's own line stays as the last attempt with its original control
 #   field, so the distro keeps the final verdict.
 #
@@ -724,16 +747,37 @@ pam_fprintd_stack_is_generated() {
 # same original line, and the newest is the one closest to the current file.
 # See JOURNAL.md, 2026-09-15.
 pam_fprintd_exact_original() {
-  local f="$1" bak baks=()
+  _pam_exact_original "$1" _pam_fprintd_backup_is_unhardened \
+    pam_fprintd_harden pam_fprintd_harden_legacy
+}
+
+# A backup holding a single pam_fprintd.so auth line that is not an attempt
+# stack: a pre-edit original, not another hardened copy.
+_pam_fprintd_backup_is_unhardened() {
+  [ "$(grep -cE "$PAM_FPRINTD_AUTH_RE" "$1" 2>/dev/null || true)" = 1 ] \
+    && ! grep -qE "$PAM_FPRINTD_RETRY_LINE_RE" "$1"
+}
+
+# Prints the newest $1.bak-* that the predicate $2 accepts and that one of the
+# filters after it (stdin to stdout) turns into $1 byte for byte, and fails
+# when there is none. The one backup scan both kinds of edit share:
+# pam_fprintd_exact_original() above and pam_keyring_exact_original() below.
+# Kept in one place because what makes a copy safe to put back is the same for
+# both - it has to be the edit's direct ancestor - and two copies of the scan
+# could drift apart (review of PR #24).
+_pam_exact_original() {
+  local f="$1" accepts="$2" bak filter baks=()
+  shift 2
   mapfile -t baks < <(printf '%s\n' "$f".bak-* | sort -r)
   for bak in "${baks[@]}"; do
     [ -f "$bak" ] || continue
-    if [ "$(grep -cE "$PAM_FPRINTD_AUTH_RE" "$bak" 2>/dev/null || true)" != 1 ]; then continue; fi
-    if grep -qE "$PAM_FPRINTD_RETRY_LINE_RE" "$bak"; then continue; fi
-    if ! pam_fprintd_harden <"$bak" | cmp -s - "$f" \
-       && ! pam_fprintd_harden_legacy <"$bak" | cmp -s - "$f"; then continue; fi
-    echo "$bak"
-    return 0
+    "$accepts" "$bak" || continue
+    for filter in "$@"; do
+      if "$filter" <"$bak" | cmp -s - "$f"; then
+        printf '%s\n' "$bak"
+        return 0
+      fi
+    done
   done
   return 1
 }
@@ -1534,22 +1578,37 @@ PAM_TPM_LINE_DELETE_SED='/pam_tpm_keyring_authtok\.so/d'
 #
 #   PAM_TPM_LINE, then PAM_KEYRING_AUTH_LINE    after the stack's last line
 #                                               in the auth phase
-#   PAM_KEYRING_SESSION_LINE                    after its last line in the
-#                                               session phase
+#   PAM_KEYRING_SESSION_LINE                    right before its last session
+#                                               line when that line includes
+#                                               postlogin, where gdm-password
+#                                               has its own; after it otherwise
 #
-# After the last line, not after the authenticator. Nothing in the file then
-# runs after our module, so only the files that include this one are left for
-# the insertion check to vet - and on Fedora, postlogin's auth phase
+# None of the three can vote, which is what makes adding them safe at all
+# (review of PR #24). Ours returns PAM_IGNORE, and the keyring lines say
+# [default=ignore] where gdm-password says `optional`. pam_gnome_keyring's
+# auth step returns PAM_SUCCESS even with no password to work with, and
+# `optional` counts that success when nothing above has voted. gdm-password
+# always has a vote above it, from the password stack it includes. A
+# gdm-fingerprint someone has rewritten need not: with `auth sufficient
+# pam_fprintd.so` and nothing after it, the optional line let a wrong finger
+# in. Measured with pamtester and the real pam_gnome_keyring on libpam 1.5.2:
+# refused before the edit, "successfully authenticated" after it. With
+# [default=ignore] the stack decides exactly what it decided before.
+#
+# After the last auth line, not after the authenticator. Nothing in the file
+# then runs after our module, so only the files that include this one are left
+# for the insertion check to vet - and on Fedora, postlogin's auth phase
 # (pam_ecryptfs, once ecryptfs is switched on) stays above it, where the token
-# does not exist yet. The session line goes last for the reason gdm-password
-# puts its own after `session include password-auth`: pam_gnome_keyring starts
-# the daemon there, which has to come after pam_selinux's `open` and after
-# pam_systemd, or the daemon runs in GDM's SELinux context without the user's
-# runtime directory.
+# does not exist yet. The session line goes where gdm-password has its own:
+# after pam_selinux's `open` and after pam_systemd (in the stack it includes),
+# which pam_gnome_keyring needs to start the daemon in the user's context and
+# runtime directory, and ahead of postlogin. Behind postlogin it was within
+# reach of postlogin's jumps, which count on into the file that includes it:
+# see _pam_phase_jumps() below.
 #
 # No password-phase line: gdm-fingerprint's password phase is a pam_deny.so.
-PAM_KEYRING_AUTH_LINE='auth    optional        pam_gnome_keyring.so'
-PAM_KEYRING_SESSION_LINE='session optional        pam_gnome_keyring.so auto_start'
+PAM_KEYRING_AUTH_LINE='auth    [default=ignore] pam_gnome_keyring.so'
+PAM_KEYRING_SESSION_LINE='session [default=ignore] pam_gnome_keyring.so auto_start'
 
 # The only service this is done for: the one GDM verifies a finger through.
 PAM_FINGERPRINT_SERVICE=gdm-fingerprint
@@ -1567,15 +1626,31 @@ PAM_FINGERPRINT_SERVICE=gdm-fingerprint
 _pam_keyring_lines_rewrite() {
   LC_ALL=C awk -v mode="$1" -v tpm="$PAM_TPM_LINE" -v auth="$PAM_KEYRING_AUTH_LINE" \
     -v session="$PAM_KEYRING_SESSION_LINE" '
-    function phase(l,   w, n, t) {
+    # splits l, comment cut, into the global w; returns the word count
+    function words(l) {
       sub(/#.*/, "", l)
-      n = split(l, w)
-      if (n == 0) return ""
+      return split(l, w)
+    }
+
+    function phase(l,   t) {
+      if (words(l) == 0) return ""
       t = tolower(w[1])
       if (t == "auth" || t == "-auth") return "auth"
       if (t == "session" || t == "-session") return "session"
       if (t == "@include" || t == "-@include") return "both"
       return "other"
+    }
+
+    # whether l includes postlogin, by name or by path
+    function includes_postlogin(l,   n, t, c, name) {
+      n = words(l)
+      t = tolower(w[1])
+      c = tolower(w[2])
+      if (t == "@include" || t == "-@include") name = w[2]
+      else if (n >= 3 && (c == "include" || c == "substack")) name = w[3]
+      else return 0
+      sub(/.*\//, "", name)
+      return name == "postlogin"
     }
 
     mode == "remove" {
@@ -1592,10 +1667,12 @@ _pam_keyring_lines_rewrite() {
 
     END {
       if (mode != "add") exit
+      ahead = last_session && includes_postlogin(line[last_session])
       for (i = 1; i <= NR; i++) {
+        if (i == last_session && ahead) print session
         print line[i]
         if (i == last_auth) { print tpm; print auth }
-        if (i == last_session) print session
+        if (i == last_session && !ahead) print session
       }
     }'
 }
@@ -1608,26 +1685,181 @@ pam_keyring_lines_remove() {
   _pam_keyring_lines_rewrite remove
 }
 
+# Prints what pam_keyring_lines_add() would do to $1, the way install.sh's
+# plan shows it: every added line marked +, the lines around it for context,
+# and "..." between the places. Worked out from the file itself, so the plan
+# shows where the lines go in this file rather than a description of it.
+pam_keyring_lines_preview() {
+  pam_keyring_lines_add <"$1" | LC_ALL=C awk -v tpm="$PAM_TPM_LINE" \
+    -v auth="$PAM_KEYRING_AUTH_LINE" -v session="$PAM_KEYRING_SESSION_LINE" '
+    { l[NR] = $0; ours[NR] = ($0 == tpm || $0 == auth || $0 == session) }
+    END {
+      for (i = 1; i <= NR; i++) {
+        if (!ours[i] && (!(ours[i - 1] || ours[i + 1]) || l[i] ~ /^[[:space:]]*$/)) continue
+        if (shown && i > shown + 1) print "       ..."
+        printf "     %s %s\n", (ours[i] ? "+" : " "), l[i]
+        shown = i
+      }
+    }'
+}
+
+# --- jumps, and the lines this tool adds ------------------------------------
+#
+# A number in a control field ([success=1 default=ignore]) is a jump: libpam
+# skips that many modules, counted from where the line sits. A line added to a
+# stack lands in the range of every jump that spans it, and that jump then
+# skips the new line in place of the last one it used to skip. A jump that ran
+# past the end of its phase - which libpam fails as a "bad jump" - lands on
+# the new line instead and stops failing. The new line can vote nothing and
+# still change who gets in that way.
+#
+# An include or @include pulls the other file's lines in where it stands, and
+# its jumps count on into the file around it. Measured with pamtester on
+# libpam 1.5.2 and 1.7.2: a session phase whose included postlogin jumped one
+# past its own end failed, and opened once a line stood after the include.
+# A substack is the exception, one module to the stack around it, with its
+# jumps kept inside. Review of PR #24.
+
+# Prints one line per module that libpam strings together for the phase $2
+# (auth or session) out of the logical lines $1, in order: the longest jump
+# its control can take, 0 for none. Includes are followed, found on $3, and a
+# substack counts once. With $4, a regex, it stops before the first line of $1
+# itself that matches. Fails with 2 when it cannot tell: an include it cannot
+# find or read cleanly, includes nested more than 8 deep, or a bracketed
+# control it does not read.
+#
+# Printing nothing is an answer too: libpam has no module of that phase for
+# the file, and runs "other"'s (libpam 1.5.2), or refuses after an @include
+# of a file with none (1.7.2). Measured with pamtester.
+_pam_phase_jumps() {
+  local lines="$1" phase="$2" path="$3" stop="${4:-}" depth="${5:-0}"
+  local line t rest ctl name more n max
+  [ "$depth" -lt 8 ] || return 2
+  while IFS= read -r line; do
+    if [ -n "$stop" ] && [[ "$line" =~ $stop ]]; then return 0; fi
+    t="" rest=""
+    read -r t rest <<<"$line"
+    case "$t" in
+      @include | -@include)
+        name=""
+        read -r name _ <<<"$rest"
+        _pam_include_jumps "$name" "$phase" "$path" "$depth" || return 2
+        continue
+        ;;
+      "$phase" | "-$phase") ;;
+      *) continue ;;
+    esac
+    if [ "${rest:0:1}" = "[" ]; then
+      ctl="${rest%%]*}"
+      if [ "$ctl" = "$rest" ] || [[ "${ctl:1}" == *"["* || "$ctl" == *\\* ]]; then
+        return 2
+      fi
+      max=0 more="$ctl"
+      while [[ "$more" =~ =([0-9]+)(.*)$ ]]; do
+        n="${BASH_REMATCH[1]}" more="${BASH_REMATCH[2]}"
+        # longer than any stack anyway, and kept away from bash's octal
+        [ "${#n}" -le 4 ] || n=9999
+        n=$((10#$n))
+        [ "$n" -le "$max" ] || max="$n"
+      done
+      printf '%s\n' "$max"
+      continue
+    fi
+    ctl="" name=""
+    read -r ctl name _ <<<"$rest"
+    case "$ctl" in
+      include)
+        _pam_include_jumps "$name" "$phase" "$path" "$depth" || return 2
+        ;;
+      substack)
+        { [ -n "$name" ] && pam_config_file "$name" "$path" >/dev/null; } || return 2
+        printf '0\n'
+        ;;
+      *) printf '0\n' ;;
+    esac
+  done <<<"$lines"
+  return 0
+}
+
+# What the file named $1, found on $3, puts into the phase $2.
+_pam_include_jumps() {
+  local name="$1" phase="$2" path="$3" depth="$4" file lines
+  [ -n "$name" ] || return 2
+  file="$(pam_config_file "$name" "$path")" || return 2
+  { [ -f "$file" ] && [ -r "$file" ]; } || return 2
+  lines="$(_pam_logical_lines "$file")" || return 2
+  _pam_phase_jumps "$lines" "$phase" "$path" "" "$((depth + 1))"
+}
+
+# Succeeds if no jump in the phase $2 of the logical lines $1, ahead of the
+# first line matching the regex $3, reaches that line - a line this tool puts
+# there, which every jump across it would now count. Includes are found on
+# $4. Sets PAM_INSERTION_REFUSAL when it says no.
+_pam_jumps_stop_short_of() {
+  local lines="$1" phase="$2" stop="$3" path="$4" jumps rc=0 i k arr=()
+  jumps="$(_pam_phase_jumps "$lines" "$phase" "$path" "$stop")" || rc=$?
+  if [ "$rc" != 0 ]; then
+    PAM_INSERTION_REFUSAL="the jumps in its $phase phase could not be counted (an include missing, unreadable or nested too deep, or a control this tool does not read)"
+    return 1
+  fi
+  [ -z "$jumps" ] || mapfile -t arr <<<"$jumps"
+  k="${#arr[@]}"
+  for i in "${!arr[@]}"; do
+    # module i+1 skips the next arr[i] modules; the new line is module k+1
+    if [ $((i + 1 + arr[i])) -gt "$k" ]; then
+      PAM_INSERTION_REFUSAL="a jump in its $phase phase reaches where the new line goes, and would land elsewhere with it there"
+      return 1
+    fi
+  done
+  return 0
+}
+
+# Succeeds if the lines pam_keyring_lines_add() put into $1 are out of every
+# jump's reach: nothing in the auth phase ahead of our module jumps as far as
+# it, nor anything in the session phase as far as the keyring line. Run on
+# the edited file, so the places checked are the places written. Includes are
+# found on $2. Sets PAM_INSERTION_REFUSAL when it says no.
+_pam_keyring_lines_out_of_reach() {
+  local f="$1" path="$2" lines
+  if ! lines="$(_pam_logical_lines "$f")"; then
+    PAM_INSERTION_REFUSAL="it could not be read cleanly"
+    return 1
+  fi
+  _pam_jumps_stop_short_of "$lines" auth \
+    '^[[:space:]]*-?auth[[:space:]].*pam_tpm_keyring_authtok\.so' "$path" || return 1
+  _pam_jumps_stop_short_of "$lines" session \
+    '^[[:space:]]*-?session[[:space:]].*pam_gnome_keyring\.so' "$path"
+}
+
 # Succeeds if install.sh may add the keyring lines to the service file $1:
 #
-# - it names neither pam_gnome_keyring nor this tool's module anywhere, comments
-#   included. A file with a keyring line in some other phase is somebody's own
-#   arrangement, and adding a second one is not this tool's call;
+# - it has no auth-phase keyring line, and names neither pam_gnome_keyring nor
+#   this tool's module anywhere else, comments included. A file with a
+#   keyring line in some other phase is somebody's own arrangement, and adding
+#   a second one is not this tool's call;
 # - it has no continuations, so the filter's physical lines are libpam's
 #   logical ones, and it reads to the end;
-# - it has an auth and a session phase of its own. A file without one gets
-#   that phase from "other", and a single line added would replace all of it;
+# - its auth phase and its session phase each have a module, counted the way
+#   libpam strings them together. A file with none in a phase gets that phase
+#   from "other", or fails it, and a line added there would take its place.
+#   Until the review of PR #24 any @include counted for both phases, whatever
+#   the included file held, so `@include common-session` passed for an auth
+#   phase - and the auth phase libpam then built was our two lines alone;
 # - the file as it would be afterwards passes pam_auth_insertion_point_is_safe(),
-#   includers and all. The draft is written to a scratch directory and checked
-#   there, under the real file's name.
+#   includers and all, and no jump ahead of the added lines reaches them. The
+#   draft is written to a scratch directory and checked there, under the real
+#   file's name.
 #
 # Sets PAM_INSERTION_REFUSAL when it says no. $2 is the include search path.
 pam_keyring_lines_can_be_added() {
-  local f="$1" path="${2:-$PAM_CONFIG_PATH}" lines line t rc=0 scratch verdict=0
-  local has_auth=0 has_session=0
+  local f="$1" path="${2:-$PAM_CONFIG_PATH}" lines phase modules rc=0 scratch verdict=0
   PAM_INSERTION_REFUSAL=""
   if [ ! -f "$f" ] || [ ! -r "$f" ]; then
     PAM_INSERTION_REFUSAL="it cannot be read"
+    return 1
+  fi
+  if grep -qE "$PAM_GNOME_KEYRING_AUTH_RE" "$f"; then
+    PAM_INSERTION_REFUSAL="it has an auth-phase pam_gnome_keyring.so line of its own"
     return 1
   fi
   if grep -q pam_tpm_keyring_authtok "$f"; then
@@ -1647,36 +1879,43 @@ pam_keyring_lines_can_be_added() {
     PAM_INSERTION_REFUSAL="it could not be read to the end"
     return 1
   fi
-  while IFS= read -r line; do
-    t=""
-    read -r t _ <<<"$line"
-    case "$t" in
-      auth | -auth) has_auth=1 ;;
-      session | -session) has_session=1 ;;
-      @include | -@include) has_auth=1 has_session=1 ;;
-    esac
-  done <<<"$lines"
-  if [ "$has_auth" = 0 ] || [ "$has_session" = 0 ]; then
-    PAM_INSERTION_REFUSAL="it has no keyring line, and no auth or no session phase of its own to add one to"
-    return 1
-  fi
+  for phase in auth session; do
+    rc=0
+    modules="$(_pam_phase_jumps "$lines" "$phase" "$path")" || rc=$?
+    if [ "$rc" != 0 ]; then
+      PAM_INSERTION_REFUSAL="it has no keyring line, and what its $phase phase includes could not be followed"
+      return 1
+    fi
+    if [ -z "$modules" ]; then
+      PAM_INSERTION_REFUSAL="it has no keyring line, and no $phase phase of its own to add one to"
+      return 1
+    fi
+  done
   if ! scratch="$(mktemp -d)"; then
     PAM_INSERTION_REFUSAL="no scratch directory to check the edited file in"
     return 1
   fi
   pam_keyring_lines_add <"$f" >"$scratch/${f##*/}"
-  pam_auth_insertion_point_is_safe "$scratch/${f##*/}" "$path" "$f" || verdict=1
+  if ! pam_auth_insertion_point_is_safe "$scratch/${f##*/}" "$path" "$f" \
+    || ! _pam_keyring_lines_out_of_reach "$scratch/${f##*/}" "$path"; then
+    verdict=1
+  fi
   rm -rf -- "$scratch"
   return "$verdict"
 }
 
-# Succeeds if $1 carries the three lines install.sh adds, each exactly once and
-# exactly where it puts them, and nothing else that names the keyring - proved
-# by round trip, as pam_fprintd_stack_is_generated() proves the attempt stack:
-# take the lines out, put them back, and require the file byte for byte. This
-# is what lets the uninstaller take the keyring lines out too. Anything else
-# with our module in it - every stack wired above an existing keyring line -
-# loses only our line.
+# Succeeds if $1 has the shape pam_keyring_lines_add() gives a file: the three
+# lines, each exactly once and exactly where it puts them, and nothing else
+# that names the keyring or this tool's module - proved by round trip, as
+# pam_fprintd_stack_is_generated() proves the attempt stack: take the lines
+# out, put them back, and require the file byte for byte.
+#
+# Shape is not provenance. The same lines can be written by hand - README shows
+# them - and the round trip cannot tell. So nothing takes the keyring lines
+# out on the strength of this alone (review of PR #24); only
+# pam_keyring_exact_original() says they are this tool's. This is for checking
+# install.sh's own draft before it is written, and for finding the files the
+# add-path checks apply to.
 pam_keyring_lines_are_ours() {
   local f="$1" l
   [ -f "$f" ] || return 1
@@ -1690,22 +1929,88 @@ pam_keyring_lines_are_ours() {
   pam_keyring_lines_remove <"$f" | pam_keyring_lines_add | cmp -s - "$f"
 }
 
-# Prints the newest .bak-<timestamp> copy of $1 that adding the three lines
-# turns into what is on disk now, byte for byte, if there is one. Restoring it
-# is exact even for a file the filter could not give back byte for byte - one
-# whose last line had no newline - and a stale copy can never pass, for the
-# same reason as in pam_fprintd_exact_original().
+# Prints the newest .bak-<timestamp> copy of $1 that names neither the keyring
+# nor this tool's module, and that adding the three lines turns into what is
+# on disk now, byte for byte - and fails when there is none. Such a copy is
+# the proof that the keyring lines in $1 are this tool's: install.sh takes it
+# right before it adds them, and nothing else leaves one behind. Lines somebody
+# wrote by hand, even byte for byte the same, come with no keyring-free
+# ancestor that adds up to the file: install.sh's backup of such a file, taken
+# when it wired the file the ordinary way, has the keyring lines in it. With no
+# such copy, uninstall.sh and install.sh take out only this tool's own line,
+# and say so (review of PR #24).
+#
+# Restoring the copy is exact even for a file the filter could not give back
+# byte for byte - one whose last line had no newline - and a stale copy can
+# never pass, for the same reason as in pam_fprintd_exact_original().
 pam_keyring_exact_original() {
-  local f="$1" bak baks=()
-  mapfile -t baks < <(printf '%s\n' "$f".bak-* | sort -r)
-  for bak in "${baks[@]}"; do
-    [ -f "$bak" ] || continue
-    if grep -qE 'pam_gnome_keyring|pam_tpm_keyring_authtok' "$bak"; then continue; fi
-    pam_keyring_lines_add <"$bak" | cmp -s - "$f" || continue
-    echo "$bak"
-    return 0
+  _pam_exact_original "$1" _pam_keyring_backup_is_keyringless pam_keyring_lines_add
+}
+
+_pam_keyring_backup_is_keyringless() {
+  ! grep -qE 'pam_gnome_keyring|pam_tpm_keyring_authtok' "$1"
+}
+
+# Succeeds if a stack that already carries this tool's line may keep it:
+# pam_auth_insertion_point_is_safe(), and for a file of the shape the keyring
+# lines are added in, the jump check they were added under as well - an
+# include can have changed since. install.sh asks this of every wired stack,
+# when it plans and again right before it writes. A file with this tool's line
+# and no keyring line under it fails, and gets the line taken back out: no
+# check has looked at what runs after it. Sets PAM_INSERTION_REFUSAL.
+pam_wired_stack_is_safe() {
+  local f="$1" path="${2:-$PAM_CONFIG_PATH}"
+  pam_auth_insertion_point_is_safe "$f" "$path" || return 1
+  if pam_keyring_lines_are_ours "$f"; then
+    _pam_keyring_lines_out_of_reach "$f" "$path" || return 1
+  fi
+  return 0
+}
+
+# Prints the services libpam reads from a directory on $2 (default
+# PAM_CONFIG_PATH) other than $1 (default /etc/pam.d) that install.sh would
+# have something to do in: one with an auth-phase keyring line, or the
+# fingerprint service itself. install.sh edits $1 only, and its other scans
+# read nothing else, so these used to be passed over in silence - a distro
+# shipping gdm-fingerprint in /usr/lib/pam.d alone would have gone the way
+# issue #23 went (review of PR #24). A copy shadowed by one of the same name
+# earlier on the path is never read, and is not listed.
+pam_stacks_outside() {
+  local editable="${1:-/etc/pam.d}" path="${2:-$PAM_CONFIG_PATH}" dir f dirs=()
+  IFS=: read -r -a dirs <<<"$path"
+  for dir in "${dirs[@]}"; do
+    { [ -n "$dir" ] && [ "$dir" != "$editable" ]; } || continue
+    for f in "$dir"/*; do
+      [ -f "$f" ] || continue
+      if [[ "$f" =~ $PAM_NON_SERVICE_RE ]]; then continue; fi
+      [ "$(pam_config_file "${f##*/}" "$path")" = "$f" ] || continue
+      if [ "${f##*/}" = "$PAM_FINGERPRINT_SERVICE" ] \
+        || grep -qE "$PAM_GNOME_KEYRING_AUTH_RE" "$f"; then
+        printf '%s\n' "$f"
+      fi
+    done
   done
-  return 1
+  return 0
+}
+
+# --- writing a PAM file -----------------------------------------------------
+
+# Backs the PAM file $1 up before its first change in this run, as
+# $1.bak-$RUN_TS: one copy per run, holding what was there before the run
+# touched it. RUN_TS is the caller's - install.sh and uninstall.sh each set
+# one for the whole run.
+backup_pam_file() {
+  local f="$1" bak="$1.bak-$RUN_TS"
+  [ -e "$bak" ] || sudo cp "$f" "$bak"
+}
+
+# Puts the content of the file $2 onto the PAM file $1, the way every
+# whole-file write here goes: $1 backed up first, then copied *onto* rather
+# than replaced, so its mode, owner and SELinux label stay what the
+# distribution shipped. One place for the sequence, which install.sh and
+# uninstall.sh used to repeat at every write (review of PR #24).
+pam_file_write() {
+  backup_pam_file "$1" && sudo cp "$2" "$1"
 }
 
 # --- SELinux ----------------------------------------------------------------
@@ -1733,13 +2038,17 @@ selinux_is_enabled() {
 
 # Asks the running kernel whether the domain in $1 (default: GDM's) may open
 # the TPM device $2 (default /dev/tpmrm0) for reading and writing. Returns 0
-# for yes, 1 for no, and 2 when it cannot ask - no selinuxfs, or a type the
-# loaded policy does not have.
+# for yes, 1 for no, and 2 when it cannot ask - no selinuxfs, a type the
+# loaded policy does not have, or a caller the kernel will not answer.
 #
 # selinuxfs's `access` file is the kernel's own access-decision interface:
 # write "scontext tcontext class", read back the allowed permissions as a hex
-# mask. It is open to every process, so this needs neither root nor setools,
-# and it answers for the policy actually loaded, whoever's module granted what.
+# mask. It needs neither root nor setools, and it answers for the policy
+# actually loaded, whoever's module granted what. It is not open to every
+# process, though, whatever its mode bits say: the kernel answers only a
+# caller whose own domain has `security { compute_av }`, and fails the write
+# for any other (sel_write_access). A login confined to a domain without it
+# gets 2 here, and install.sh says it could not check (review of PR #24).
 selinux_domain_may_use_tpm() {
   local scon="${1:-system_u:system_r:xdm_t:s0}" dev="${2:-/dev/tpmrm0}"
   local fs="${SELINUXFS:-/sys/fs/selinux}" tcon idx perm bit want=0 allowed="" rest fd

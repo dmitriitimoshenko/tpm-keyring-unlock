@@ -11,6 +11,16 @@ post_install() {
 EOF
 }
 
+# tpm-keyring-unlock-configure may have loaded the SELinux module, which lets
+# every process in GDM's domain open the TPM (README.md, "SELinux"). With the
+# package gone no helper is left to need it.
+post_remove() {
+  if command -v semodule >/dev/null 2>&1 \
+    && semodule -l 2>/dev/null | grep -qx tpm_keyring_unlock; then
+    semodule -r tpm_keyring_unlock >/dev/null 2>&1 || true
+  fi
+}
+
 post_upgrade() {
   echo "==> Run tpm-keyring-unlock-configure once after an upgrade: it re-checks"
   echo "==> the PAM stacks an older version wired, and takes the helper back"

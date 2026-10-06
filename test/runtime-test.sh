@@ -171,9 +171,16 @@ flow_service() {
           sub(/pam_fprintd\.so.*/, sprintf("pam_flow_stub.so mark=fp%d ret=%s", n, r))
           print
         }' >/etc/pam.d/flowtest
-  # the keyring lines the real gdm-fingerprint stack carries below fprintd
+  # The lines the real gdm-fingerprint stack carries below fprintd: ours,
+  # which returns PAM_IGNORE on every path, and pam_gnome_keyring, which
+  # returns PAM_SUCCESS. A success jump records no result of its own in libpam
+  # (measured on 1.5.2 and 1.7.2: a jump over pam_deny followed by nothing
+  # that votes is refused), so it is the keyring line's `optional` success
+  # that carries a match here - on Debian's gdm-fingerprint, pam_nologin's
+  # above it does too. Until the review of PR #24 the stand-in for our module
+  # returned success as well, which said nothing true about it.
   cat >>/etc/pam.d/flowtest <<'INNER'
-auth	optional	pam_flow_stub.so mark=tpm ret=success
+auth	optional	pam_flow_stub.so mark=tpm ret=ignore
 auth	optional	pam_flow_stub.so mark=keyring ret=success
 INNER
 }
@@ -225,17 +232,28 @@ echo "   (bin/lib.sh's pam_keyring_lines_add; GitHub issue #23) --"
 # libpam's reading of that position: a matched finger has to reach the new
 # lines, and a failed one must still fail the stack. postlogin's auth phase is
 # empty unless ecryptfs is on, so a marker stands in for that line, to show it
-# runs before ours.
+# runs before ours. The stand-ins return what the real modules do: ours
+# PAM_IGNORE, pam_gnome_keyring PAM_SUCCESS, and the postlogin marker nothing
+# that counts, as an empty phase would.
 F44_FIXTURES="$REPO_DIR/test/fixtures/pam.d/fedora44"
+# $1 the finger's result; $2, if given, a fingerprint-auth to use instead of
+# the stock one, with FP where the finger goes.
 f44_flow_case() {
-  sed "s/pam_fprintd\.so/pam_flow_stub.so mark=fp ret=$1/" \
-    "$F44_FIXTURES/fingerprint-auth" >/etc/pam.d/f44-fingerprint-auth
-  { printf 'auth\toptional\tpam_flow_stub.so mark=postlogin\n'; cat "$F44_FIXTURES/postlogin"; } \
+  if [ -n "${2:-}" ]; then
+    printf '%s\n' "$2" | sed "s/FP/pam_flow_stub.so mark=fp ret=$1/" >/etc/pam.d/f44-fingerprint-auth
+  else
+    sed "s/pam_fprintd\.so/pam_flow_stub.so mark=fp ret=$1/" \
+      "$F44_FIXTURES/fingerprint-auth" >/etc/pam.d/f44-fingerprint-auth
+  fi
+  { printf 'auth\toptional\tpam_flow_stub.so mark=postlogin ret=ignore\n'; cat "$F44_FIXTURES/postlogin"; } \
     >/etc/pam.d/f44-postlogin
+  # F44_KEYRING_CONTROL puts another control on the keyring lines, to show
+  # what the one PR #24 first wrote did.
   pam_keyring_lines_add <"$F44_FIXTURES/gdm-fingerprint" \
     | sed -e 's/fingerprint-auth/f44-fingerprint-auth/; s/postlogin/f44-postlogin/' \
-          -e 's/pam_tpm_keyring_authtok\.so/pam_flow_stub.so mark=tpm/' \
-          -e 's/pam_gnome_keyring\.so/pam_flow_stub.so mark=keyring/' \
+          -e "s/\[default=ignore\] pam_gnome_keyring/${F44_KEYRING_CONTROL:-[default=ignore]} pam_gnome_keyring/" \
+          -e 's/pam_tpm_keyring_authtok\.so/pam_flow_stub.so mark=tpm ret=ignore/' \
+          -e 's/pam_gnome_keyring\.so/pam_flow_stub.so mark=keyring ret=success/' \
     >/etc/pam.d/f44-gdm-fingerprint
   rm -f "$FLOW_LOG"
   local r
@@ -252,6 +270,64 @@ check "a mismatched finger still fails the stack" \
   "$(f44_flow_case auth_err)" "failure fp,postlogin,tpm,keyring,"
 check "so does a bad scan" \
   "$(f44_flow_case authinfo_unavail)" "failure fp,postlogin,tpm,keyring,"
+
+echo
+echo "-- the lines install.sh adds cannot change who gets in (review of PR #24) --"
+# A fingerprint-auth authselect no longer manages, or one written by hand,
+# need not end in pam_deny. With the finger `sufficient` and nothing after it,
+# a wrong finger casts no vote at all, and the stack's answer is whatever
+# votes next. The keyring line used to be `optional`, and pam_gnome_keyring
+# returns PAM_SUCCESS even with no password to work with, so that answer was
+# yes - the review measured it with the real module, too. None of the lines
+# install.sh adds can vote now, so the stack answers as it did without them.
+F44_SUFFICIENT=$'auth\tsufficient\tFP'
+check "a sufficient finger and nothing after it: a wrong finger is refused" \
+  "$(f44_flow_case auth_err "$F44_SUFFICIENT")" "failure fp,postlogin,tpm,keyring,"
+check "...so is a bad scan" \
+  "$(f44_flow_case authinfo_unavail "$F44_SUFFICIENT")" "failure fp,postlogin,tpm,keyring,"
+check "...and a matched finger gets in, reaching the keyring line" \
+  "$(f44_flow_case success "$F44_SUFFICIENT")" "success fp,postlogin,tpm,keyring,"
+check "(with the keyring line optional, as PR #24 first wrote it, the wrong finger got in)" \
+  "$(F44_KEYRING_CONTROL=optional f44_flow_case auth_err "$F44_SUFFICIENT")" \
+  "success fp,postlogin,tpm,keyring,"
+
+# The same at its barest: an auth phase of nothing but the two auth lines
+# install.sh adds lets nobody in. That is the auth phase libpam built for a
+# gdm-fingerprint whose only "auth phase" was an @include of a session-only
+# file, which bin/lib.sh used to accept.
+{
+  printf '%s\n%s\n' "$PAM_TPM_LINE" "$PAM_KEYRING_AUTH_LINE" \
+    | sed -e 's/pam_tpm_keyring_authtok\.so/pam_flow_stub.so mark=tpm ret=ignore/' \
+          -e 's/pam_gnome_keyring\.so/pam_flow_stub.so mark=keyring ret=success/'
+  printf 'account\trequired\tpam_permit.so\n'
+} >/etc/pam.d/ours-only
+rm -f "$FLOW_LOG"
+if pamtester ours-only testsuccess authenticate >/dev/null 2>&1; then r=success; else r=failure; fi
+check "an auth phase of only the lines install.sh adds lets nobody in" \
+  "$r $(tr '\n' ',' <"$FLOW_LOG" 2>/dev/null || true)" "failure tpm,keyring,"
+
+# The session line goes ahead of postlogin, where gdm-password has its own.
+# An include does not fence in its jumps: a postlogin whose last jump ran past
+# its own end skipped a line placed behind it, and by landing there turned
+# libpam's "bad jump" into a session that opened. Ahead of postlogin the line
+# runs, and the answer stays postlogin's.
+printf '%s\n' 'session [default=2] pam_flow_stub.so mark=pl-jump' \
+  'session optional pam_flow_stub.so mark=pl-last' >/etc/pam.d/f44-postlogin-overrun
+session_case() {
+  printf '%s\n' 'auth required pam_permit.so' 'session optional pam_flow_stub.so mark=own' \
+    'session include postlogin' | "$@" \
+    | sed -e 's/postlogin/f44-postlogin-overrun/' \
+          -e 's/pam_tpm_keyring_authtok\.so/pam_flow_stub.so mark=tpm ret=ignore/' \
+          -e 's/pam_gnome_keyring\.so/pam_flow_stub.so mark=keyring/' >/etc/pam.d/f44-session
+  rm -f "$FLOW_LOG"
+  local r
+  if pamtester f44-session testsuccess open_session >/dev/null 2>&1; then r=opened; else r=refused; fi
+  printf '%s %s' "$r" "$(tr '\n' ',' <"$FLOW_LOG" 2>/dev/null || true)"
+}
+check "a postlogin whose jump runs past its end fails the session on its own" \
+  "$(session_case cat)" "refused own,pl-jump,"
+check "...and still does with the keyring line added, which runs ahead of it" \
+  "$(session_case pam_keyring_lines_add)" "refused own,keyring,pl-jump,"
 
 if [ "$fail" -eq 0 ]; then
   echo "All runtime tests passed."

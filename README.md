@@ -18,7 +18,8 @@ done.
 You also need fingerprint login already working, and all of the following.
 `install.sh` checks each one and stops if it is missing.
 
-- TPM 2.0 with `/dev/tpmrm0`
+- TPM 2.0 with `/dev/tpmrm0`. The unseal at login always goes through it,
+  the kernel's own resource manager, and never through `tpm2-abrmd`.
 - Secure Boot enabled. PCR7 is meaningless as a lock otherwise.
 - systemd, and `gnome-keyring` as your actual secrets backend
 - `tpm2-tools`, a C compiler, and PAM headers. The installer offers to fetch
@@ -189,21 +190,33 @@ it system-wide.
 
 Fedora's `gdm-fingerprint` has no keyring line at all: a finger never yields
 a password, so GDM's Red Hat stacks leave the keyring out. For that one file
-`install.sh` adds the lines Fedora's own `gdm-password` has, with the module
-between them. They go after the stack's last auth line and its last session
-line, so nothing in the file runs after the module:
+`install.sh` adds the keyring lines, with the module between them. The auth
+lines go after the stack's last auth line, so nothing in the file runs after
+the module. The session line goes where Fedora's own `gdm-password` has its
+own, ahead of `postlogin`:
 
 ```
 auth        include       postlogin
-auth    optional        pam_tpm_keyring_authtok.so   <- added by this tool
-auth    optional        pam_gnome_keyring.so         <- added by this tool
+auth    optional        pam_tpm_keyring_authtok.so       <- added by this tool
+auth    [default=ignore] pam_gnome_keyring.so             <- added by this tool
 ...
+session     include       fingerprint-auth
+session [default=ignore] pam_gnome_keyring.so auto_start  <- added by this tool
 session     include       postlogin
-session optional        pam_gnome_keyring.so auto_start   <- added by this tool
 ```
 
-`uninstall.sh` takes all three back out, restoring the pre-install copy when
-it can prove that copy is the file's direct ancestor.
+None of the three can vote, so the stack lets in exactly whom it let in
+before. That is why the keyring lines say `[default=ignore]` where
+`gdm-password` says `optional`: `pam_gnome_keyring` reports success even
+when it has no password to work with, and in a stack where nothing else has
+voted, `optional` counts that success as a login. The installer also refuses
+the file when a jump in it (`[success=1 ...]`) would reach the new lines,
+because a jump counts every line it passes.
+
+`uninstall.sh` takes all three back out by restoring the copy `install.sh`
+took right before adding them. That copy is the only proof the lines are this
+tool's: the same lines written by hand look identical. Without it, only the
+module's own line comes out, and `uninstall.sh` says so.
 
 Before it patches a stack, it checks everything that runs *after* the new
 line. That covers the lines below the keyring line, whatever they include
@@ -223,7 +236,19 @@ The installer prints the reason. Logins there work as before, but the keyring
 stays locked until you type its password. The stacks GDM and LightDM ship on
 Ubuntu, Debian, Fedora and Arch all pass. A stack wired by an earlier run is
 checked again on every run, and the helper is taken back out of it if it no
-longer passes.
+longer passes, or if its keyring line has gone.
+
+The installer edits `/etc/pam.d` only. A keyring stack, or `gdm-fingerprint`,
+that libpam reads from the distribution's own `/usr/lib/pam.d` is listed with
+the reason rather than edited. To have it wired, copy it over and re-run:
+
+```bash
+sudo cp /usr/lib/pam.d/gdm-fingerprint /etc/pam.d/gdm-fingerprint
+```
+
+The copy then replaces the vendor file for good, and updates to the vendor
+file stop reaching you until you delete it. That trade is why the installer
+leaves the step to you.
 
 ## The fingerprint reader dropping out mid-prompt
 
@@ -370,8 +395,17 @@ which is one rule:
 (allow xdm_t tpm_device_t (chr_file (open read write)))
 ```
 
-`uninstall.sh` offers to remove it again, or by hand:
-`sudo semodule -r tpm_keyring_unlock`.
+It is the run's last step, taken only once a stack is wired, so a run that
+stops early or wires nothing leaves the policy as it was. `uninstall.sh`
+offers to remove it again, and removing the distribution package removes it
+too. By hand: `sudo semodule -r tpm_keyring_unlock`.
+
+The check needs no root, but the kernel answers it only for a login allowed
+to ask (`security { compute_av }`), and a confined login may not be. The
+installer then says it could not check. To check by hand, `sesearch -A -s
+xdm_t -t tpm_device_t -c chr_file -p open` (from `setools-console`) prints
+nothing when the access is missing. The journal line above shows the same
+after a fingerprint login.
 
 **What it gives up.** The rule is for all of `xdm_t`, not only the helper:
 every process GDM runs as root may now open the TPM. File permissions still

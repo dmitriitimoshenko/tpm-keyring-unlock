@@ -54,16 +54,10 @@ confirm() {
 
 # One timestamp for the whole run, so a file touched by two different steps
 # below gets exactly one backup, holding its pristine pre-run content - same
-# rule install.sh follows.
+# rule install.sh follows, through the same bin/lib.sh backup_pam_file().
+# Undoing an edit to a login-critical file is still an edit to a
+# login-critical file, so it gets the same .bak-<timestamp> copy.
 RUN_TS="$(date +%Y%m%d%H%M%S)"
-
-# Backs a PAM file up before its first modification in this run. Undoing an
-# edit to a login-critical file is still an edit to a login-critical file, so
-# it gets the same .bak-<timestamp> copy the install side takes.
-backup_pam_file() {
-  local f="$1" bak="$1.bak-$RUN_TS"
-  [ -e "$bak" ] || sudo cp "$f" "$bak"
-}
 
 # Every prompt below defaults to yes, so a run with no terminal must not be
 # allowed to answer them by hitting EOF. read() failing counts as "no" in
@@ -133,32 +127,29 @@ for f in /etc/pam.d/*; do
   if ! grep -q pam_tpm_keyring_authtok.so "$f"; then continue; fi
   # A gdm-fingerprint that had no keyring line of its own got the keyring
   # lines from install.sh along with ours (Fedora's; GitHub issue #23). Those
-  # are this tool's too, so they go as well - but only when the round trip
-  # proves them ours, exactly where install.sh puts them. Restored from the
-  # pre-install copy when one provably is the file's direct ancestor, which is
-  # exact to the byte; otherwise the three lines are taken out.
-  if pam_keyring_lines_are_ours "$f"; then
+  # are this tool's too, so they go as well - but only on proof: the copy
+  # install.sh took right before it added them, which adding them turns into
+  # this file byte for byte. That copy goes back, exact to the byte. Lines of
+  # the same shape without it may be somebody's own, written from README, and
+  # the shape alone cannot tell; they stay (review of PR #24).
+  ORIGINAL="$(pam_keyring_exact_original "$f" || true)"
+  if [ -n "$ORIGINAL" ]; then
     echo "Found the TPM helper in $f, with the two keyring lines install.sh"
     echo "added next to it - the file had none of its own."
-    ORIGINAL="$(pam_keyring_exact_original "$f" || true)"
     if confirm "Remove all three, back to the file as it was?"; then
-      backup_pam_file "$f"
-      if [ -n "$ORIGINAL" ]; then
-        # cp *onto* the existing file, so its mode, owner and label stay.
-        sudo cp "$ORIGINAL" "$f"
-        echo "Restored exactly, from $ORIGINAL"
-      else
-        REWRITTEN="$(mktemp)"
-        pam_keyring_lines_remove <"$f" >"$REWRITTEN"
-        sudo cp "$REWRITTEN" "$f"
-        rm -f "$REWRITTEN"
-        echo "Removed the three lines (no pre-install copy of this file was found)."
-      fi
+      pam_file_write "$f" "$ORIGINAL"
+      echo "Restored exactly, from $ORIGINAL"
       echo "Previous content backed up as $f.bak-$RUN_TS."
     fi
     continue
   fi
   echo "Found the injected line in $f"
+  if pam_keyring_lines_are_ours "$f"; then
+    echo "The two pam_gnome_keyring.so lines beside it match the ones install.sh"
+    echo "adds, but no pre-install copy (.bak-*) proves this tool put them there,"
+    echo "so they stay. They never vote; delete them by hand if you did not add"
+    echo "them yourself."
+  fi
   if confirm "Remove it?"; then
     backup_pam_file "$f"
     sudo sed -i "$PAM_TPM_LINE_DELETE_SED" "$f"
@@ -243,10 +234,7 @@ for f in /etc/pam.d/*; do
   fi
   if confirm "$PROMPT"; then
     if [ -n "$ORIGINAL" ]; then
-      backup_pam_file "$f"
-      # cp *onto* the existing file rather than replacing it, so its mode and
-      # ownership stay exactly as the distro shipped them.
-      sudo cp "$ORIGINAL" "$f"
+      pam_file_write "$f" "$ORIGINAL"
       echo "Restored exactly, from $ORIGINAL"
       echo "(previous content backed up as $f.bak-$RUN_TS)."
       continue
@@ -260,8 +248,7 @@ for f in /etc/pam.d/*; do
       && [ "$(grep -cE "$PAM_FPRINTD_AUTH_RE" "$REWRITTEN")" = 1 ] \
       && ! grep -qE "$PAM_FPRINTD_RETRY_LINE_RE" "$REWRITTEN" \
       && ! grep -qE "${PAM_FPRINTD_AUTH_RE}.*timeout=-1" "$REWRITTEN"; then
-      backup_pam_file "$f"
-      sudo cp "$REWRITTEN" "$f"
+      pam_file_write "$f" "$REWRITTEN"
       echo "Restored to the module's defaults (no pre-install copy of this file"
       echo "was found, so an explicit timeout= it may have had is not back)."
       echo "Previous content backed up as $f.bak-$RUN_TS."
@@ -339,12 +326,19 @@ fi
 # --- 2. remove installed module + helper --------------------------------
 # Same candidate list install.sh picks the install directory from (shared
 # via bin/lib.sh), just checking for our own module instead of pam_unix.so.
-found_module=""
+# Every copy, not the first: until the review of PR #24 the list put
+# /lib/security ahead of /usr/lib64/security, so on a 64-bit Fedora or
+# openSUSE with 32-bit PAM installed the module went into the 32-bit
+# directory, and a re-install now puts it into the right one. A directory
+# reached under two names (/lib is /usr/lib there) counts once.
+found_modules=()
+declare -A seen_module=()
 for candidate in "${PAM_MODULE_DIR_CANDIDATES[@]}"; do
-  if [ -f "$candidate/pam_tpm_keyring_authtok.so" ]; then
-    found_module="$candidate/pam_tpm_keyring_authtok.so"
-    break
-  fi
+  [ -f "$candidate/pam_tpm_keyring_authtok.so" ] || continue
+  real_module="$(readlink -f "$candidate/pam_tpm_keyring_authtok.so")"
+  [ -z "${seen_module[$real_module]:-}" ] || continue
+  seen_module["$real_module"]=1
+  found_modules+=("$candidate/pam_tpm_keyring_authtok.so")
 done
 # The module and the helper are machine-wide, not this account's: every user
 # who sealed here depends on them, and these were the only destructive steps
@@ -356,7 +350,7 @@ if [ "$KEEP_PACKAGED_FILES" = true ]; then
   echo
   echo "The PAM module and helper came from a package - remove it with your"
   echo "package manager if you want them gone."
-elif [ -n "$found_module" ] || [ -f "$HELPER_DST" ]; then
+elif [ "${#found_modules[@]}" -gt 0 ] || [ -f "$HELPER_DST" ]; then
   echo
   REMOVE_PROMPT="Remove the machine-wide PAM module and helper?"
   if [ -n "$OTHER_SEALED" ]; then
@@ -377,10 +371,10 @@ elif [ -n "$found_module" ] || [ -f "$HELPER_DST" ]; then
     echo "that isn't mounted right now wouldn't show up."
   fi
   if confirm "$REMOVE_PROMPT"; then
-    if [ -n "$found_module" ]; then
+    for found_module in "${found_modules[@]}"; do
       sudo rm -f "$found_module"
       echo "Removed $found_module"
-    fi
+    done
     if [ -f "$HELPER_DST" ]; then
       sudo rm -f "$HELPER_DST"
       echo "Removed $HELPER_DST"
@@ -404,10 +398,18 @@ if command -v semodule >/dev/null 2>&1 && [ -d /var/lib/selinux ]; then
   if grep -qx "$SELINUX_MODULE_NAME" <<<"$SELINUX_MODULES"; then
     echo
     SELINUX_PROMPT="Remove the SELinux module $SELINUX_MODULE_NAME? GDM logins lose the TPM again."
+    # The same three cases as the module and the helper above: a scan that
+    # could not run is said out loud, not answered as if nobody else were
+    # here (review of PR #24).
     if [ -n "$OTHER_SEALED" ]; then
       echo "Reminder: these users' GDM logins reach the TPM through it too:"
       echo "$OTHER_SEALED" | sed 's/^/  /'
       SELINUX_PROMPT="Remove the SELinux module $SELINUX_MODULE_NAME anyway, taking GDM auto-unlock away from the users listed above?"
+    elif [ "$OTHER_SCAN_OK" -eq 0 ]; then
+      echo "The SELinux module lets the GDM logins of every user of this tool here"
+      echo "reach the TPM, and it was not possible to check whether anyone else"
+      echo "still relies on it."
+      SELINUX_PROMPT="Remove the SELinux module $SELINUX_MODULE_NAME? GDM logins lose the TPM again, possibly other users' too."
     fi
     if confirm "$SELINUX_PROMPT"; then
       if sudo semodule -r "$SELINUX_MODULE_NAME"; then
@@ -457,11 +459,16 @@ if [ -f "$DATA_DIR/primary.handle" ] && command -v tpm2_evictcontrol >/dev/null 
     # answer - sudo declined, getent unavailable, an unreadable home - has
     # to count as "somebody might", because the failure mode on the other
     # side is silently breaking someone else's login.
+    #
+    # $LIB_SH, the copy this script sourced, not bin/lib.sh: a packaged
+    # deconfigure.sh has lib.sh flat beside it, so that path did not exist,
+    # the scan failed every time and the eviction was never offered there
+    # (found during the review of PR #24).
     if DEPENDENTS="$(sudo bash -c '
            set -euo pipefail
            source "$1"
            tpm_primary_handle_dependents "$2" "$3"
-         ' _ "$REPO_DIR/bin/lib.sh" "$PRIMARY_HANDLE" "$USER")"; then
+         ' _ "$LIB_SH" "$PRIMARY_HANDLE" "$USER")"; then
       SCAN_OK=1
     else
       SCAN_OK=0
