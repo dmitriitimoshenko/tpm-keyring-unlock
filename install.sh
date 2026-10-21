@@ -3,12 +3,14 @@
 # keyring, working for both password and fingerprint logins, without
 # blanking the keyring password. See README.md for how/why this works.
 #
-# Safe by design at every step except the /etc/pam.d/ edits, of which there
-# are two, both backed up first: the line it adds to the fingerprint PAM
-# stack is "optional" and cannot itself grant or block login, and the one it
-# can optionally make to pam_fprintd.so (an attempt stack, only ever on a
-# fingerprint-only stack) changes how many times the sensor is re-armed
-# before the prompt gives up, never who gets in. See README.md "How it works" before running this if you
+# Safe by design at every step except the /etc/pam.d/ edits, all backed up
+# first: the line it adds to the fingerprint PAM stack is "optional" and
+# cannot itself grant or block login, and the one it can optionally make to
+# pam_fprintd.so (an attempt stack, only ever on a fingerprint-only stack)
+# changes how many times the sensor is re-armed before the prompt gives up,
+# never who gets in. The one edit that does change who gets in - a
+# fingerprint line for polkit's prompts - is made only on an explicit "n",
+# never on Enter. See README.md "How it works" before running this if you
 # want to understand exactly what it touches.
 set -euo pipefail
 
@@ -65,6 +67,17 @@ confirm() {
   # terminal) is a "no", so nothing here can be auto-approved by a pipe.
   read -rp "$prompt [Y/n] " ans || return 1
   [[ ! "$ans" =~ ^[Nn][Oo]?$ ]]
+}
+
+# The same [Y/n], for the one question whose "yes" leaves things as they are,
+# so a run can still be answered by holding Enter: succeeds only on an
+# explicit n. A failed read fails too - with confirm()'s "EOF is a no", the
+# inverted question would make the change on EOF.
+declines() {
+  local prompt="$1"
+  local ans
+  read -rp "$prompt [Y/n] " ans || return 1
+  [[ "$ans" =~ ^[Nn][Oo]?$ ]]
 }
 
 # One timestamp for the whole run, so a file touched by two different steps
@@ -173,6 +186,117 @@ fprintd_conflict_offer() {
     echo "All ${#losers[@]}: ${losers[*]##*/}"
   fi
   confirm "$(pam_fprintd_conflict_question "$prompts" "${#losers[@]}")"
+}
+
+# Succeeds, with POLKIT_STACK set to polkit's file, when the question below is
+# worth asking: pam_fprintd knows the line's options, polkit's file has the
+# shape the line goes into, and you have a finger enrolled. The caller has
+# already made sure polkit has no fingerprint from the shared stack. Asked
+# from the same two places as fprintd_conflict_offer(), so one rule.
+polkit_fprintd_offerable() {
+  pam_fprintd_supports_attempt_options || return 1
+  POLKIT_STACK="$(pam_polkit_fprintd_target)" || return 1
+  fprintd_user_has_enrolled_finger "$USER"
+}
+
+# Asks whether polkit's prompts get a fingerprint line of their own, and
+# succeeds when the answer is to add it. Unlike every other question here,
+# "yes" leaves things as they are: the line adds a way to approve admin
+# actions, so Enter must not be what adds it (the repo owner's call,
+# 2026-10-21). It is still [Y/n], so a run stays Enter-through-able, and the
+# security cost is in the text right above it.
+#
+# $1 is the file libpam reads for polkit; $2 is true when this run is what
+# takes polkit's fingerprint away.
+polkit_fprintd_offer() {
+  local target="$1" losing="$2"
+  if [ "$losing" = true ]; then
+    echo "polkit prompts (App Center and snap installs, other admin actions) lose"
+    echo "fingerprint with that. A line of their own in /etc/pam.d/polkit-1 would"
+    echo "keep it for them without bringing the race back: GDM never reads that file."
+  else
+    echo "Optional: polkit prompts (App Center and snap installs, other admin"
+    echo "actions) take no fingerprint here. A line of their own in"
+    echo "/etc/pam.d/polkit-1 would let them, without touching the lock screen."
+  fi
+  echo "Security: with it, an enrolled finger alone approves any of them,"
+  echo "installing software and other root-level changes included."
+  if [ "$target" != /etc/pam.d/polkit-1 ]; then
+    echo "And /etc/pam.d/polkit-1 would be a copy of $target that replaces it"
+    echo "for good: polkit's updates to that file stop reaching you. README.md."
+  fi
+  declines "Keep polkit prompts password-only?"
+}
+
+# Adds PAM_POLKIT_FPRINTD_LINE to polkit's file: the write behind a "no" to
+# polkit_fprintd_offer(). A function for the reason disable_fprintd_profile()
+# is one - the planned step and the end-of-run check both call it. Where
+# libpam reads polkit from the vendor directory, /etc/pam.d/polkit-1 is
+# created as a copy carrying the line; where the release ships that file
+# itself (Ubuntu 22.04), it is edited in place, backed up.
+polkit_fprintd_add() {
+  local dst=/etc/pam.d/polkit-1 target rewritten how
+  echo "-- Fingerprint for polkit --"
+  # Re-checked against what is on disk now, as every write here is: the
+  # package install since the plan can have rewritten polkit's file, or run
+  # pam-auth-update and put the profile back - and with the shared stack's
+  # line back, a line of polkit's own asks for the finger twice.
+  if pam_fprintd_in_shared_stack; then
+    echo "pam_fprintd.so is in $PAM_SHARED_AUTH_STACK, which polkit reads already -"
+    echo "a line of its own would ask for the finger twice. Left alone."
+    return 0
+  fi
+  if ! target="$(pam_polkit_fprintd_target)"; then
+    echo "polkit's PAM file changed since the plan was printed and no longer" >&2
+    echo "qualifies - left untouched. Re-run to reconsider it." >&2
+    return 0
+  fi
+  rewritten="$(mktemp)"
+  pam_polkit_fprintd_line_add <"$target" >"$rewritten"
+  # Every admin prompt on the machine goes through this file, so refuse
+  # anything that is not the same file plus exactly the one line. `awk 1`
+  # ends a last line that had no newline, as the filter does.
+  if [ "$(grep -cxF "$PAM_POLKIT_FPRINTD_LINE" "$rewritten")" != 1 ] \
+    || ! pam_polkit_fprintd_line_remove <"$rewritten" | cmp -s - <(awk 1 "$target"); then
+    echo "Unexpected result adding the line to $target - left it untouched." >&2
+    rm -f "$rewritten"
+    return 0
+  fi
+  if [ "$target" = "$dst" ]; then
+    pam_file_write "$dst" "$rewritten"
+    how=edited
+  elif [ -e "$dst" ]; then
+    # pam_polkit_fprintd_target() would have named it, so it appeared since
+    echo "$dst appeared while this ran - left untouched. Re-run to reconsider it." >&2
+    rm -f "$rewritten"
+    return 0
+  else
+    # install, not cp: the temporary file is 0600, and a polkit file only
+    # root can read would be one this tool's own scans count as unreadable
+    sudo install -o root -g root -m 0644 "$rewritten" "$dst"
+    how=copied
+  fi
+  rm -f "$rewritten"
+  if [ "$(pam_config_file "$PAM_POLKIT_SERVICE")" != "$dst" ] \
+    || [ "$(grep -cxF "$PAM_POLKIT_FPRINTD_LINE" "$dst")" != 1 ]; then
+    echo "$dst does not read back as written - check it before the next admin prompt." >&2
+    return 0
+  fi
+  mkdir -p "$DATA_DIR"
+  # What lets uninstall.sh take the line out, and tells it whether the whole
+  # file is this tool's copy. See bin/lib.sh, PAM_POLKIT_FPRINTD_MARKER.
+  {
+    echo "# written by install.sh at $RUN_TS: it added"
+    echo "#   $PAM_POLKIT_FPRINTD_LINE"
+    echo "# to $dst. uninstall.sh offers to take it out again."
+    echo "$how"
+  } >"$DATA_DIR/$PAM_POLKIT_FPRINTD_MARKER"
+  chmod 0644 "$DATA_DIR/$PAM_POLKIT_FPRINTD_MARKER"
+  if [ "$how" = copied ]; then
+    echo "Done: polkit now reads $dst. Undo: uninstall.sh, or sudo rm $dst"
+  else
+    echo "Done. Backup: $dst.bak-$RUN_TS. Undo: uninstall.sh, or delete the pam_fprintd line"
+  fi
 }
 
 
@@ -423,6 +547,24 @@ if { [ "$UNLIMIT_FPRINTD" = true ] || [ "$FPRINTD_STACK_PRESENT" = true ]; } \
   echo
 fi
 
+# 1f'. polkit's own fingerprint line. Whoever has polkit without a finger -
+# because 1f is about to take it, or because the shared stack never had one -
+# is asked whether polkit's prompts should get a line of their own, which the
+# greeter race above never reads. Enter keeps polkit password-only. With the
+# shared stack's line staying, polkit has a finger already and is not asked.
+# See bin/lib.sh, PAM_POLKIT_FPRINTD_LINE, and JOURNAL.md, 2026-10-21.
+POLKIT_FPRINTD_ADD=false
+POLKIT_STACK=""
+if { [ "$FPRINTD_CONFLICT_FIX" = true ] || ! pam_fprintd_in_shared_stack; } \
+  && polkit_fprintd_offerable; then
+  if polkit_fprintd_offer "$POLKIT_STACK" "$FPRINTD_CONFLICT_FIX"; then
+    POLKIT_FPRINTD_ADD=true
+  else
+    echo "Left as it is."
+  fi
+  echo
+fi
+
 # 1g. SELinux. The helper runs in the domain of the PAM stack that starts it,
 # which under GDM is xdm_t, and Fedora's policy does not let xdm_t open the
 # TPM: every fingerprint login and unlock then fails to unseal, while this
@@ -507,6 +649,19 @@ fi
 if [ "$FPRINTD_CONFLICT_FIX" = true ]; then
   echo "  $n. Disable the 'fprintd' pam-auth-update profile, taking"
   echo "     pam_fprintd.so out of $PAM_SHARED_AUTH_STACK (common-* backed up)."
+  n=$((n + 1))
+fi
+if [ "$POLKIT_FPRINTD_ADD" = true ]; then
+  if [ "$POLKIT_STACK" = /etc/pam.d/polkit-1 ]; then
+    echo "  $n. Give polkit prompts a fingerprint line of their own in"
+    echo "     /etc/pam.d/polkit-1 (backed up):"
+  else
+    echo "  $n. Give polkit prompts a fingerprint line of their own: create"
+    echo "     /etc/pam.d/polkit-1 as a copy of $POLKIT_STACK, which it then replaces:"
+  fi
+  # Printed from the file itself, so it shows the include the line lands above.
+  pam_polkit_fprintd_line_add <"$POLKIT_STACK" | grep -A1 -xF "$PAM_POLKIT_FPRINTD_LINE" \
+    | sed -E 's/[[:space:]]+/ /g; 1s/^/     + /; 2s/^/       /'
   n=$((n + 1))
 fi
 if [ "${#unsafe_wired[@]}" -gt 0 ]; then
@@ -744,6 +899,11 @@ if [ "$FPRINTD_CONFLICT_FIX" = true ]; then
   echo
 fi
 
+if [ "$POLKIT_FPRINTD_ADD" = true ]; then
+  polkit_fprintd_add
+  echo
+fi
+
 echo "-- Login PAM stacks --"
 wired_stacks=()
 already_wired=()
@@ -912,6 +1072,16 @@ if [ "$fprintd_stack_installed" = true ] && pam_fprintd_in_shared_stack; then
     if fprintd_conflict_offer "${fprintd_installed_stacks[@]}"; then
       disable_fprintd_profile
       pam_fprintd_in_shared_stack && echo "Still there - see above." || true
+      # polkit has just lost its finger too, and 1f' did not ask about it:
+      # at plan time the shared stack still gave it one.
+      if ! pam_fprintd_in_shared_stack && polkit_fprintd_offerable; then
+        echo
+        if polkit_fprintd_offer "$POLKIT_STACK" true; then
+          polkit_fprintd_add
+        else
+          echo "Left as it is."
+        fi
+      fi
     else
       echo "Left alone."
     fi

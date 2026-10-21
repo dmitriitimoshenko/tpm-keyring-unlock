@@ -52,6 +52,16 @@ actually runs there, never skips.
   the question itself (`pam_fprintd_conflict_question`), which defaults to
   yes and so must state a cost whenever there is one. GitHub issue #19: the
   question used to promise that `sudo` keeps fingerprint.
+  And polkit's own fingerprint line, which `install.sh` offers when polkit
+  has none (`pam_polkit_fprintd_target`, `pam_polkit_fprintd_line_add` and
+  `_remove`). It lands directly above the shared stack's include in the
+  file libpam reads, the vendor one on the stock layout, and is found under
+  every include spelling. Any other shape is refused: an auth line before
+  the include, a different first include (Fedora's `auth include
+  system-auth`), a fingerprint line already there, a continuation, no auth
+  phase. Taking the line out gives the vendor file back byte for byte and
+  leaves README's hand-written line alone. With the line in place, polkit
+  drops out of the profile's cost and the attempt stack never takes the file.
   Also `tpm_handle_is_wellformed` and `tpm_primary_handle_dependents`, the
   two predicates `uninstall.sh` consults before evicting the TPM primary
   key that every user of the tool on a machine shares. Driven against a

@@ -6869,3 +6869,251 @@ replicated locally; `dpkg-parsechangelog` on Debian 13 reads the new entry;
 `rpmspec` on Fedora 44 reads the new `%changelog`; a `rpmbuild -bb` and a
 `dpkg-buildpackage -b` of the tree build, with the same `rpmlint` and
 `lintian` findings as before.
+
+## polkit prompts back to the password after the 2026-10-06 run: the named cost, and README's polkit recipe checked against polkitd 127's sandboxed helper (2026-10-09)
+
+The owner updated software from App Center and got GNOME Shell's polkit
+dialog ("Authentication is required to install, update, or remove
+packages") with a password field and no fingerprint prompt.
+
+**Not a regression.** The system journal at 13:38:16 has the whole chain.
+PackageKit asks for `org.freedesktop.packagekit.package-install-untrusted`
+(a nautilus update), polkitd starts `polkit-agent-helper@….service`, and the
+helper authenticates through the PAM service `polkit-1`. There is no
+`/etc/pam.d/polkit-1`, so libpam reads `/usr/lib/pam.d/polkit-1`, whose only
+auth line is `@include common-auth`. `common-auth` has had no `pam_fprintd`
+line since the 2026-10-06 run took the fprintd profile out: the marker
+`fprintd-pam-config-disabled` is from 21:00 that day, and the backup taken
+right before, `common-auth.bak-20261006205956`, still has the line. That
+run's question names this cost (on this machine "Fingerprint stops being
+offered in sudo -i and polkit prompts"), and it was accepted. `sudo` still
+takes a finger here only through the hand-added line in `/etc/pam.d/sudo`
+(2026-09-25 entry).
+
+**The disable survived an unattended pam-auth-update.** `common-auth` has
+mtime 13:40 today. In the same round of updates, `libpam-sss`
+2.12.0-1ubuntu5.5 ran `pam-auth-update` from its postinst. `/var/lib/pam/auth`
+still lists only unix, sss and capability, and the regenerated file has no
+fingerprint line. This is why the installer goes through `pam-auth-update
+--disable` instead of editing the file (2026-09-15): this upgrade would have
+silently undone a hand edit.
+
+**Would README's polkit recipe still work on 26.04?** It had not been
+checked against the way polkitd 127 runs the helper. The helper is a
+socket-activated service (`polkit-agent-helper@.service`,
+`--socket-activated`) with a hard sandbox, including `PrivateNetwork=yes`,
+`RestrictAddressFamilies=AF_UNIX`, `PrivateDevices=yes`,
+`DevicePolicy=strict` and `ProtectSystem=strict`. pam_fprintd needs no device
+node, only the system bus. That is a path-based `AF_UNIX` socket, which a
+private network namespace does not cut off. The journal confirms it works
+there. While `common-auth` carried the profile's line, the helper itself
+activated fprintd four times between 2026-08-13 and 2026-09-15:
+
+    dbus-daemon[1744]: [system] Activating via systemd: service name='net.reactivated.Fprint' unit='fprintd.service' requested by ':1.209' (uid=0 pid=22517 comm="/usr/lib/polkit-1/polkit-agent-helper-1 --socket-a" label="unconfined")
+
+That one, 2026-09-15 13:36:57, is an App Center snap install (pdfarranger).
+It took 3 s from helper start to snapd's "Installing snap", so it was a
+finger, not a typed password. fprintd is only activated when it is not
+already running, so four is a lower bound. Those runs used polkitd
+127-2ubuntu1. The 127-2ubuntu1.1 installed since 2026-09-16 changes only the
+helper's cookie parsing (CVE-2026-85498, per its changelog), not the unit. A
+`pam_fprintd` line in a separate `/etc/pam.d/polkit-1` runs in the same
+helper, so the recipe still works.
+
+**What the dialog does while it waits for a finger.** GNOME Shell 50's agent
+(`gresource extract /usr/lib/gnome-shell/libshell-18.so
+/org/gnome/shell/ui/components/polkitAgent.js`) creates the password entry
+hidden. It shows the entry only on a PAM `request`. pam_fprintd's "Place your
+finger" arrives as `show-info`, which only sets a label. So the dialog has no
+password field at all until pam_fprintd returns. With the recipe's bare
+`pam_fprintd.so` that takes up to 30 s or three mismatches. With the
+profile's former `max-tries=1 timeout=10` it was 10 s or one.
+
+**Done.** The recipe (README, "Keeping fingerprint for sudo and polkit
+anyway", step 3) was handed to the owner to run, since it needs root and
+changes `/etc/pam.d`. The insertion command was first dry-run twice on a
+copy of the vendor file: one line goes in, and the second run changes
+nothing. `dpkg -S /etc/pam.d/polkit-1` finds no owner here, so README's undo
+(deleting the copy) is safe on this release. Result: not yet tested.
+
+**Noticed, not changed.** The installer's question names what polkit loses
+and prints "Why: README.md." above it. Nothing points to the README section
+that gets it back. One line could.
+
+### Having the installer do it, weighed again (same day)
+
+The owner asked what it would cost to have the installer apply the recipe.
+Two of the three reasons from 2026-09-25 still hold. The default-yes reason
+depends on where the offer appears:
+
+- Offered only in the run that disables the profile, the line keeps
+  fingerprint in polkit for someone who had it a moment earlier. A
+  default-yes answer then changes nothing about who can authenticate and
+  how. Anywhere else it adds a way in, and there it must not be offered.
+- The maintenance costs are unchanged. The copy shadows
+  `/usr/lib/pam.d/polkit-1` until it is deleted, and the installer can
+  re-sync it only when it runs. On Ubuntu 22.04, `/etc/pam.d/polkit-1` is a
+  conffile, which has to be edited in place, not copied. Uninstall needs
+  proof that it made the copy and that nobody has changed it since. And it
+  covers polkit only: `sudo -i` and `su` still lose fingerprint, and giving
+  `sudo` a line means editing a conffile.
+
+**A different shape that avoids those costs, not built.** Keep fingerprint
+in `common-auth` but skip it for `gdm-password`, through the tool's own
+pam-auth-update profile in place of the stock `fprintd` one:
+
+    Auth-Type: Primary
+    Auth:
+    	[success=1 default=ignore]	pam_succeed_if.so service in gdm-password quiet
+    	[success=end default=ignore]	pam_fprintd.so max-tries=1 timeout=10
+
+`gdm-password` would then never claim the sensor, so the race with
+`gdm-fingerprint` (2026-09-15) is gone. Every other service keeps what the
+stock profile gave it, and the installer's question stops costing anything.
+
+pam-auth-update can carry the profile. `merge_one_line` rewrites only `end`
+(`$modline =~ s/end/$count/g`), so the literal `success=1` survives
+regeneration. That jump also stays inside the profile. A separate profile
+holding only the skip would be dangerous: once the fprintd profile was
+disabled, its jump would land on `pam_unix`, and password login through
+`gdm-password` would fail. The skip itself cannot let anyone in: in the auth
+phase a numeric jump records no result. That is why Debian's primary block
+ends with `pam_permit` "to prime the stack".
+
+Still open before it could be built:
+- whether GDM's smartcard stacks include `common-auth`;
+- what pam-auth-update does with `Conflicts:` when someone re-enables the
+  stock profile;
+- what the installer's own conflict check makes of a guarded line;
+- tests against a real pam-auth-update.
+
+No decision yet.
+
+## The installer offers polkit a fingerprint line of its own, Enter keeping it password-only (2026-10-21)
+
+The owner asked for a choice at install time: polkit as it is now
+(password-only once the fprintd profile is off, 2026-10-09), or with
+fingerprint for snap installs. The default is to be the current state.
+
+**What gets the line.** polkit only, through `/etc/pam.d/polkit-1`, which
+GDM never reads, so the greeter race of 2026-09-15 stays closed. `sudo` is
+left out: its file is a conffile, a finger there is root on a terminal, and
+it was not asked for.
+
+**Who is asked.** Offered two options, the owner chose "everyone whose polkit
+has no finger" over "only those this tool took it from". In code
+(`install.sh` 1f', `polkit_fprintd_offerable`): the shared stack has no
+`pam_fprintd` after this run (this run disables the profile, or it was never
+on), `pam_fprintd` knows `max-tries=` (`pam_fprintd_supports_attempt_options`),
+polkit's file has the shape below (`pam_polkit_fprintd_target`), and the user
+has a finger enrolled. The last one is `fprintd-list "$USER"`: its
+` - #N: finger` lines are a literal format string in fprintd 1.94.5
+(`strings /usr/bin/fprintd-list`) and come out untranslated under
+`LANG=ru_RU.UTF-8`. Without that check, every Ubuntu desktop would get a
+question about a reader it may not have. With the profile staying on, polkit
+already has a finger, and a second line would ask for it twice, so nobody is
+asked. The end-of-run check asks too, when it is the one that disables the
+profile, since at plan time polkit still had its finger.
+
+**The question against the [Y/n] rule.** Every prompt is `[Y/n]` and Enter
+accepts (2026-09-14, 2026-09-16), and here Enter has to change nothing. Asked
+which shape, the owner chose the inverted question, with the security cost in
+the text "if there is one":
+
+    Security: with it, an enrolled finger alone approves any of them,
+    installing software and other root-level changes included.
+    ...
+    Keep polkit prompts password-only? [Y/n]
+
+It goes through a new `declines()`, not `! confirm`. `confirm()` treats EOF as
+"no", which under `!` would add the line on EOF. `declines()` succeeds only on
+an explicit n/no. Rejected: a 1/2 menu (a new kind of prompt among the
+`[Y/n]`s) and `[y/N]` (breaks the rule outright).
+
+**The line.** `auth    sufficient      pam_fprintd.so max-tries=1 timeout=10`
+(`PAM_POLKIT_FPRINTD_LINE`). It is the profile's
+`[success=end default=ignore] ... max-tries=1 timeout=10` written for a
+service file, so a "no" gives polkit back exactly what it had before 2026-10-06.
+The 10 seconds matter more here than anywhere: GNOME Shell's polkit dialog
+shows no password field until `pam_fprintd` returns (2026-10-09). README's
+recipe keeps the bare `pam_fprintd.so`. The difference also keeps the two
+apart, which matters for uninstall.
+
+**Where it goes.** Directly above the first line that can run in the auth
+phase, and only if that line is an include (`@include`, `auth include` or
+`auth substack`, any case) of the shared stack. The file must also have no
+`pam_fprintd` line of its own and no continuation (`pam_polkit_fprintd_line_can_be_added`).
+Anything else is refused rather than guessed at. That also takes care of
+distributions without `common-auth`: Fedora's `auth include system-auth`
+fails the check, so the question never comes up there. Where libpam reads
+polkit from `/usr/lib/pam.d` (Ubuntu 24.04+, Debian 12), `/etc/pam.d/polkit-1`
+is created as the vendor file plus the line. It is written with `sudo install
+-m 0644`, not `cp`: the `mktemp` file is 0600, and a root-only polkit file is
+one this tool's own scans count as unreadable. Where `/etc/pam.d/polkit-1`
+already exists (Ubuntu 22.04 ships it), it is edited in place through
+`pam_file_write`, backed up. Before writing, the result has to have the line
+exactly once and give back the original file byte for byte with the line
+removed. Afterwards `pam_config_file polkit-1` has to resolve to the
+`/etc/pam.d` file.
+
+**Undo.** A marker in `$DATA_DIR`, `polkit-fprintd-line`, holds `copied` or
+`edited`, and only with it does `uninstall.sh` (new step 1b') touch the line.
+The same line written by hand is somebody's own, the rule the profile marker
+already follows. The copy itself is deleted only when the marker says
+`copied` and the copy, minus the line, is the vendor file byte for byte. The
+vendor path is looked up (`pam_config_file polkit-1 /usr/lib/pam.d`), never
+read from the marker: that file sits in a directory the account can write, and
+the path decides what gets deleted. Otherwise only the line goes, backed up,
+and when the copy has drifted from the vendor file, uninstall says so and
+prints the `diff` to run. Step 1b' runs before the profile re-enable, so the
+"would try the reader twice" list there is worked out without this line.
+
+**Not built.** Re-syncing the copy when polkit updates the vendor file. The
+question states that cost, and uninstall handles the drift. The guarded
+pam-auth-update profile from 2026-10-09 stays where it was: open questions,
+no decision.
+
+**Tests.** `test/unit-regex-test.sh`, 362 ok. New: the target and insertion
+on the stock 26.04 fixture tree, the round trip, every include spelling,
+seven refusals, and README's hand-written line surviving removal. With the
+copy in place, polkit drops out of the profile's cost and lands in the
+"asking twice" list, and `pam_fprintd_stack_is_eligible` refuses the file.
+One test was wrong at first: it expected polkit-1 to be the only "asking
+twice" entry, but the fixture tree's `shadowed` has a fingerprint line of its
+own. It now checks that polkit-1 is in the list.
+
+**On a real machine.** Run in a throwaway Ubuntu 26.04.1 VM (cloud image,
+polkitd 127-2ubuntu1.1, libpam-fprintd 1.94.5-4, no reader), with
+`install.sh`'s `declines`, `polkit_fprintd_offer` and `polkit_fprintd_add`, and
+`uninstall.sh`'s step 1b', taken from the checkout and run against the
+VM's own `/etc/pam.d`:
+
+- The answers: Enter, `y` and EOF keep polkit as it is, `n` and `No` add the line.
+- Vendor layout: `/etc/pam.d/polkit-1` is created `root:root 644`, is the
+  vendor file plus the line, and the marker says `copied`. With it, a pkexec
+  in the VM makes the helper activate fprintd
+  (`Activating via systemd: service name='net.reactivated.Fprint' ...
+  comm="/usr/lib/polkit-1/polkit-agent-helper-1 --socket-a"`), so the line is
+  live. A second add is refused, and the file still has one line.
+- Uninstall declined: nothing moves. Accepted: the copy is deleted, a
+  `.bak-` is left, and the marker is gone.
+- Pre-existing `/etc/pam.d/polkit-1`: it is edited in place, backed up first,
+  and the marker says `edited`. Uninstall gives it back with the same sha256.
+- The vendor file changed after the copy: uninstall keeps the copy, takes
+  out only the line, and prints the `diff`.
+- `common-auth` with `pam_fprintd` back (`pam-auth-update --enable fprintd`):
+  the add writes nothing.
+- polkit-1 still takes the password before, with the line, after, and when
+  edited (`pamtester polkit-1 ubuntu authenticate`: "successfully
+  authenticated"). A wrong password still fails.
+
+**Dead ends in that run.** Answering pkexec's `Password:` prompt straight
+away with `test/vm/pty-drive.py` always failed. A 1 s delay before the answer
+did not help either. The transcript showed why: the PAM part passes, and then
+the helper reports `error response to PolicyKit daemon:
+GDBus.Error:org.freedesktop.PolicyKit1.Error.Failed: No session for cookie`
+and pkexec exits 127. That happens on a VM nothing was changed on, and a wrong
+password also gives 127, so pkexec there could not show that the password
+still works. `pamtester polkit-1` can. Why polkitd loses the cookie was not
+looked into: it is not this tool's code, and it shows up with and without the
+line.

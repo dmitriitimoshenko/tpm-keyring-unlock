@@ -259,6 +259,55 @@ for f in /etc/pam.d/*; do
   fi
 done
 
+# --- 1b'. polkit's own fingerprint line ----------------------------------
+# install.sh adds it when asked to, so polkit's prompts take a finger without
+# the shared stack (bin/lib.sh, PAM_POLKIT_FPRINTD_LINE). Taken out on the
+# strength of install.sh's marker only, like the profile below: the same line
+# written by hand from README is somebody's own. Before the profile, so the
+# services its question says would try the reader twice are counted without
+# this line.
+POLKIT_PAM=/etc/pam.d/polkit-1
+POLKIT_MARKER="$DATA_DIR/$PAM_POLKIT_FPRINTD_MARKER"
+if [ -f "$POLKIT_MARKER" ]; then
+  if [ ! -f "$POLKIT_PAM" ] || ! grep -qxF "$PAM_POLKIT_FPRINTD_LINE" "$POLKIT_PAM"; then
+    # Gone already, by hand or by a polkit upgrade: nothing left to claim.
+    rm -f "$POLKIT_MARKER"
+  else
+    # Looked up, never read out of the marker: that lives in a directory this
+    # account can write, and the path decides which file gets deleted.
+    POLKIT_VENDOR="$(pam_config_file "$PAM_POLKIT_SERVICE" /usr/lib/pam.d || true)"
+    echo "install.sh gave polkit prompts a fingerprint line of their own in $POLKIT_PAM."
+    # The whole file goes only when it is provably install.sh's copy, nothing
+    # changed since: without the line it is the vendor file byte for byte, so
+    # deleting it changes nothing else about what libpam reads.
+    if grep -qx copied "$POLKIT_MARKER" && [ -n "$POLKIT_VENDOR" ] \
+      && pam_polkit_fprintd_line_remove <"$POLKIT_PAM" | cmp -s - <(awk 1 "$POLKIT_VENDOR"); then
+      echo "It is install.sh's copy of $POLKIT_VENDOR plus that line, unchanged since."
+      if confirm "Delete the copy, so polkit reads $POLKIT_VENDOR again and asks for the password?"; then
+        backup_pam_file "$POLKIT_PAM"
+        sudo rm -f "$POLKIT_PAM"
+        rm -f "$POLKIT_MARKER"
+        echo "Deleted (backed up as $POLKIT_PAM.bak-$RUN_TS)."
+      fi
+    else
+      if grep -qx copied "$POLKIT_MARKER"; then
+        echo "install.sh made it as a copy of ${POLKIT_VENDOR:-the vendor file}, and without the line"
+        echo "it no longer matches that file - polkit updated it, or somebody edited"
+        echo "this copy - so the copy stays and only the line goes. Compare them:"
+        echo "  diff ${POLKIT_VENDOR:-/usr/lib/pam.d/polkit-1} $POLKIT_PAM"
+      fi
+      if confirm "Remove the line? polkit prompts go back to the password."; then
+        REWRITTEN="$(mktemp)"
+        pam_polkit_fprintd_line_remove <"$POLKIT_PAM" >"$REWRITTEN"
+        pam_file_write "$POLKIT_PAM" "$REWRITTEN"
+        rm -f "$REWRITTEN" "$POLKIT_MARKER"
+        echo "Removed (previous content backed up as $POLKIT_PAM.bak-$RUN_TS)."
+      fi
+    fi
+    echo
+  fi
+fi
+
 # --- 1c. re-enable the fprintd pam-auth-update profile -------------------
 # install.sh disables it so the fingerprint attempt stack can actually get the
 # sensor (two PAM conversations, one reader - see bin/lib.sh and JOURNAL.md,
