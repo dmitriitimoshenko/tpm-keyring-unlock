@@ -4,7 +4,7 @@
 # directory to replace the checksum below with the real one, then
 # `makepkg --printsrcinfo > .SRCINFO`. Both are required by the AUR.
 pkgname=tpm-keyring-unlock
-pkgver=1.5.1
+pkgver=1.6.0
 pkgrel=1
 pkgdesc="TPM-backed unlock of the GNOME login keyring at login, incl. fingerprint logins"
 arch=('x86_64' 'aarch64')
@@ -21,7 +21,7 @@ options=('!debug')
 makedepends=('gcc' 'make')
 install="${pkgname}.install"
 source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
-sha256sums=('61102f788b81c89da3df55aef887ada76c6a7044aecc68a2f45e31a35dd84870')
+sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')
 
 build() {
   cd "${pkgname}-${pkgver}"

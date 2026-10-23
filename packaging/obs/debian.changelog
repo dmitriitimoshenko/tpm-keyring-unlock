@@ -1,3 +1,20 @@
+tpm-keyring-unlock (1.6.0-1) unstable; urgency=medium
+
+  * Release 1.6.0. See JOURNAL.md for the full history.
+  * tpm-keyring-unlock-configure can give polkit prompts (App Center and
+    snap installs, other admin actions) a fingerprint line of their own,
+    which the lock screen never reads. It is asked the other way round:
+    answer n at "Keep polkit prompts password-only?" to add the line,
+    Enter keeps polkit password-only. With it, an enrolled finger alone
+    approves root-level changes. tpm-keyring-unlock-deconfigure takes it
+    back out.
+  * Asked only where polkit prompts have no fingerprint and a finger is
+    enrolled. To be asked after upgrading, run
+    tpm-keyring-unlock-configure once more. Answer n at "Overwrite?" to
+    keep the sealed secret.
+
+ -- Dmitrii <dmitrii.timoshenko16@gmail.com>  Fri, 23 Oct 2026 10:56:16 +0200
+
 tpm-keyring-unlock (1.5.1-1) unstable; urgency=medium
 
   * Release 1.5.1. See JOURNAL.md for the full history.
