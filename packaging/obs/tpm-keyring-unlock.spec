@@ -3,7 +3,7 @@
 # Built by OBS from the tarball that _service pulls from the git tag.
 #
 Name:           tpm-keyring-unlock
-Version:        1.5.1
+Version:        1.6.0
 Release:        0
 Summary:        TPM-backed unlock of the GNOME login keyring at login
 License:        MIT
@@ -85,6 +85,17 @@ fi
 %{_bindir}/tpm-keyring-unlock-deconfigure
 
 %changelog
+* Fri Oct 23 2026 Dmitrii Timoshenko <dmitrii.timoshenko16@gmail.com> - 1.6.0-0
+- tpm-keyring-unlock-configure can give polkit prompts (App Center and snap
+  installs, other admin actions) a fingerprint line of their own, which the
+  lock screen never reads. It is asked the other way round: answer n at
+  "Keep polkit prompts password-only?" to add the line, Enter keeps polkit
+  password-only. With it, an enrolled finger alone approves root-level
+  changes. tpm-keyring-unlock-deconfigure takes it back out.
+- Asked only where polkit prompts have no fingerprint and a finger is
+  enrolled. To be asked after upgrading, run tpm-keyring-unlock-configure
+  once more. Answer n at "Overwrite?" to keep the sealed secret.
+
 * Tue Oct 06 2026 Dmitrii Timoshenko <dmitrii.timoshenko16@gmail.com> - 1.5.1-0
 - Fedora: tpm-keyring-unlock-configure now wires gdm-fingerprint, which
   ships with no keyring line, adding the keyring lines with the module

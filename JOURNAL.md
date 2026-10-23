@@ -7117,3 +7117,56 @@ password also gives 127, so pkexec there could not show that the password
 still works. `pamtester polkit-1` can. Why polkitd loses the cookie was not
 looked into: it is not this tool's code, and it shows up with and without the
 line.
+
+## Release 1.6.0 (2026-10-23)
+
+Carries #26 to the packages: `tpm-keyring-unlock-configure` can give polkit
+prompts (App Center and snap installs, other admin actions) a fingerprint
+line of their own, asked the other way round so that Enter keeps them
+password-only. Until this release the packages had only the README recipe
+for that, which never runs by itself.
+
+**Why 1.6.0.** The repo owner's call. It fits: 1.5.1 fixed what the tool
+already claimed to do, while this adds a step the tool never took before,
+and the only step that adds a way in rather than wiring the keyring.
+
+**The changelogs** say what the question does, what it costs (an enrolled
+finger alone then approves root-level changes) and where it is asked: only
+where polkit's prompts have no fingerprint, the reader takes the attempt
+options, and the user has an enrolled finger. They say how to be asked
+after an upgrade: run `tpm-keyring-unlock-configure` once more. Two
+questions in that run take `n` for opposite reasons, so the notes name both
+by their text: `n` at "Keep polkit prompts password-only?" adds the line,
+`n` at "Overwrite?" keeps the sealed secret. README's install section got
+the first one in capitals in #26, at the owner's request. It names the
+question by its text rather than calling it the first one: on some
+machines the reader's attempts (1e) or the greeter conflict (1f) are asked
+before it, and an `n` there declines those instead.
+
+**Not changed for packages.** Removing a package still leaves PAM alone,
+the polkit line included: `tpm-keyring-unlock-deconfigure` is what takes it
+out, as with every other line (packaging/README.md). A copy left behind
+after a removal keeps working, since `pam_fprintd` belongs to
+libpam-fprintd, not to this package.
+
+**The CI hiccups on #26.** Two jobs failed on the README commit, both
+before anything of ours ran. `packaging (opensuse)` stopped after 12
+seconds: the Tumbleweed image's zypper got `Access to requested URL is
+forbidden. Curl error (22)` from `openSUSE-Tumbleweed-Oss`, skipped the
+repository, and then found no `gcc`, `pam-devel` or `tpm2.0-tools`. The VM
+job sat in its `apt-get install swtpm ... qemu-system-x86` step for 14
+minutes - `azure.archive.ubuntu.com` was serving tens of kB/s, two minutes
+for the 11.2 MB qemu-system-x86 alone - where the whole run normally takes
+three, and was cancelled by hand. Mirrors, not the code: the same commit's
+arch, debian, fedora and ubuntu builds and the PAM runtime job passed, and
+`gh run rerun --failed` turned both green without a change.
+
+**Where else it goes.** As for every earlier tag, the GitHub release is
+written by hand with the upgrade note on top; the workflow tags, pins the
+AUR checksum and publishes to the Build Service.
+
+Checked before the PR: the release workflow's five-file version check,
+replicated locally; `dpkg-parsechangelog -l packaging/obs/debian.changelog
+-S Version` reads `1.6.0-1`; `rpmspec -q` reads `1.6.0-0` and `rpmspec -P`
+shows the new `%changelog` entry on top. The packaging jobs of this PR
+build both packages from them.
