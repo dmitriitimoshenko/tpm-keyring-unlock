@@ -37,6 +37,9 @@ cd tpm-keyring-unlock
 ./install.sh
 ```
 
+**WANT FINGERPRINT FOR POLKIT PROMPTS (APP CENTER, SNAP INSTALLS)? ANSWER `n`
+TO `Keep polkit prompts password-only?`**
+
 The installer prints its whole plan first: packages to install, the group
 change, and the exact PAM diffs it would apply, with every file backed up. It
 asks once before touching anything, and Enter accepts. The one optional step
