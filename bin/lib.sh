@@ -1135,6 +1135,100 @@ pam_shared_stack_is_sane_without_fprintd() {
     < <(_pam_logical_lines "$shared")
 }
 
+# --- polkit's own fingerprint line ----------------------------------------
+#
+# With pam_fprintd out of the shared stack, polkit's prompts take a password
+# only: App Center and snap installs, and every other admin action a desktop
+# asks about. A pam_fprintd line in polkit's own file gives fingerprint back
+# to polkit alone, and stays out of the greeter race above - gdm-password
+# never reads that file, and pam_fprintd_stack_is_eligible() refuses it,
+# since it includes the shared stack. The line adds a way to approve admin
+# actions, so install.sh offers it with "leave polkit as it is" as the answer
+# Enter gives. README's polkit recipe is the same line by hand. See
+# JOURNAL.md, 2026-10-09 and 2026-10-21.
+
+PAM_POLKIT_SERVICE=polkit-1
+
+# What the fprintd profile put into the shared stack - one try, a 10-second
+# wait - spelled the way a service file spells it: `sufficient` is what the
+# profile's [success=end default=ignore] means outside a pam-auth-update block.
+# The wait counts for more in polkit than anywhere else: GNOME Shell's dialog
+# shows no password field until pam_fprintd returns (JOURNAL.md, 2026-10-09).
+# The exact text is how uninstall.sh finds the line again.
+PAM_POLKIT_FPRINTD_LINE='auth    sufficient      pam_fprintd.so max-tries=1 timeout=10'
+
+# Basename of the marker install.sh writes in $DATA_DIR once it has added the
+# line, holding "copied" when it made /etc/pam.d/polkit-1 as a copy of the
+# vendor file and "edited" when it changed a file that was already there. Its
+# presence is the only thing that lets uninstall.sh take the line out, the
+# same rule PAM_FPRINTD_PROFILE_MARKER follows.
+PAM_POLKIT_FPRINTD_MARKER="polkit-fprintd-line"
+
+# Succeeds if the polkit service file $1 is one install.sh may add the line
+# to: no continuation whose meaning depends on the libpam version, no
+# pam_fprintd line of its own, and an auth phase that opens with an include
+# of the shared stack $2, resolved on $3 (default PAM_CONFIG_PATH). The line
+# goes directly above that include, so the only thing it changes is that the
+# reader is asked before the shared stack's password. That is the shape every
+# Debian and Ubuntu polkit-1 has; anything else is refused rather than guessed
+# at - including any file whose first include is not the shared stack, which
+# on a distribution without common-auth is every file.
+pam_polkit_fprintd_line_can_be_added() {
+  local f="$1" shared="${2:-$PAM_SHARED_AUTH_STACK}" path="${3:-$PAM_CONFIG_PATH}"
+  local lines line inc
+  { [ -f "$f" ] && [ -r "$f" ]; } || return 1
+  pam_config_has_no_line_continuations "$f" || return 1
+  lines="$(_pam_logical_lines "$f")" || return 1
+  ! grep -qE "$PAM_FPRINTD_AUTH_RE" <<<"$lines" || return 1
+  while IFS= read -r line; do
+    [[ "$line" =~ ^[[:space:]]*(@include|-?auth)[[:space:]] ]] || continue
+    inc="$(_pam_include_target "$line")" || return 1
+    [ "$(pam_config_file "$inc" "$path")" = "$shared" ]
+    return
+  done <<<"$lines"
+  return 1
+}
+
+# Prints the file libpam reads for polkit, found on $1 (default
+# PAM_CONFIG_PATH), when pam_polkit_fprintd_line_can_be_added() accepts it
+# against the shared stack $2. Fails, printing nothing, otherwise.
+pam_polkit_fprintd_target() {
+  local path="${1:-$PAM_CONFIG_PATH}" shared="${2:-$PAM_SHARED_AUTH_STACK}" f
+  f="$(pam_config_file "$PAM_POLKIT_SERVICE" "$path")" || return 1
+  pam_polkit_fprintd_line_can_be_added "$f" "$shared" "$path" || return 1
+  printf '%s\n' "$f"
+}
+
+# Writes the polkit file on stdin to stdout with PAM_POLKIT_FPRINTD_LINE
+# directly above the first line that can run in the auth phase - the include
+# pam_polkit_fprintd_line_can_be_added() looked at. Comments are cut before
+# the match and keywords matched in any case, as libpam reads them.
+pam_polkit_fprintd_line_add() {
+  awk -v add="$PAM_POLKIT_FPRINTD_LINE" '
+    !done {
+      l = $0
+      sub(/#.*/, "", l)
+      if (tolower(l) ~ /^[[:space:]]*(@include|-?auth)[[:space:]]/) { print add; done = 1 }
+    }
+    { print }'
+}
+
+# The reverse: the file on stdin without the line, every other line as it was.
+pam_polkit_fprintd_line_remove() {
+  awk -v drop="$PAM_POLKIT_FPRINTD_LINE" '$0 != drop'
+}
+
+# Succeeds if the user $1 has a finger enrolled with fprintd - nobody else has
+# a use for polkit's line. fprintd-list's " - #N: finger" lines are not
+# translated (fprintd 1.94.5). Captured before grep reads it, for the reason
+# _pam_logical_lines() gives about grep -q at the end of a pipe.
+fprintd_user_has_enrolled_finger() {
+  local out
+  command -v fprintd-list >/dev/null 2>&1 || return 1
+  out="$(timeout 10 fprintd-list "$1" 2>/dev/null || true)"
+  grep -qE '^ - #[0-9]+: ' <<<"$out"
+}
+
 # --- the machine-wide TPM primary handle ---------------------------------
 #
 # bin/seal.sh persists the TPM primary key at ONE fixed handle shared by

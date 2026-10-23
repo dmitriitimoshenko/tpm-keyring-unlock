@@ -670,6 +670,125 @@ check "...in the singular too" \
 check "...and is bare only when nothing is lost" \
   "$(pam_fprintd_conflict_question "" 0)" "Fix the lock screen?"
 
+# --- polkit's own fingerprint line (2026-10-21) ----------------------------
+# install.sh offers it to whoever has polkit without a finger. It goes above
+# the include of the shared stack in the file libpam reads for polkit - the
+# vendor file, copied into /etc/pam.d, on the stock 26.04 layout - and only
+# into a file of that shape.
+POLKIT_WORK="$WORKDIR/polkit"
+mkdir -p "$POLKIT_WORK"
+
+check "stock layout: polkit's line goes into the vendor file libpam reads" \
+  "$(pam_polkit_fprintd_target "$VENDOR_PATH" "$VENDOR/etc/common-auth")" \
+  "$VENDOR/usr-lib/polkit-1"
+
+pam_polkit_fprintd_line_add <"$VENDOR/usr-lib/polkit-1" >"$POLKIT_WORK/added"
+check "the line lands directly above the shared stack's include" \
+  "$(grep -A1 -xF "$PAM_POLKIT_FPRINTD_LINE" "$POLKIT_WORK/added" | tail -1)" \
+  "@include common-auth"
+check "...exactly once" "$(grep -cxF "$PAM_POLKIT_FPRINTD_LINE" "$POLKIT_WORK/added")" "1"
+if pam_polkit_fprintd_line_remove <"$POLKIT_WORK/added" | cmp -s - "$VENDOR/usr-lib/polkit-1"; then
+  got=identical
+else
+  got=different
+fi
+check "taking the line out gives back the vendor file byte for byte" "$got" "identical"
+
+# The stock tree with install.sh's copy in /etc/pam.d.
+POLKIT_TREE="$POLKIT_WORK/copied"
+mkdir -p "$POLKIT_TREE/etc"
+cp "$VENDOR/etc/"* "$POLKIT_TREE/etc/"
+cp "$POLKIT_WORK/added" "$POLKIT_TREE/etc/polkit-1"
+POLKIT_TREE_PATH="$POLKIT_TREE/etc:$VENDOR/usr-lib"
+
+if pam_polkit_fprintd_target "$POLKIT_TREE_PATH" "$POLKIT_TREE/etc/common-auth" >/dev/null; then
+  got=offered
+else
+  got=refused
+fi
+check "a polkit that has the line is not offered it again" "$got" "refused"
+mapfile -t losers < <(pam_fprintd_services_losing_fingerprint \
+  "$POLKIT_TREE/etc/common-auth" "$POLKIT_TREE_PATH")
+case " ${losers[*]} " in *"/polkit-1 "*) got=listed ;; *) got=absent ;; esac
+check "with the line, polkit is out of the profile's cost" "$got" "absent"
+check "...and the question names sudo alone" \
+  "$(pam_fprintd_shared_stack_prompts "$POLKIT_TREE/etc/common-auth" "$POLKIT_TREE_PATH")" \
+  "sudo"
+mapfile -t twice < <(pam_fprintd_services_asking_twice \
+  "$POLKIT_TREE/etc/common-auth" "$POLKIT_TREE_PATH")
+case " ${twice[*]} " in *" $POLKIT_TREE/etc/polkit-1 "*) got=listed ;; *) got=absent ;; esac
+check "with the profile back, uninstall.sh's twice-list names the copy" "$got" "listed"
+if pam_fprintd_stack_is_eligible "$POLKIT_TREE/etc/polkit-1"; then got=eligible; else got=refused; fi
+check "the attempt stack never takes polkit's file: it includes the shared stack" \
+  "$got" "refused"
+
+# A release that ships /etc/pam.d/polkit-1 itself (Ubuntu 22.04's shape): the
+# file is edited where it is.
+POLKIT_ETC="$POLKIT_WORK/etc-only"
+mkdir -p "$POLKIT_ETC"
+cp "$VENDOR/etc/common-auth" "$POLKIT_ETC/"
+printf '%s\n' '#%PAM-1.0' '' '@include common-auth' '@include common-account' \
+  '@include common-password' \
+  'session       required   pam_env.so readenv=1 user_readenv=0' \
+  '@include common-session-noninteractive' >"$POLKIT_ETC/polkit-1"
+check "a polkit-1 already in /etc/pam.d is the file the line goes into" \
+  "$(pam_polkit_fprintd_target "$POLKIT_ETC" "$POLKIT_ETC/common-auth")" \
+  "$POLKIT_ETC/polkit-1"
+
+# Every spelling libpam accepts for the include is found, and the line goes
+# above it, comments and blank lines before it left where they were.
+for include in "@INCLUDE common-auth" "auth include common-auth" \
+  "AUTH Substack common-auth" "@include common-auth # a comment"; do
+  printf '%s\n' '#%PAM-1.0' '# a comment' '' "$include" '@include common-account' \
+    >"$POLKIT_ETC/polkit-1"
+  if pam_polkit_fprintd_target "$POLKIT_ETC" "$POLKIT_ETC/common-auth" >/dev/null; then
+    got="$(pam_polkit_fprintd_line_add <"$POLKIT_ETC/polkit-1" | sed -n 4,5p | tr '\n' '|')"
+  else
+    got=refused
+  fi
+  check "polkit's line goes above: $include" "$got" "$PAM_POLKIT_FPRINTD_LINE|$include|"
+done
+
+# Refused: any other shape, and a file that has fingerprint already.
+refuse_polkit() {
+  local desc="$1"
+  shift
+  printf '%s\n' "$@" >"$POLKIT_ETC/polkit-1"
+  if pam_polkit_fprintd_target "$POLKIT_ETC" "$POLKIT_ETC/common-auth" >/dev/null; then
+    got=offered
+  else
+    got=refused
+  fi
+  check "polkit's line is refused: $desc" "$got" "refused"
+}
+refuse_polkit "an auth module before the include" \
+  'auth required pam_env.so' '@include common-auth'
+refuse_polkit "a first include that is not the shared stack (Fedora's shape)" \
+  'auth include system-auth'
+refuse_polkit "an include of something else first" \
+  '@include common-account' '@include common-auth'
+refuse_polkit "a fingerprint line of its own (README's recipe)" \
+  'auth    sufficient    pam_fprintd.so' '@include common-auth'
+refuse_polkit "a fingerprint line below the include" \
+  '@include common-auth' 'auth sufficient pam_fprintd.so'
+refuse_polkit "a line continuation" \
+  'auth \' '  include common-auth'
+refuse_polkit "no auth phase at all" \
+  'session required pam_env.so'
+if pam_polkit_fprintd_target "$FORMS" "$FORMS/common-auth" >/dev/null; then
+  got=offered
+else
+  got=refused
+fi
+check "polkit's line is refused: a polkit answered by other's auth phase" "$got" "refused"
+
+# uninstall.sh takes out its own line only, never README's hand-written one.
+printf '%s\n' "$PAM_POLKIT_FPRINTD_LINE" 'auth    sufficient    pam_fprintd.so' \
+  '@include common-auth' >"$POLKIT_ETC/polkit-1"
+check "taking the line out leaves a hand-written fingerprint line alone" \
+  "$(pam_polkit_fprintd_line_remove <"$POLKIT_ETC/polkit-1" | tr '\n' '|')" \
+  "auth    sufficient    pam_fprintd.so|@include common-auth|"
+
 # --- the machine-wide TPM primary handle ----------------------------------
 # bin/lib.sh's tpm_handle_is_wellformed / tpm_primary_handle_dependents, which
 # is what uninstall.sh now consults before evicting a handle every user of the

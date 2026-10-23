@@ -37,10 +37,14 @@ cd tpm-keyring-unlock
 ./install.sh
 ```
 
+**WANT FINGERPRINT FOR POLKIT PROMPTS (APP CENTER, SNAP INSTALLS)? ANSWER `n`
+TO `Keep polkit prompts password-only?`**
+
 The installer prints its whole plan first: packages to install, the group
 change, and the exact PAM diffs it would apply, with every file backed up. It
-asks once before touching anything, and Enter accepts. It will not run without
-a terminal.
+asks once before touching anything, and Enter accepts. The one optional step
+that adds a way in, fingerprint for polkit prompts, is asked the other way
+round, so Enter leaves it out. It will not run without a terminal.
 
 Sealing the keyring password is part of that run: the installer calls
 `bin/seal.sh` itself, which asks for the password in this same terminal. You
@@ -320,10 +324,29 @@ accept. The installer works out which services lose it from your files,
 `/usr/lib/pam.d` included, which is where Ubuntu 26.04 keeps polkit's, and
 names `sudo` and polkit in the question when they are among them.
 
+polkit can get its finger back in the same run. polkit prompts are App Center
+and snap installs and the other admin actions a desktop asks about. When they
+have no fingerprint, either because this run takes it away or because the
+profile was never on, and you have a finger enrolled, the installer asks:
+
+```
+Keep polkit prompts password-only? [Y/n]
+```
+
+Enter keeps them password-only. `n` makes step 3 of the recipe below: the line
+the profile used to put into `common-auth` (one try, 10 seconds) goes above the
+`@include common-auth` in `/etc/pam.d/polkit-1`. GDM never reads that file, so
+the lock screen keeps its retries. Where polkit's file lives in
+`/usr/lib/pam.d`, the installer creates the copy in `/etc/pam.d`, with the
+costs listed below the recipe. `uninstall.sh` takes the line out again. It
+deletes the copy only when the copy is still the vendor file plus that line,
+byte for byte.
+
 ### Keeping fingerprint for `sudo` and polkit anyway
 
 You can give `sudo` and polkit a fingerprint line of their own, so they stop
-depending on the profile. The tool does not do this for you. With
+depending on the profile. The tool never does this for `sudo`, and does it
+for polkit only when you answer `n` to the question above. With
 `sufficient`, a finger alone is enough to become root, and whether that is
 acceptable on your machine is your call, not an installer's. A mistake in
 these files can lock you out of `sudo`, so keep a root shell open until you
