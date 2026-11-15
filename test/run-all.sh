@@ -34,6 +34,16 @@ else
   record "regex/detection" FAIL
 fi
 
+echo
+echo "########################################"
+echo "# power-button LED watcher (no container)"
+echo "########################################"
+if test/led-test.sh; then
+  record "power-button LED" PASS
+else
+  record "power-button LED" FAIL
+fi
+
 if ! command -v docker >/dev/null 2>&1; then
   echo
   echo "docker not found - skipping the container-based tests (runtime" >&2

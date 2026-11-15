@@ -76,6 +76,12 @@ fi
 # Loaded by tpm-keyring-unlock-configure on SELinux systems, never here.
 %{_libexecdir}/%{name}/tpm_keyring_unlock.cil
 %{_libexecdir}/%{name}/seal.sh
+# The optional power-button LED service. tpm-keyring-unlock-configure installs
+# the last three into /etc on a Framework laptop, when asked to; never here.
+%{_libexecdir}/%{name}/tpm-keyring-led
+%{_libexecdir}/%{name}/tpm-keyring-led.service
+%{_libexecdir}/%{name}/90-tpm-keyring-led.rules
+%{_libexecdir}/%{name}/tpm-keyring-led.sysusers
 %{_libexecdir}/%{name}/configure.sh
 %{_libexecdir}/%{name}/deconfigure.sh
 # root-only: it unseals the keyring password and is executed by PAM as root.

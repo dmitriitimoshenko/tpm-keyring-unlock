@@ -10,6 +10,9 @@
   can't drift out of sync on things like the PAM module directory
   candidate list or the PAM-line detection regex).
 - `pam/` — the PAM module source and its root-owned helper script.
+- `led/` — the optional power-button LED service for Framework laptops: the
+  watcher, its systemd unit, udev rule and sysusers file. Nothing to do with
+  the keyring; `install.sh` offers it on a Framework laptop only.
 - `packaging/` — distribution packaging: `obs/` (the spec and the
   `debian.*` files, both consumed by one Open Build Service package) and
   `aur/` (`PKGBUILD` for Arch). `packaging/README.md` explains what a
@@ -31,6 +34,7 @@
 ```bash
 make test        # everything; or: test/run-all.sh
 make test-regex  # just the PAM-line detection regex (no docker needed)
+make test-led    # just the power-button LED watcher (no docker needed)
 make test-runtime    # just the PAM module's runtime behavior
 make test-packaging  # just the per-distro dependency/compile/detection checks
 make test-vm      # real TPM/Secure Boot round trip in a VM (opt-in, see below)
@@ -64,6 +68,7 @@ also covers.
   matters: whatever one sets up, the other should be able to tear down.
 - If you touch anything in `bin/lib.sh`, re-run `make test` — both the
   detection regex test and every per-distro container depend on it.
+- If you touch anything under `led/`, run `make test-led`.
 - If you touch `pam/pam_tpm_keyring_authtok.c`, run `make test-runtime` at
   minimum; it's the only thing that exercises the module's actual
   fork/exec/timeout logic rather than just compiling it.

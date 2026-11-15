@@ -724,9 +724,11 @@ if [ "$B1_OK" -eq 1 ]; then
     echo
     echo "-- install.sh end to end (real TPM, fixture PAM stack) --"
     # selinux/ too: `make install` below ships the policy module, even on a
-    # machine without SELinux, where nothing ever loads it.
+    # machine without SELinux, where nothing ever loads it. led/ for the same
+    # reason: it ships the power-button LED service, which install.sh never
+    # offers here - the VM is no Framework laptop, so no prompt may appear.
     vm_scp "$B2_SSHPORT" -r "$REPO_DIR/install.sh" "$REPO_DIR/uninstall.sh" \
-      "$REPO_DIR/Makefile" "$REPO_DIR/selinux" "ubuntu@127.0.0.1:~/tpm-keyring-unlock/"
+      "$REPO_DIR/Makefile" "$REPO_DIR/selinux" "$REPO_DIR/led" "ubuntu@127.0.0.1:~/tpm-keyring-unlock/"
     vm_scp "$B2_SSHPORT" "$REPO_DIR/test/fixtures/pam.d/shared/gdm-password" \
       "ubuntu@127.0.0.1:~/gdm-password.fixture"
 

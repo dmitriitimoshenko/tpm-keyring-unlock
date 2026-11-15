@@ -7170,3 +7170,392 @@ replicated locally; `dpkg-parsechangelog -l packaging/obs/debian.changelog
 -S Version` reads `1.6.0-1`; `rpmspec -q` reads `1.6.0-0` and `rpmspec -P`
 shows the new `%changelog` entry on top. The packaging jobs of this PR
 build both packages from them.
+
+## The power button blinks while the reader waits: an optional service for Framework laptops (2026-11-15)
+
+*Partly superseded the same evening by the next entry, after a code review:
+the watcher no longer writes `chromeos-auto` to an LED it did not take,
+`--restore` acts on a note only, the udev rule fires on `add` only, a failed
+update puts the earlier version back instead of removing it, and the install
+code moved from install.sh into bin/lib.sh. The rest stands.*
+
+The repo owner asked for what
+[framework-fingerprint-led-blink](https://github.com/alejandroqh/framework-fingerprint-led-blink)
+(alejandroqh, Apache-2.0) does, offered as an optional step of the install:
+blink the power-button LED while fprintd waits for a finger. On a Framework
+laptop the reader is in that button, and nothing shows when it is listening.
+Added mid-task, also the owner's: offer it **only** on a Framework that has
+that LED. It has nothing to do with the keyring; it lives here because this
+is where the owner's fingerprint setup lives. README.md, "Power-button LED".
+
+**Read before anything was written.** The upstream repo was cloned at
+`445e984` into a scratch directory and read whole: a Python watcher, a
+systemd unit, a udev rule, a sysusers file, an installer. Its design is what
+was taken over, because each part of it is the right call:
+
+- `gdbus monitor --system --dest net.reactivated.Fprint` subscribes to
+  signals from the current owner of fprintd's name only. The bus stamps the
+  sender, so a local user cannot fake them. It needs no privilege, which
+  `busctl monitor` / `dbus-monitor` do.
+- It blinks on fprintd's own `finger-needed` device property (fprintd 1.92+),
+  paused while `finger-present` is true, and hands the LED back to the EC
+  with its `chromeos-auto` trigger.
+- `DynamicUser=` with no capabilities, plus a udev rule that gives one group
+  write access to the LED's `trigger`, `brightness` and `multi_intensity`.
+
+**Why a rewrite in bash, not a copy or a download.** Three ways were weighed:
+
+- *Fetch upstream at install time* - rejected first. That runs whatever is at
+  a third party's HEAD as root, on every install. CLAUDE.md's first rule.
+- *Vendor upstream's files* - Apache-2.0 code in an MIT repo is allowed, but
+  every packaging recipe's license field and `debian.copyright` would turn
+  mixed. It would also make Python a runtime dependency of a tool that is
+  otherwise bash and C, and tie this repo to a Python program it does not own.
+- *Own implementation, same design* - chosen. `led/tpm-keyring-led.sh` was
+  written for this repo and shares no code with upstream; the credit is in
+  its header and in README. One deliberate difference: `read -t` is the
+  clock. Every half period with no line from gdbus is a toggle, so one
+  process does what upstream does with a thread.
+
+**Who is asked** (`bin/lib.sh`, `framework_power_led`). Every condition is
+one the feature needs, and together they are the owner's "only a Framework
+with that blinking button":
+
+- DMI `sys_vendor` is `Framework` and `product_name` starts with `Laptop`.
+  Every Framework laptop so far keeps the reader in the power button, and the
+  first 13s are named plain `Laptop`. The Desktop has no reader there.
+  Chromebooks run the same ChromeOS EC and can expose the same LED with no
+  reader in the button.
+- `chromeos:white:power` exists, or the older 13's `chromeos:multicolor:power`
+  (the same two, in the same order, the watcher looks for).
+- The LED offers the `chromeos-auto` trigger. Without it the watcher could
+  take the LED and never give it back, so it never touches such an LED.
+- The user has a finger enrolled (`fprintd_user_has_enrolled_finger`, as the
+  polkit offer uses). Nothing to wait for otherwise.
+- framework-fingerprint-led-blink's unit is not installed. Two blinkers on one
+  LED would fight; the run says so in one line instead of asking.
+- `gdbus` is there, or the package manager can add it: `libglib2.0-bin`,
+  `glib2` (dnf and pacman), `glib2-tools` (zypper). Each was checked in that
+  distro's container (`dnf provides`, `zypper se --provides`, `pacman -F`)
+  and with `dpkg -S` here. Package-manager detection moved out of 1a for it.
+  It is now looked up whether or not anything is missing, in the same order.
+
+**The question is `[Y/n]`, Enter installs.** The standing rule (2026-09-14,
+2026-09-16): every prompt defaults to yes, so a run can be held through with
+Enter. The polkit question is the one asked the other
+way round, because its yes adds a way to approve root actions. This adds no
+way in: it changes nothing about who authenticates, only what the LED shows.
+What it does give out is in the plan line: a group that may write that LED.
+
+**The unit** (`led/tpm-keyring-led.service`), and how it differs from
+upstream's:
+
+- `SystemCallErrorNumber=EPERM` added, so a syscall the filter refuses
+  returns an error instead of killing the service. Neither bash nor gdbus
+  makes one under the test below, but a future glibc that does should get an
+  error, not a SIGSYS restart loop.
+- `ExecStopPost=-<watcher> --restore`. A mode of the watcher itself instead
+  of a shell loop in the unit, and allowed to fail (the `-`), so a watcher
+  that is gone does not turn the stop into a failure.
+- `ConditionPathExists=<watcher>`. A package removed without the deconfigure
+  step takes the watcher with it; the unit then stays out of the way instead
+  of failing at every boot.
+- Not `ProtectKernelTunables=`: it makes `/sys` read-only, LED included.
+  The test suite checks it stays out.
+- `systemd-analyze security --offline=true` on the rendered unit: **0.6
+  SAFE**, upstream's figure. `systemd-analyze verify`: clean.
+
+**Install, and how it fails.** `led_service_install` in install.sh runs last,
+after SELinux, and is never fatal: the keyring work before it stands either
+way. Each step is checked, because a failure rolls back to *no* service.
+A udev rule handing the LED to a group, with nothing running to show for it,
+is access given for nothing. After the rule is applied (`udevadm trigger
+--action=change` on the LED), the attributes must read group `tpm-keyring-led`
+with group write. The service must keep the same MainPID across 3 s, past its
+`RestartSec=2`: a crash loop still reads "active" right after a restart.
+Both checks are upstream's. A packaged watcher must be root's and not group-
+or other-writable before a unit points at it. The unit's path goes through
+`led_unit_render`, which refuses anything but a plain absolute path. It lands
+unquoted in `ExecStart=` and in a sed replacement.
+
+A later run compares the installed files with the ones it carries. When they
+differ it plans an update, without asking again, the way wired stacks are
+re-checked. It leaves a service the owner disabled by hand disabled.
+
+**Uninstall** (step 2c) acts only on a unit whose first line is the marker
+`# tpm-keyring-unlock: power-button LED`. A unit by that name without it is
+somebody else's. `led_service_remove` stops the service first, so its
+ExecStopPost hands the LED back. It resets only the attributes that still
+carry `tpm-keyring-led`, so a group someone else gave them stays, and then
+deletes the group. The watcher is deleted only from `/usr/local/sbin`; a
+package's copy belongs to the package manager.
+
+**Packages** ship the watcher (0755) and the three data files (0644) in the
+libexec directory, out of `dh_fixperms` like the `.cil`. Nothing is installed
+or enabled by the package. No removal scriptlet takes the `/etc` copies out,
+unlike the SELinux module. That module widens a security domain for nothing
+once the helper is gone. The leftovers here give one LED to a group nothing
+runs as, which is untidy, not unsafe, and `ConditionPathExists=` keeps the
+unit quiet. packaging/README.md says to run the deconfigure step first, as it
+already did for the PAM lines.
+
+**A bug the new test caught before anything ran for real.** The first loop
+read `if ! IFS= read -r -t "$HALF" ...; then rc=$?`. After `if !`, `$?` is the
+negation's status, 0, so the first blink tick was taken for the end of
+gdbus's output. The watcher stopped the moment it started blinking. The log
+said `tpm-keyring-led: gdbus monitor exited` right after the
+`finger-needed: <true>` line. 17 of the first 22 checks failed, and the run
+died at the SIGTERM check, whose watcher had already exited. Now `rc=0; read ...
+|| rc=$?`, with a comment saying why.
+
+**A test failure that was the fake.** A plain file is not sysfs. Sysfs reads
+`trigger` back as the whole list, the active one bracketed (`[none] ...
+chromeos-auto ...`). A file holds the last word written. The first `--restore`
+check wrote plain `none`, and the watcher, correctly, refused an LED that does
+not offer `chromeos-auto`. The fixture now writes what sysfs would. The test
+header names the difference.
+
+**Process substitution replaced by a coprocess.** `exec {mon}< <(gdbus ...)`
+opens `/dev/fd/63`, and `PrivateDevices=` gives the service a `/dev` of its
+own. systemd's private `/dev` should have the `/dev/fd` link, but nothing
+here could show it without root. A `coproc` is plain pipes and needs no
+`/dev/fd`. Its descriptor is copied at once, because bash unsets `MON` once
+it has reaped gdbus.
+
+**Observed on this machine** (Framework Laptop 13, Ryzen AI 300; Ubuntu
+26.04.1; fprintd 1.94.5-4; glib 2.88.0; systemd 259.9; bash 5.3.9):
+
+- The LED is `chromeos:white:power`, `max_brightness` 100, triggers list ends
+  `[chromeos-auto]`. It is a multicolour-class LED with one channel:
+  `multi_index` `white`, `multi_intensity` `100`. The watcher picks colours
+  only with two channels or more, so it leaves this one alone.
+- `gdbus monitor --dest` *activates* fprintd: the name went to a new owner
+  (`:1.155`) 0.45 s after the monitor started. fprintd then idled out at 30 s
+  (`The name net.reactivated.Fprint does not have an owner`), and the monitor
+  kept running. So every start of the service starts fprintd once, briefly.
+  Upstream behaves the same.
+- `fprintd-verify` sends `VerifyFingerSelected`, then `finger-needed: <true>`.
+  When it is killed (`timeout 4`), fprintd sends `finger-needed: <false>` and
+  `VerifyStatus ('verify-no-match', true)`. gdbus flushes each line at once,
+  even into a pipe.
+
+**Checked, and how.**
+
+- `test/led-test.sh`: 55 ok. New in `make test`, `run-all.sh` and CI (a `led`
+  job). test/README.md lists what it covers.
+- The real bus and fprintd, no root: the watcher pointed at a stand-in LED
+  directory. A forged `PropertiesChanged` with `finger-needed: <true>`, sent
+  from this account (`gdbus emit --system --object-path
+  /net/reactivated/Fprint/Device/0 ...`, exit 0, so the bus accepted it),
+  changed nothing in 1 s. A real `fprintd-verify` then blinked it (10 samples
+  dark, 10 lit, every 0.1 s). Once it ended, the LED was back to
+  `chromeos-auto`. SIGTERM exited 0.
+- The same, as a transient `systemd-run --user` service under the unit's
+  syscall filter (`@system-service`, minus `@privileged @resources`),
+  `MemoryDenyWriteExecute=`, `RestrictAddressFamilies=AF_UNIX`, and the rest
+  of the seccomp set: active, blinked, `Result=success` on stop.
+- `led_service_install` with `sudo`, `systemctl`, `udevadm`, `install` and
+  `systemd-sysusers` stubbed, against stand-in paths. A good run calls
+  sysusers, the udev reload, trigger and settle, daemon-reload, enable,
+  restart, and checks MainPID twice. A udev rule that did not apply, or a
+  changing MainPID, rolls back to no files and the LED attributes back at
+  644. An update leaves a disabled service disabled. An install finding the
+  unit already there leaves it alone.
+- `make install` into a staging tree: the four files land, modes 0755/0644.
+- `test/run-all.sh`: everything PASS (arm64 SKIPPED here, no binfmt, as
+  always). `make test-vm`: all 40 checks ok. It runs install.sh end to end,
+  through the reworked package-manager lookup, and `make install` plus the
+  configure step in the guest. The LED question never printed there: QEMU's
+  DMI is no Framework.
+
+**Dead end: systemd-run --user with the full sandbox.**
+`CapabilityBoundingSet=`, and `ProtectKernelModules=`, `ProtectClock=`,
+`PrivateDevices=` and the rest, each drop capabilities. A user manager cannot
+do that: `Failed to drop capabilities: Operation not permitted`, `status=218/
+CAPABILITIES`. The namespace options were skipped with a warning. So the user
+service tested the seccomp half of the sandbox only.
+
+**Not checked yet.** The unit under the system manager, `DynamicUser=` and
+`SupplementaryGroups=` included, on the real LED. That needs root, so it
+waits for the owner's own `./install.sh` run. The installer's MainPID check
+and rollback are what stand between a unit that cannot run there and a
+leftover udev rule. The multicolour path ran on the stand-in only, with no
+older Framework 13 at hand. The VM test copies `led/` now, since `make
+install` needs it; it can only show the question staying away from a
+machine that is not a Framework.
+
+## The LED service after review: fourteen findings, one of them fatal on the owner's machine (2026-11-15, later)
+
+The owner ran `/code-review xhigh` on the uncommitted work: the diff
+against HEAD plus the untracked `led/` and `test/led-test.sh`, not the
+whole repository. It returned fourteen findings. Every one held up when
+checked, and each is fixed below with what checked it. None was public yet;
+nothing had been committed.
+
+**1. The install could never succeed on Ubuntu, Debian or Arch.**
+`/etc/sysusers.d` does not exist there until something puts a file in it
+(`ls: cannot access '/etc/sysusers.d'` on this machine; the reviewer saw the
+same in ubuntu 24.04, debian 13 and arch images). `install` into a missing
+directory fails, and the rollback took everything out again. So on the
+owner's own Framework the answer "yes" would have ended in "not installed".
+The stub run recorded in the entry above missed it, because its stand-in
+`/etc` had every directory already. Now `led_service_install` creates a
+missing directory with `install -d`, and only a missing one: `install -d` on
+a directory that exists would reset its mode and owner. A rollback `rmdir`s
+what it created, so a directory something else has used since stays.
+
+**Why the install code moved to bin/lib.sh.** Finding 1 got through because
+the earlier stub run drove a copy of the functions, cut out of install.sh by
+`sed`. `led_service_install`, `led_service_up_to_date` and
+`led_service_rollback` now live in bin/lib.sh. The caller sets
+`LED_SRC_DIR`, `LED_BIN` and `LED_WATCHER_SRC` (empty when a package owns
+the watcher), and `test/led-test.sh` runs those very functions. Its `/etc`
+has no `sysusers.d`.
+
+**2. A failed update deleted a working install.** `refresh` failing at any
+step went to the same rollback as a fresh install, `led_service_remove`. Now
+an update first copies the unit, rule, sysusers file and (hand-rolled) the
+watcher aside. A failure puts them back and restarts the service if it was
+running. The test checks the four files' sha256 before and after, and that
+`restart` ran twice.
+
+**3. Step 1h asked about an install it would then refuse.** A unit by the
+name without the marker passed the plan, got the question and a plan line,
+and failed at the write with "appeared since the plan was printed", which
+was false. Now `led_install_conflict` is asked first, in the plan and again
+before the writes. If anything stands in the way it says what, once, and
+asks nothing.
+
+**11. Only the unit was checked for being this tool's.** The udev rule and
+the sysusers file were overwritten and deleted on sight. The group was
+created by `systemd-sysusers`, which leaves an existing group alone, so the
+rule would have handed the LED to whoever was already in a group of that
+name. Uninstall would later `groupdel` it. Now all three files carry the marker
+`# tpm-keyring-unlock: power-button LED` as their first line
+(`LED_FILE_MARKER`). `led_install_conflict` refuses when any of them is
+there without it, or when the group exists without this tool's sysusers file
+to have made it. `led_service_remove` deletes only marked files, and touches
+the LED's attributes and the group only when the sysusers file was this
+tool's.
+
+**4. The watcher overwrote an LED its owner had switched off.** `restore_all`
+ran at every start and stop and wrote `chromeos-auto` to any power LED not
+on it, and `led_service_remove` did the same. A button switched off with
+`trigger none` lit up again. "A crashed watcher left it dark" and "its owner
+switched it off" both read `trigger none`, so the trigger alone cannot tell
+them apart. Now:
+
+- `take_led` takes only an LED whose *active* trigger is `chromeos-auto`.
+  Giving back is therefore always correct, and a switched-off button is
+  never woken.
+- Before its first write it notes the LED in `$RUNTIME_DIRECTORY/taken`: the
+  name, then a multicolour LED's colours. Giving back removes the note.
+- `--restore` (ExecStopPost) and the start act on the note only. A note
+  naming anything but the two power-button LEDs is dropped unread. Without
+  systemd (no `RUNTIME_DIRECTORY`) there is no note, so nothing is recovered.
+- `led_service_remove` no longer writes the trigger at all.
+
+**A dead end in 4, found by checking it on the real systemd.** The note
+first lived in a plain `RuntimeDirectory=`. A transient user service
+(`systemd-run --user`, the unit's ExecStopPost and runtime directory) was
+blinking on a real `fprintd-verify` and was killed with `systemctl --user
+kill -s KILL`. The LED stayed `none`. The journal said why: `Control
+process exited, code=killed, status=9/KILL`. `systemctl kill` signals the
+whole cgroup, and ExecStopPost, just forked into it, died with the rest. The
+runtime directory was then removed with the note in it. With the new rule
+(never take an LED off `chromeos-auto`), the button would have stayed dark
+until reboot. A plain `kill -9` of the main PID, which is what a crash looks
+like, was fine: ExecStopPost ran with `RUNTIME_DIRECTORY=/run/user/1000/...`
+and `SERVICE_RESULT=signal` and saw the note. An OOM kill takes the cgroup
+the way `systemctl kill` does, so the directory is now
+`RuntimeDirectoryPreserve=yes`, kept until reboot. Checked the same way: after
+the whole-cgroup SIGKILL the note was still there. The next start gave the
+LED back and removed the note. A reboot hands the LED to the EC anyway,
+since the driver's default trigger is `chromeos-auto`. `led_service_remove`
+runs `systemctl clean --what=runtime` after the stop, so the kept directory
+does not outlive the service.
+
+**5. A prompt already up when the watcher started never blinked.** Signals
+report changes only. Now, on the first "is owned by" line, the subscription
+is in place, so nothing between the answer and the next signal is lost. The
+watcher then asks fprintd once: `Manager.GetDevices`, then
+`Properties.GetAll` on each device. The answers come from the name's owner,
+routed by the bus, as the signals do. Checked against this machine's fprintd
+first. Idle, GetAll gave `{'name': <'Goodix MOC Fingerprint Sensor'>, ...,
+'finger-present': <false>, 'finger-needed': <false>}`; during
+`fprintd-verify` it gave `'finger-needed': <true>`. Then the watcher was
+started as a sandboxed user service 1.2 s into a running `fprintd-verify`,
+with no new signal coming. It blinked (`none:0`/`none:100` alternating).
+Later owners are not asked again: a new fprintd starts with nothing waiting,
+and the signals cover it.
+
+**6. A watcher that cannot run would restart for ever.** It exits within a
+second every time, and with `RestartSec=2` the default limit (5 starts in
+10 s) is never reached. Now `StartLimitIntervalSec=120` and
+`StartLimitBurst=10`.
+
+**7. A package update left the old watcher running.** The packaged watcher
+is not compared, since it is the package's. Nothing restarted the service,
+so the old code ran until reboot. `led_service_up_to_date` now also compares
+the service's `ExecMainStartTimestamp` (`systemctl show --timestamp=unix`,
+which reads `@<seconds>` for a running service and nothing for a stopped one)
+with the file's change time. That is the time the package manager wrote it;
+its modification time is the build's. A running watcher older than its file
+means an update with a restart. A systemd too old for `--timestamp=unix`
+prints nothing usable, and the comparison is skipped.
+
+**8. The packaged watcher's check stopped at the file.** Whoever can write
+a directory above it can swap the file. `led_path_is_roots_alone` walks every
+directory up to `/`: root's, no group or other write. A symlink is refused.
+The test's first sample was `/usr/bin/env`, and the check said no. On Ubuntu
+26.04 that is a symlink to rust coreutils
+(`/usr/bin/env -> ../lib/cargo/bin/coreutils/env`), so the check was right
+and the sample wrong. It is `/etc/passwd` now.
+
+**12. The udev rule ran on every trigger write.** The kernel sends a `change`
+uevent for each one, two per prompt, and each started `/bin/sh` and
+`chgrp`/`chmod` to set what was set already. The rule is `ACTION=="add"` now.
+install.sh applies it to the LED already there with `udevadm trigger
+--action=add`. The attributes keep their group for as long as the device
+exists. `udevadm verify` passes.
+
+**13. The LED names and attributes lived in four places.** bin/lib.sh now has
+one `LED_SYSFS_NAMES`, used by `framework_power_led` and
+`led_service_remove`. The watcher and the udev rule cannot read lib.sh, so
+the test checks the watcher's `LED_CANDIDATES`, the rule's `KERNEL==` and
+the rule's attribute list against `LED_SYSFS_NAMES` and `LED_ATTRS`.
+
+**10. "Undo: uninstall.sh" pointed at the whole uninstaller**, whose earlier
+questions take out the PAM lines, the module and the sealed secret, all
+`[Y/n]`. The install now ends with how to switch only the LED off
+(`systemctl disable --now tpm-keyring-led`; a later run leaves it off).
+It adds that uninstall.sh asks about the keyring parts first, and `n` keeps
+them. README says the same.
+
+**14. Small things.** The unit is rendered once per check, through `cmp -s
+<(...)`. `fprintd-list`, which starts fprintd and can take seconds, now runs
+once per run (`user_has_enrolled_finger` caches it for polkit's question and
+the LED's). An unused variable in the test is gone.
+
+**9. A test that could fail on a slow runner, and one that did.** The cap
+check had a 0.25 s margin: with a 2 s cap, blinking ends 1 to 2.25 s in. The
+check now runs at 3.5 s. Then, with every CPU busy (32 spinning loops on 16
+CPUs), a different check failed once: `finger-present on another device
+does not stop it` got `[none] kbd-capslock disk-activity chromeos-auto
+rfkill-any` instead of `none`. The state was right: `none` was active. The
+fake sysfs had already turned the watcher's bare word back into the list,
+because the watcher, slowed down, wrote before the fake sent its next line.
+Checks of the active trigger now read the bracketed word or the bare one
+(`act`). Raw content is compared only where the point is that nothing was
+written. Under the same load, run twice: 118 ok both times.
+
+**Checked after the fixes.** `test/led-test.sh`: 118 ok, three runs idle
+and two under full load. `systemd-analyze verify` on the rendered unit:
+clean. `systemd-analyze security --offline=true`: still 0.6 SAFE. `udevadm
+verify` on the rule: success. The sandboxed user-service runs above, against
+this machine's fprintd.
+
+**Still not checked:** the unit under the system manager, with
+`DynamicUser=`, `SupplementaryGroups=`, `PrivateDevices=` and a preserved
+runtime directory, on the real LED. That needs root, so it waits for the
+owner's `./install.sh`.

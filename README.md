@@ -395,6 +395,82 @@ it back.
 `gdm-password` stays password-only this way, so the gap described above stays
 closed.
 
+## Power-button LED
+
+On a Framework laptop the fingerprint reader is in the power button, and
+nothing shows when it is waiting for a finger. `install.sh` offers to blink
+the button's LED while it waits, wherever the finger is asked for: the lock
+screen, `sudo`, polkit. It has nothing to do with the keyring, and the run
+asks about it separately:
+
+```
+Blink the power button while the reader waits? [Y/n]
+```
+
+The question appears only on a Framework laptop whose power-button LED the
+embedded controller can take back, and only if you have a finger enrolled.
+Everyone else never sees it. It is not asked when
+[framework-fingerprint-led-blink](https://github.com/alejandroqh/framework-fingerprint-led-blink)
+is installed: two blinkers would fight over one LED. Nor when a unit, udev
+rule, sysusers file or group by this feature's names is already there and
+is not this tool's. The run names what it found.
+
+The idea and the design are that project's, by alejandroqh. This is a separate
+implementation in bash, the language the rest of this tool is written in:
+
+- `tpm-keyring-led.service` runs `gdbus monitor --system --dest
+  net.reactivated.Fprint`, which receives only signals fprintd itself sent.
+  The bus stamps the sender, so another local user cannot start or stop the
+  blinking with a forged signal. They can make it blink by starting a real
+  verification (`fprintd-verify`), because then fprintd really is waiting.
+- While fprintd's `finger-needed` property is true and no finger is on the
+  sensor, the service takes the LED from the embedded controller and blinks
+  it: 0.25 s dark, then 0.25 s lit. On the older Framework 13, whose
+  multicolour LED defaults to red, it lights only white.
+- A touch, the end of the prompt, or fprintd going away hands the LED back
+  through its `chromeos-auto` trigger. One stretch of blinking lasts 60
+  seconds at most. A prompt that is already up when the service starts
+  blinks too: it asks fprintd once, at start.
+- It only ever takes the LED from `chromeos-auto`. If you switched the
+  button off yourself (`trigger none`), it stays off, and the service leaves
+  it alone. While the LED is the service's, a note in
+  `/run/tpm-keyring-led` says so. If the service is killed mid-blink, the
+  note is how its next start tells "left dark by a crash" from "switched off
+  by you".
+- The service runs as a throwaway user (`DynamicUser=`) with no capabilities,
+  sandboxed. `systemd-analyze security tpm-keyring-led` rates it 0.6. A udev
+  rule lets its group, `tpm-keyring-led`, write the LED's `trigger`,
+  `brightness` and `multi_intensity`, and nothing else.
+
+It needs `gdbus` (the installer adds it to the packages when missing) and
+fprintd 1.92 or newer, which every release this tool supports ships.
+
+Files: `/usr/local/sbin/tpm-keyring-led` (a package runs its own copy in
+`/usr/libexec/tpm-keyring-unlock`), `/etc/systemd/system/tpm-keyring-led.service`,
+`/etc/udev/rules.d/90-tpm-keyring-led.rules` and
+`/etc/sysusers.d/tpm-keyring-led.conf`. A later run updates them when they
+differ from the version it carries, or when the running watcher is older
+than the file (a package update), and leaves a service you disabled
+disabled. If an update fails, the earlier version is put back.
+
+To switch the blinking off and keep everything else:
+
+```bash
+sudo systemctl disable --now tpm-keyring-led
+```
+
+`uninstall.sh` removes it for good, but it asks about the keyring parts
+first. Answer `n` to those to keep them.
+
+To test it, run `fprintd-verify` and watch the button. If it does not blink,
+`journalctl -u tpm-keyring-led -b` says why. A watcher that cannot run at
+all stops after ten tries in two minutes rather than restarting for ever.
+If the LED ever stays dark, give it back to the embedded controller by hand:
+
+```bash
+echo chromeos-auto | sudo tee /sys/class/leds/chromeos:*:power/trigger
+```
+
 ## SELinux
 
 GDM runs its PAM stacks in the SELinux domain `xdm_t`, and so does the

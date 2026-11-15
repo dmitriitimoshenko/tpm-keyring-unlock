@@ -23,6 +23,13 @@ jobs:
       - uses: actions/checkout@v4
       - run: test/unit-regex-test.sh
 
+  led:
+    name: power-button LED watcher (no docker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: test/led-test.sh
+
   runtime:
     name: PAM module runtime behavior
     runs-on: ubuntu-latest
