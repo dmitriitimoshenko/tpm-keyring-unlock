@@ -59,6 +59,31 @@ it may refuse with `Can't read TPM PCRs`: the installer ran the TPM steps
 inside `sg tss`, and your own shell only picks up the new group membership
 after a logout.
 
+### Upgrading
+
+```bash
+cd tpm-keyring-unlock
+./install.sh --upgrade
+```
+
+It fetches, lists what the newest release brings, and asks before moving this
+checkout there. A branch is only fast-forwarded. With local changes, or
+commits of your own on it, the checkout stays where it is and the run says
+so.
+
+Then every step runs again with the new version. The module and the helper
+are rebuilt, the PAM stacks re-checked, and whatever the new version adds is
+offered, such as the [power-button LED](#power-button-led). Your sealed secret
+is kept if it still unseals through the new helper, so there is nothing to
+type. It is re-sealed only if it no longer unseals, or if it was sealed before
+logins got the fast path.
+
+1.6.0 and earlier have no `--upgrade` yet, so pull once by hand:
+
+```bash
+git pull && ./install.sh --upgrade
+```
+
 ### From a distribution package
 
 Prebuilt `x86_64` packages for openSUSE, Fedora, Debian and Ubuntu are
@@ -109,10 +134,10 @@ Use one method or the other on a given machine, not both: `./install.sh` and a
 package write the same PAM module filename, so whichever ran last wins. See
 `packaging/README.md`.
 
-After upgrading the package, run `tpm-keyring-unlock-configure` once more. It
-re-checks the PAM stacks an older version wired, and takes the helper back out
-of any that the current checks refuse. Answer `n` at "Overwrite?" to keep your
-sealed secret.
+After upgrading the package, run `tpm-keyring-unlock-configure --upgrade`. It
+re-checks the PAM stacks an older version wired, takes the helper back out of
+any that the current checks refuse, and offers what the new version adds. It
+keeps your sealed secret if it still unseals.
 
 ## What this protects, and what it doesn't
 

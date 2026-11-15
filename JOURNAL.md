@@ -7559,3 +7559,90 @@ this machine's fprintd.
 `DynamicUser=`, `SupplementaryGroups=`, `PrivateDevices=` and a preserved
 runtime directory, on the real LED. That needs root, so it waits for the
 owner's `./install.sh`.
+
+## `install.sh --upgrade`: from an earlier version to the newest, keeping the sealed secret (2026-11-15, late)
+
+The owner asked for an upgrade path beside the install. The case in point is
+the power-button LED: someone on 1.6.0 should get offered it without
+re-installing. Until now the way was `git pull` and a full re-run, which
+plans "Re-seal (overwrite)". seal.sh then asks "Overwrite?", and the
+documented answer is `n`, a trap for anyone holding Enter. Packages had the
+same in post_upgrade: run the configure step, "Answer n at 'Overwrite?'".
+
+**What `--upgrade` does.** Two steps:
+
+1. **A git checkout moves to the newest release first** (`upgrade_checkout`
+   in bin/lib.sh). It runs `git fetch --tags origin`, takes the highest
+   `vX.Y.Z` tag (an `-rc` or any other tag is no release), compares it with
+   VERSION numerically (`sort -V`, so 1.10.0 is after 1.9.0), lists the
+   commit subjects coming with it, and asks `[Y/n]`. Then it execs the new
+   version's install.sh with the same options and a marker
+   (`TPM_KEYRING_UPGRADE_REEXEC`) that skips this step. So everything after
+   it is the new version's code, not the old script carrying on. git writes
+   the new files as new inodes, so the running bash keeps reading the old
+   one until the exec.
+2. **Then every step runs again**, as on any re-run: packages, tss, the
+   module and helper rebuilt, the mask, the PAM stacks re-checked, and every
+   optional question the new version has, the LED among them. The difference
+   is the seal step.
+
+**The seal step keeps what works.** The plan says "Keep your sealed secret if
+it still unseals with the updated helper; re-seal only if it does not". At
+that point the helper has just been installed. It is asked as README's
+troubleshooting asks it: `sudo "$HELPER_DST" "$USER" >/dev/null`, only the
+exit status kept, the secret into /dev/null. It is re-sealed only when it no
+longer unseals (PCR7 moved with a Secure Boot change), or when it has no
+`primary.handle`, which means it predates the persisted primary that makes
+logins fast. In either case seal.sh runs as before, with its own question.
+
+**Where it will not move a checkout**, carrying on with the files it has and
+saying why:
+
+- local changes to tracked files - switching could lose them;
+- a branch with commits the release lacks - a fast-forward is impossible,
+  and rewinding someone's branch is not this tool's call;
+- a checkout already past the release, such as a developer's main;
+- no git checkout at all (a tarball);
+- `origin` unreachable.
+
+A branch is only ever fast-forwarded (`merge --ff-only`), so the user stays on
+`main`. A checkout on no branch, an older tag say, checks out the new tag.
+`upgrade_checkout_is_git` insists the directory is the top of its own work
+tree. Inside some other repository, `git -C` would otherwise answer for that
+one.
+
+**Trust.** The fetch is from `origin` as `git clone` set it up: the same
+trust as the first install, which ran what that clone fetched. The tags
+carry no signatures, so there is nothing more to check them against. The
+step shows what is coming and asks before anything moves.
+
+**Packages.** With `--no-build` the files are the package manager's, and the
+step only says so. `tpm-keyring-unlock-configure --upgrade` then does the
+rest, and that is what the AUR install script's post_upgrade, and README, now
+tell people to run after a package upgrade. The release changelogs already
+published stay as written.
+
+**No upgrade without an install.** `--upgrade` with no sealed secret for this
+user stops and points at the plain installer. Without one there is nothing to
+keep, and the run would be a first install under another name.
+
+**Tested the way the review of the LED work taught.** `upgrade_checkout`
+lives in bin/lib.sh, not install.sh, so that `test/upgrade-test.sh` runs the
+function itself rather than a copy. That test uses a bare repository as the
+remote, with releases tagged after the clone. A switch execs the new
+installer, so each call runs in a subshell, and the release carries a
+stand-in install.sh that prints how it was started. That is how the test sees
+the same options and the marker arrive. It has 39 checks, listed in
+test/README.md. The rest needs a TPM: `test/vm/run-vm-test.sh` now runs
+`install.sh --upgrade` between the install and the uninstall. The plan must
+be the only prompt, `seal.priv` must keep its sha256, the stack must read
+"already wired in", and the secret must still unseal.
+
+**Bootstrap.** 1.6.0 and earlier have no `--upgrade`, so the first time is
+`git pull && ./install.sh --upgrade`. README says so.
+
+**Checked.** `test/upgrade-test.sh`: 39 ok. `make test-vm`: all 46 checks ok,
+the five new `--upgrade` ones among them. Its run ended with the plan as its
+only prompt, printed "It unseals through the updated helper - kept", and
+left `seal.priv` with the same sha256. `test/run-all.sh`: everything PASS,
+arm64 skipped here as always.

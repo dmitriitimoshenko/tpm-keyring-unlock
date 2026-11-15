@@ -47,13 +47,26 @@ LED_SRC_DIR="$REPO_DIR/led"
 # a distribution package, so this run must not compile or install them - it
 # only does the parts a package is not allowed to do (sealing a secret, which
 # needs the user's password, and editing /etc/pam.d, which needs consent).
+#
+# --upgrade: an install from an earlier version moves to the newest one. A git
+# checkout first moves to the newest release and the run starts over from
+# there (bin/lib.sh, upgrade_checkout); then every step runs again, as on any
+# re-run, except that a sealed secret that still unseals is kept rather than
+# re-sealed. What the new version adds is offered as it would be to a new
+# install. JOURNAL.md, 2026-11-15.
+ORIG_ARGS=("$@")
 DO_BUILD=true
+UPGRADE=false
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --no-build) DO_BUILD=false ;;
+    --upgrade) UPGRADE=true ;;
     -h | --help)
-      echo "usage: ${0##*/} [--no-build]"
+      echo "usage: ${0##*/} [--no-build] [--upgrade]"
       echo "  --no-build  configure only; expects the module and helper to be installed"
+      echo "  --upgrade   move an install from an earlier version to the newest one:"
+      echo "              a git checkout first moves to the newest release, then every"
+      echo "              step runs again, keeping the sealed secret if it still unseals"
       exit 0
       ;;
     *)
@@ -63,6 +76,10 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
+
+# The version these files are. A package's libexec directory has no VERSION;
+# it is only ever printed.
+TOOL_VERSION="$(tr -d '[:space:]' <"$REPO_DIR/VERSION" 2>/dev/null || true)"
 
 # The power-button LED watcher the unit runs. The hand-rolled install copies
 # it beside the unseal helper; a package ships it next to this script, and it
@@ -341,6 +358,11 @@ fi
 echo "== tpm-keyring-unlock installer =="
 echo
 
+if [ "$UPGRADE" = true ] && [ -z "${TPM_KEYRING_UPGRADE_REEXEC:-}" ]; then
+  upgrade_checkout
+  echo
+fi
+
 # --- 0. hard requirements - checked before touching anything, including
 # before installing dependencies, so a machine that can't use this tool
 # finds out immediately instead of after a sudo package install -----------
@@ -410,6 +432,13 @@ fi
 # 1c. seal vs. re-seal
 RESEAL=false
 [ -f "$DATA_DIR/seal.priv" ] && RESEAL=true
+# An upgrade is of an install that exists. Without a sealed secret there is
+# nothing to keep, and the run would be a first install by another name.
+if [ "$UPGRADE" = true ] && [ "$RESEAL" = false ]; then
+  echo "Nothing to upgrade for $USER: no sealed secret in $DATA_DIR." >&2
+  echo "Run the installer without --upgrade to install." >&2
+  exit 1
+fi
 
 # 1d. login PAM stacks that need the helper wired in - and every stack that
 # carries it already, keyring line or not. One whose keyring line was taken
@@ -718,7 +747,10 @@ else
   echo "  $n. Mask systemd's eager gnome-keyring-daemon startup."
 fi
 n=$((n + 1))
-if [ "$RESEAL" = true ]; then
+if [ "$UPGRADE" = true ]; then
+  echo "  $n. Keep your sealed secret if it still unseals with the updated helper"
+  echo "     (checked with sudo, nothing shown); re-seal only if it does not."
+elif [ "$RESEAL" = true ]; then
   echo "  $n. Re-seal (overwrite) the existing sealed secret at $DATA_DIR."
 else
   echo "  $n. Seal your keyring password into the TPM."
@@ -937,12 +969,33 @@ else
 fi
 
 echo
-if [ "$RESEAL" = true ]; then
-  echo "-- Re-seal into the TPM --"
+if [ "$UPGRADE" = true ]; then
+  # Asked of the helper every login runs, just installed, as README's
+  # troubleshooting asks it: as root, the secret into /dev/null, only the exit
+  # status kept. Re-sealing needs the keyring password typed again, so it
+  # happens only when keeping would not do: the secret no longer unseals, or
+  # it predates the persisted primary that makes logins fast.
+  echo "-- Sealed secret --"
+  SEAL_REASON=""
+  if [ ! -f "$DATA_DIR/primary.handle" ]; then
+    SEAL_REASON="it was sealed before logins got the fast path (no primary.handle)"
+  elif ! sudo "$HELPER_DST" "$USER" >/dev/null; then
+    SEAL_REASON="it no longer unseals - a Secure Boot change moves PCR7, and the seal with it"
+  fi
+  if [ -z "$SEAL_REASON" ]; then
+    echo "It unseals through the updated helper - kept. Nothing to type."
+  else
+    echo "Re-sealing, because $SEAL_REASON."
+    tpm_run "$SEAL_SH"
+  fi
 else
-  echo "-- Seal into the TPM --"
+  if [ "$RESEAL" = true ]; then
+    echo "-- Re-seal into the TPM --"
+  else
+    echo "-- Seal into the TPM --"
+  fi
+  tpm_run "$SEAL_SH"
 fi
-tpm_run "$SEAL_SH"
 
 echo
 if [ "$UNLIMIT_FPRINTD" = true ]; then
@@ -1141,7 +1194,11 @@ if [ -n "$LED_STEP" ]; then
 fi
 
 echo
-echo "Log out and back in to test."
+if [ "$UPGRADE" = true ]; then
+  echo "Upgraded${TOOL_VERSION:+ to $TOOL_VERSION}. Log out and back in to test."
+else
+  echo "Log out and back in to test."
+fi
 
 # --- 4. did the fingerprint side actually end up able to work? -----------
 # The attempt stack fails silently when it loses the sensor: it returns

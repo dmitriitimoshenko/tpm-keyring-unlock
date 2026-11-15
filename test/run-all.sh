@@ -44,6 +44,16 @@ else
   record "power-button LED" FAIL
 fi
 
+echo
+echo "########################################"
+echo "# install.sh --upgrade: checkout to the newest release (no container)"
+echo "########################################"
+if test/upgrade-test.sh; then
+  record "upgrade (checkout)" PASS
+else
+  record "upgrade (checkout)" FAIL
+fi
+
 if ! command -v docker >/dev/null 2>&1; then
   echo
   echo "docker not found - skipping the container-based tests (runtime" >&2

@@ -796,6 +796,32 @@ if [ "$B1_OK" -eq 1 ]; then
       "$INSTALL_SECRET" "$WORK/install-unseal.err"
 
     echo
+    echo "-- install.sh --upgrade end to end --"
+    # What a user runs to get what a newer version adds: every step again, but
+    # the secret sealed just above still unseals, so it is kept and nothing is
+    # asked about it. The plan is the only prompt answered; an "Overwrite?" or
+    # a password prompt would find no rule and fail the step on
+    # VM_TTY_TIMEOUT. The VM's copy is no git checkout, so the switch to a
+    # newer release is skipped with a note (test/upgrade-test.sh covers it).
+    SEAL_SUM_BEFORE="$(vm_ssh "$B2_SSHPORT" 'sha256sum ~/.local/share/tpm-keyring-unlock/seal.priv')"
+    vm_drive "$B2_SSHPORT" "$WORK/upgrade.out" \
+      'cd ~/tpm-keyring-unlock && ./install.sh --upgrade' \
+      'Proceed with all of the above\? \[Y/n\] ='
+    if [ $? -eq 0 ]; then got=upgraded; else got=failed; fi
+    check "install.sh --upgrade completes a run" "$got" "upgraded" "$WORK/upgrade.out"
+    check "--upgrade keeps a secret that still unseals, asking nothing about it" \
+      "$(grep -c 'unseals through the updated helper - kept' "$WORK/upgrade.out"):$(grep -c 'Overwrite?' "$WORK/upgrade.out")" \
+      "1:0" "$WORK/upgrade.out"
+    check "--upgrade leaves the sealed blob as it was" \
+      "$(vm_ssh "$B2_SSHPORT" 'sha256sum ~/.local/share/tpm-keyring-unlock/seal.priv')" \
+      "$SEAL_SUM_BEFORE" "$WORK/upgrade.out"
+    check "--upgrade finds the stack wired already" \
+      "$(grep -c 'gdm-password: already wired in' "$WORK/upgrade.out")" "1" "$WORK/upgrade.out"
+    check "after --upgrade the secret still unseals through the helper" \
+      "$(vm_ssh "$B2_SSHPORT" 'sudo /usr/local/sbin/tpm-keyring-unseal ubuntu' 2>"$WORK/upgrade-unseal.err")" \
+      "$INSTALL_SECRET" "$WORK/upgrade-unseal.err"
+
+    echo
     echo "-- uninstall.sh end to end --"
     # Every prompt here defaults to yes, so one repeating rule - answer Enter
     # to anything ending in [Y/n] - accepts the whole run, however many

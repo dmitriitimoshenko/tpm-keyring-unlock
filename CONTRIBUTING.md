@@ -35,6 +35,7 @@
 make test        # everything; or: test/run-all.sh
 make test-regex  # just the PAM-line detection regex (no docker needed)
 make test-led    # just the power-button LED watcher (no docker needed)
+make test-upgrade  # just install.sh --upgrade's checkout step (no docker needed)
 make test-runtime    # just the PAM module's runtime behavior
 make test-packaging  # just the per-distro dependency/compile/detection checks
 make test-vm      # real TPM/Secure Boot round trip in a VM (opt-in, see below)

@@ -34,7 +34,7 @@ MODULE      := pam/pam_tpm_keyring_authtok.so
 
 INSTALL     ?= install
 
-.PHONY: all test test-regex test-led test-runtime test-packaging test-vm test-vm-selinux build install uninstall clean
+.PHONY: all test test-regex test-led test-upgrade test-runtime test-packaging test-vm test-vm-selinux build install uninstall clean
 
 # MUST stay the first rule in this file. `make` with no target is what every
 # packaging recipe runs (rpm's %make_build, dh_auto_build), and before this
@@ -58,6 +58,11 @@ test-regex:
 # docker, no root.
 test-led:
 	./test/led-test.sh
+
+# install.sh --upgrade's move of a git checkout to the newest release, against
+# a local bare repository; no network, no root.
+test-upgrade:
+	./test/upgrade-test.sh
 
 # Real TPM/Secure Boot round trip in a VM (swtpm + OVMF) - the layer Docker
 # structurally can't cover. Needs swtpm, qemu, and /dev/kvm; degrades to a

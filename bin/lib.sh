@@ -2556,3 +2556,133 @@ led_service_remove() {
     sudo groupdel "$LED_GROUP" >/dev/null 2>&1 || true
   fi
 }
+
+# --- install.sh --upgrade: a checkout to the newest release --------------------
+#
+# `install.sh --upgrade` first moves a git checkout of this repository to its
+# newest release, then starts over with the new installer. Releases are the
+# tags vX.Y.Z the release workflow makes from VERSION on main. JOURNAL.md,
+# 2026-11-15.
+
+# Succeeds when the directory $1 is the top of a git work tree of its own: a
+# checkout, rather than a package's libexec directory, or a copy inside some
+# other repository.
+upgrade_checkout_is_git() {
+  local top
+  top="$(git -C "$1" rev-parse --show-toplevel 2>/dev/null)" || return 1
+  [ "$(cd "$top" && pwd -P)" = "$(cd "$1" && pwd -P)" ]
+}
+
+# Succeeds when version $1 is newer than version $2, comparing X.Y.Z
+# numerically: 1.10.0 is newer than 1.9.0.
+version_is_newer() {
+  [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" = "$1" ]
+}
+
+# Prints the newest release tag the checkout $1 knows, or nothing. Only
+# vX.Y.Z counts: a pre-release or any other tag is not a release.
+latest_release_tag() {
+  local tags
+  tags="$(git -C "$1" tag -l 'v*' 2>/dev/null || true)"
+  grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' <<<"$tags" | sort -V | tail -n1 || true
+}
+
+# Decides whether the checkout $1, whose files say version $2, can move to the
+# release tag $3. Returns 0 when it can, and otherwise:
+#   1  that release is not newer than these files
+#   3  tracked files have local changes, which switching could lose
+#   4  the checkout is on a branch with commits the release does not have:
+#      it cannot be fast-forwarded, and rewinding it is not this tool's call
+# A checkout on no branch (at an older tag, say) simply moves to the new one.
+upgrade_checkout_movable() {
+  local dir="$1" current="$2" tag="$3" head target
+  [ -n "$tag" ] && version_is_newer "${tag#v}" "$current" || return 1
+  git -C "$dir" diff --quiet HEAD -- 2>/dev/null || return 3
+  if git -C "$dir" symbolic-ref -q HEAD >/dev/null; then
+    head="$(git -C "$dir" rev-parse HEAD)" || return 4
+    target="$(git -C "$dir" rev-parse "$tag^{commit}")" || return 4
+    git -C "$dir" merge-base --is-ancestor "$head" "$target" || return 4
+  fi
+  return 0
+}
+
+# Moves the checkout $1 to the tag $2: a fast-forward of the branch it is on,
+# so it stays on that branch, or a checkout of the tag when it is on none.
+upgrade_checkout_move() {
+  local dir="$1" tag="$2"
+  if git -C "$dir" symbolic-ref -q HEAD >/dev/null; then
+    git -C "$dir" merge --ff-only --quiet "$tag"
+  else
+    git -C "$dir" -c advice.detachedHead=false checkout --quiet "$tag"
+  fi
+}
+
+# --upgrade's first step: a git checkout of this repository moves to the
+# newest release tag, and the run starts over with the installer that comes
+# with it, so every step after this one is the new version's. It shows what
+# changes and asks first. It never rewrites history: a branch is only
+# fast-forwarded, and a checkout with local changes, or with commits the
+# release does not have, stays where it is - the run then carries on with the
+# files it has, and says so. A package's files are its package manager's to
+# upgrade.
+#
+# In bin/lib.sh rather than install.sh so that test/upgrade-test.sh runs this
+# very function. The caller provides REPO_DIR, TOOL_VERSION, DO_BUILD,
+# ORIG_ARGS (its own command line) and confirm(), install.sh's [Y/n]. On a
+# switch it does not return: it execs the new $REPO_DIR/install.sh.
+upgrade_checkout() {
+  local tag rc=0 commits count
+  echo "-- Newest release --"
+  if [ "$DO_BUILD" = false ]; then
+    echo "Packaged install: your package manager brings the newest files. This run"
+    echo "re-checks the configuration against them."
+    return 0
+  fi
+  if ! upgrade_checkout_is_git "$REPO_DIR"; then
+    echo "$REPO_DIR is not a git checkout - carrying on with these files${TOOL_VERSION:+ ($TOOL_VERSION)}."
+    return 0
+  fi
+  # The remote this checkout came from, as `git clone` set it up - the same
+  # trust as the first install, which ran what that clone fetched.
+  if ! timeout 60 git -C "$REPO_DIR" fetch --quiet --tags origin; then
+    echo "Could not fetch from origin (offline?) - carrying on with ${TOOL_VERSION:-these files}."
+    return 0
+  fi
+  tag="$(latest_release_tag "$REPO_DIR")"
+  upgrade_checkout_movable "$REPO_DIR" "$TOOL_VERSION" "$tag" || rc=$?
+  case "$rc" in
+    0) ;;
+    1)
+      echo "Already at the newest release${TOOL_VERSION:+ ($TOOL_VERSION)}."
+      return 0
+      ;;
+    3)
+      echo "$tag is out, but $REPO_DIR has local changes - not switching versions;"
+      echo "carrying on with ${TOOL_VERSION:-these files}. Commit or stash them, then re-run."
+      return 0
+      ;;
+    *)
+      echo "$tag is out, but this checkout's branch has commits $tag does not - not"
+      echo "moving it; carrying on with ${TOOL_VERSION:-these files}."
+      return 0
+      ;;
+  esac
+  commits="$(git -C "$REPO_DIR" log --no-merges --format='  %s' "HEAD..$tag" 2>/dev/null || true)"
+  count="$(grep -c . <<<"$commits" || true)"
+  echo "$tag is out; these files are ${TOOL_VERSION:-older}. What comes with it:"
+  head -n 15 <<<"$commits"
+  [ "$count" -le 15 ] || echo "  ... and $((count - 15)) more (git log HEAD..$tag)"
+  if ! confirm "Switch $REPO_DIR to $tag and carry on with it?"; then
+    echo "Carrying on with ${TOOL_VERSION:-these files}."
+    return 0
+  fi
+  if ! upgrade_checkout_move "$REPO_DIR" "$tag"; then
+    echo "Could not switch (git says why above) - carrying on with ${TOOL_VERSION:-these files}." >&2
+    return 0
+  fi
+  echo "Now at $tag. Starting over with its installer."
+  echo
+  # The marker keeps the new installer from fetching again. exec, so nothing
+  # of this old script runs after the switch.
+  TPM_KEYRING_UPGRADE_REEXEC=1 exec "$REPO_DIR/install.sh" "${ORIG_ARGS[@]}"
+}

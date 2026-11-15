@@ -30,6 +30,13 @@ jobs:
       - uses: actions/checkout@v4
       - run: test/led-test.sh
 
+  upgrade:
+    name: install.sh --upgrade, checkout to the newest release (no docker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: test/upgrade-test.sh
+
   runtime:
     name: PAM module runtime behavior
     runs-on: ubuntu-latest

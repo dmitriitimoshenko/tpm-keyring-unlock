@@ -193,6 +193,21 @@ actually runs there, never skips.
   cover is the unit under the system manager (`DynamicUser=`, the sandbox)
   on the real LED: `JOURNAL.md`, 2026-11-15, records what was checked by
   hand, and how.
+- **`test/upgrade-test.sh`** (no container, no root, no network) — the
+  first step of `install.sh --upgrade`, which moves a git checkout to the
+  newest release. A bare repository under a temp directory plays the GitHub
+  remote, with releases tagged after the clone. Covers: versions compare as
+  numbers (1.10.0 after 1.9.0); only `vX.Y.Z` counts as a release, not an
+  `-rc` or another tag; a branch is fast-forwarded and stays a branch, a
+  detached checkout moves to the tag, untracked files do not block it; a
+  local change to a tracked file, a branch with commits of its own, or a
+  checkout already past the release are left where they are; a directory
+  inside a repository or a plain one is no checkout. Then `upgrade_checkout`
+  itself, the function install.sh runs, in a subshell because a switch execs
+  the new installer: declined, accepted (the release's stand-in installer
+  starts with the same options and the re-exec marker), already newest,
+  local changes, no checkout, a packaged install, and an unreachable origin.
+  The rest of an upgrade needs a TPM; `run-vm-test.sh` runs it.
 - **`test/runtime-test.sh`** (one container, distro doesn't matter) — the
   compiled PAM module's actual fork/exec/pipe/timeout/`PAM_AUTHTOK` logic,
   using `pamtester` + a fake helper script standing in for
@@ -297,7 +312,10 @@ script). Two scenarios:
   `tpm-keyring-unlock-configure` (which must not compile anything), and
   `-deconfigure`, which must leave files a package owns alone. Until this
   existed, nothing in the repo had ever executed `install.sh` - the distro
-  tests mirror its logic, they do not run it.
+  tests mirror its logic, they do not run it. Between the two it runs
+  `install.sh --upgrade`: it has to finish with the plan as its only prompt,
+  keep the sealed blob byte for byte (no "Overwrite?", no password), find
+  the stack wired already, and leave the secret unsealing.
 
 ### Driving the prompts: `test/vm/pty-drive.py`
 
