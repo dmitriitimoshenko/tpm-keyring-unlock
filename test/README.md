@@ -171,12 +171,16 @@ actually runs there, never skips.
   once; a finger on one device does not hide another device that wants one;
   the older Framework 13's multicolour LED lights only white and gets its
   colours back; an LED off `chromeos-auto` - including a button its owner
-  switched off with `trigger none` - is never taken or woken; the
+  switched off with `trigger none` - is never taken or woken; a trigger
+  somebody sets mid-blink makes it let go without another write; the
   60-second cap (shortened for the test, with the checks a second clear of
-  its window); a line cut in two by a blink tick still counts; SIGTERM
+  its window), after which only a new prompt starts it again; a stream of
+  lines every 0.1 s neither holds the LED still nor outlasts the cap; a line
+  cut in two by a blink tick still counts; SIGTERM
   mid-blink restores the LED and stops `gdbus`; SIGKILL leaves the note that
-  `--restore` and the next start act on, and `--restore` without a note, or
-  with one naming anything else, writes nothing. Then `framework_power_led()`,
+  `--restore` and the next start act on, and `--restore` without a note, with
+  one naming anything else, or with a trigger set since the kill, writes
+  nothing. Then `framework_power_led()`,
   which decides who is asked at all. Then the files: the LED names and
   attributes the watcher, the udev rule and `bin/lib.sh` each carry are held
   to each other, every file starts with the marker, and the rendered unit
@@ -185,11 +189,12 @@ actually runs there, never skips.
   `install` and `systemd-sysusers` and an `/etc` with no `sysusers.d`, as on
   Ubuntu, Debian and Arch: a fresh install creates it; a failed fresh install
   leaves nothing, the directory included; a failed update puts the earlier
-  files back byte for byte and restarts the service; a disabled service stays
-  disabled through an update; a running watcher older than its file counts
-  as out of date; a unit, rule or group by this tool's names that is not this
-  tool's makes it refuse; removal takes only files with the marker; a
-  packaged watcher this account could replace is refused. What it cannot
+  files back byte for byte and restarts the service; a stopped service stays
+  stopped through an update and a running one is restarted, with its
+  enablement never touched; a running watcher older than its file counts as
+  out of date; a unit, rule, group or watcher file by this tool's names that
+  is not this tool's makes it refuse; removal takes only files with the
+  marker; a packaged watcher this account could replace is refused. What it cannot
   cover is the unit under the system manager (`DynamicUser=`, the sandbox)
   on the real LED: `JOURNAL.md`, 2026-11-15, records what was checked by
   hand, and how.
@@ -197,12 +202,15 @@ actually runs there, never skips.
   first step of `install.sh --upgrade`, which moves a git checkout to the
   newest release. A bare repository under a temp directory plays the GitHub
   remote, with releases tagged after the clone. Covers: versions compare as
-  numbers (1.10.0 after 1.9.0); only `vX.Y.Z` counts as a release, not an
-  `-rc` or another tag; a branch is fast-forwarded and stays a branch, a
-  detached checkout moves to the tag, untracked files do not block it; a
-  local change to a tracked file, a branch with commits of its own, or a
-  checkout already past the release are left where they are; a directory
-  inside a repository or a plain one is no checkout. Then `upgrade_checkout`
+  numbers (1.10.0 after 1.9.0); only `vX.Y.Z` on the remote's main line
+  counts as a release, not an `-rc`, another tag, or a `v9.0.0` pushed onto
+  a side commit; a branch is fast-forwarded and stays a branch, a detached
+  checkout at an older release moves to the tag, untracked files do not
+  block it; a local change to a tracked file, commits of its own (on a
+  branch or detached), or a checkout already past the release are left where
+  they are; a directory inside a repository or a plain one is no checkout.
+  `install.sh --upgrade` with no sealed secret is refused before the
+  checkout step, run in a pty with an empty HOME. Then `upgrade_checkout`
   itself, the function install.sh runs, in a subshell because a switch execs
   the new installer: declined, accepted (the release's stand-in installer
   starts with the same options and the re-exec marker), already newest,

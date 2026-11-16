@@ -7386,6 +7386,10 @@ machine that is not a Framework.
 
 ## The LED service after review: fourteen findings, one of them fatal on the owner's machine (2026-11-15, later)
 
+*Partly superseded by the 2026-11-16 entry: an update now restarts by
+`is-active` and never touches enablement, the watcher lets go of an LED whose
+trigger somebody set mid-blink, and toggling and the cap run on the clock.*
+
 The owner ran `/code-review xhigh` on the uncommitted work: the diff
 against HEAD plus the untracked `led/` and `test/led-test.sh`, not the
 whole repository. It returned fourteen findings. Every one held up when
@@ -7562,6 +7566,10 @@ owner's `./install.sh`.
 
 ## `install.sh --upgrade`: from an earlier version to the newest, keeping the sealed secret (2026-11-15, late)
 
+*Partly superseded by the 2026-11-16 entry: only tags on the remote's main
+line count as releases, a detached checkout with commits of its own is not
+moved, and the "nothing to upgrade" refusal comes before the checkout step.*
+
 The owner asked for an upgrade path beside the install. The case in point is
 the power-button LED: someone on 1.6.0 should get offered it without
 re-installing. Until now the way was `git pull` and a full re-run, which
@@ -7646,3 +7654,122 @@ the five new `--upgrade` ones among them. Its run ended with the plan as its
 only prompt, printed "It unseals through the updated helper - kept", and
 left `seal.priv` with the same sha256. `test/run-all.sh`: everything PASS,
 arm64 skipped here as always.
+
+## A second review: ten findings in the LED service and `--upgrade`, and one more its own test found (2026-11-16)
+
+The owner ran `/code-review medium` on PR #29, the LED service and
+`install.sh --upgrade`. It returned ten findings, all of which held. While
+fixing them the new tests found an eleventh. And one worry of mine was ruled
+out. Each is below, with what checked it.
+
+**Ruled out first: gdbus speaking another language.** The watcher matches
+gdbus's own lines, "The name ... is owned by" and "does not have an
+owner", and a system service gets the system locale. It turned out not to
+matter: run under `LANG=de_DE.UTF-8 LANGUAGE=de LC_ALL=de_DE.UTF-8` (de_DE is
+installed here), gdbus still printed English. That check did turn up
+something else. This machine has `LC_NUMERIC=de_DE.UTF-8`, and under it
+`$EPOCHREALTIME` reads `1794790274,374873`, with a comma. That mattered for
+finding 6.
+
+**6, and the eleventh: the blinking ran off read's timeout.** It toggled
+only when a read timed out, so lines arriving faster than every 0.25 s held
+the LED still and kept it past the cap. Now the clock decides. Each pass
+toggles when the half period is up (`$EPOCHREALTIME`, in microseconds) and
+ends the stretch at the cap, then waits for a line only until the next tick.
+The watcher exports `LC_ALL=C` for the decimal point, and strips either
+separator anyway. The cap is now exact to the microsecond rather than whole
+seconds.
+
+The test written for it - a line every 0.1 s for 3 s, with a 2 s cap - then
+failed: `a stream of lines: the cap still ends it (got: none, want:
+chromeos-auto)`. The cap did end the stretch. But the next line was a second
+device's `finger-present: <false>`, and it counted as "a new change from
+fprintd", which took the LED straight back. That had been the rule since the
+first version, and upstream's too, so under such a stream the cap held
+nothing. Now, after the cap, only a new prompt starts the blinking again:
+`finger-needed: <true>`, either from a retry or from a fresh prompt. A test
+covers that.
+
+**7. An LED whose trigger somebody set mid-blink got overwritten.**
+`give_back` wrote `chromeos-auto` whenever the EC did not have the LED. Now
+every tick first reads the active trigger. If it is no longer the `none`
+the watcher set, the watcher lets go of the LED: no further write, and the
+note is dropped. `give_back`, and `--restore` acting on a note, write
+`chromeos-auto` only over that `none`. One case stays out of reach. An
+owner who writes `none` themselves mid-blink looks the same as the
+watcher's own `none`, so their choice is overridden when the prompt ends.
+`active_trigger` reads the bracketed word, and treats a file holding a
+single word as that word. Sysfs never gives that; the test's plain files
+do. So the fake sysfs needs no special casing in the watcher's logic.
+
+**8. An update decided by `is-enabled`.** This came from the first review's
+own fix. A service that was disabled but still running got its watcher
+replaced and was not restarted. From then on every run called it out of
+date, since the running watcher was older than the file. And a service that
+was enabled but stopped by hand was started again. Now an update restarts a
+service that is running, leaves one that is stopped stopped, and never calls
+`enable`: whether it is enabled is its owner's setting. Only a fresh install
+enables it.
+
+**5. The watcher at `/usr/local/sbin` was not checked for being this
+tool's.** A fresh install overwrote whatever was at that path, a rollback
+deleted it, and uninstall deleted it. The watcher now carries the marker as
+its second line, under the shebang (`led_watcher_is_ours`).
+`led_install_conflict` refuses when a file is at the hand-rolled path
+without it. The rollback and uninstall delete only a marked watcher, and
+uninstall says when it leaves one alone.
+
+**3. Any `vX.Y.Z` on the remote counted as a release.** It is now only a
+tag on the remote's main line: `git tag -l --merged` of what origin/HEAD
+points at, or origin/main. The release workflow tags main, so a tag pushed
+onto some other commit is no release, however high its number. The tags are
+unsigned, so there is no signature to check. A checkout with neither ref has
+no releases, and the run says so.
+
+**4. A detached HEAD with commits of its own was moved anyway**, leaving
+those commits to the reflog. The ancestry check that guarded branches now
+guards a detached HEAD too.
+
+**2. `--upgrade` with nothing installed refused only after the checkout had
+moved**, after the switch and the exec of the new installer. Now the check
+for a sealed secret comes before the checkout step.
+`test/upgrade-test.sh` runs `install.sh --upgrade` in a pty (`script`) with
+an empty HOME, and checks that it refuses without printing the checkout
+step's heading.
+
+**1. A kept secret is not proved to be the current keyring password.** That
+it unseals proves the seal works, not what it holds. A plain re-run asks
+"Overwrite?" and Enter re-seals; `--upgrade` asks nothing. Nothing can
+compare the secret with the keyring password: unlocking the keyring with it
+would be a change of state, and the keyring file's change time moves
+whenever any secret is stored. So the run says, right where it keeps the
+secret, to re-seal after a password change, and README says the same.
+
+**9. The group can write any trigger.** A writable `trigger` takes any
+trigger the kernel offers, not only `none` and `chromeos-auto`, and file
+permissions cannot narrow that. So it is documented as the limit: the
+service's sandbox and missing capabilities are what keep it to those two.
+README's security bullet says so.
+
+**10. A comment overstated a check.** It said the packaged watcher is checked
+"like the module and the helper", but `--no-build` only checks that those
+two exist. It now says the watcher gets more than that presence check, and
+why: a unit this run writes runs it where it lies.
+
+**A slip while making these.** One edit was a Python script fed to bash
+through a heredoc ending in `EOF`. The test text inside it had heredocs of
+its own ending in `EOF`, so bash ended the outer one early and ran the rest
+as shell commands. Python had stopped at a syntax error, so no file was
+edited. The stray commands failed for unset variables (`>"$LED/trigger"`
+went to `/trigger`, refused for a non-root user), and nothing was created:
+`ls /trigger /stream.sh ...` found nothing, and `git status` showed only the
+intended files. The scripts now go through a file with a delimiter of their
+own.
+
+**Checked.** `test/led-test.sh`: 131 ok, idle and twice with every CPU busy.
+`test/upgrade-test.sh`: 44 ok. On this machine's fprintd, as a sandboxed user
+service under the unit's syscall filter and with `LC_NUMERIC=de_DE.UTF-8` set
+for it: blinking during a real `fprintd-verify`, `chromeos-auto` after,
+`Result=success` on stop.
+`test/run-all.sh`: everything PASS (arm64 skipped here). `make test-vm`:
+all 46 checks ok, `install.sh --upgrade` among them.

@@ -2257,6 +2257,16 @@ led_file_is_ours() {
   [ "$first" = "$LED_FILE_MARKER" ]
 }
 
+# Succeeds when the watcher file $1 is this tool's: the marker is its second
+# line, under the shebang. The hand-rolled install copies it to
+# /usr/local/sbin, a path anything else could have taken first.
+led_watcher_is_ours() {
+  local first="" second=""
+  [ -f "$1" ] || return 1
+  { IFS= read -r first && IFS= read -r second; } <"$1" 2>/dev/null || return 1
+  [ "$second" = "$LED_FILE_MARKER" ]
+}
+
 # Succeeds when the LED service's unit is installed, and is this tool's.
 led_service_installed() {
   led_file_is_ours "$LED_UNIT"
@@ -2273,8 +2283,8 @@ led_upstream_present() {
 
 # Succeeds, printing why, when something by one of this tool's names is there
 # and is not this tool's: a unit, udev rule or sysusers file without the
-# marker, or the group with no sysusers file of this tool's to have created
-# it. Installing over any of them would be taking over state this tool did
+# marker, a file where the hand-rolled install would copy the watcher, or the
+# group with no sysusers file of this tool's to have created it. Installing over any of them would be taking over state this tool did
 # not create - a group somebody already uses would get the LED, and uninstall
 # would later delete it. install.sh asks nothing while this holds, and
 # led_service_install() checks it again before it writes.
@@ -2286,6 +2296,10 @@ led_install_conflict() {
       return 0
     fi
   done
+  if [ -n "${LED_WATCHER_SRC:-}" ] && [ -e "$LED_BIN" ] && ! led_watcher_is_ours "$LED_BIN"; then
+    echo "$LED_BIN is there already, and is not this tool's"
+    return 0
+  fi
   if ! led_file_is_ours "$LED_SYSUSERS" && getent group "$LED_GROUP" >/dev/null 2>&1; then
     echo "a group named $LED_GROUP exists already, and is not this tool's"
     return 0
@@ -2384,9 +2398,10 @@ led_service_install() {
     echo "The watcher's path, $LED_BIN, cannot go into a unit file - not installed." >&2
     return 1
   fi
-  # A package's watcher is run where it lies. Checked, not assumed, like the
-  # module and the helper: a watcher somebody other than root can replace is
-  # code of their choosing, run by a service with the LED in its hands.
+  # A package's watcher is run where it lies, by a unit this run writes, so it
+  # gets more than the presence check --no-build gives the module and the
+  # helper: a watcher somebody other than root can replace is code of their
+  # choosing, run by a service with the LED in its hands.
   if [ -z "$LED_WATCHER_SRC" ] && ! led_path_is_roots_alone "$LED_BIN"; then
     echo "$LED_BIN is missing, or somebody other than root can replace it or a" >&2
     echo "directory above it - the power-button LED service is not installed." >&2
@@ -2458,13 +2473,22 @@ led_service_install() {
     led_service_rollback "systemctl daemon-reload failed" "$keep" "$was_active"
     return 1
   fi
-  # An update leaves a service somebody disabled by hand disabled.
-  if [ "$how" = refresh ] && ! systemctl is-enabled --quiet "$LED_NAME.service" 2>/dev/null; then
+  # An update restarts a running service, so its new watcher runs, and leaves
+  # a stopped one stopped. Whether it is enabled is never changed: that is
+  # its owner's setting. (Deciding by is-enabled restarted a service stopped
+  # by hand, and left one disabled but running on the old watcher, out of
+  # date at every later run: review, 2026-11-16.)
+  if [ "$how" = refresh ] && [ "$was_active" = false ]; then
     rm -rf -- "$keep"
-    echo "Updated. $LED_NAME.service stays disabled, as it was."
+    echo "Updated. $LED_NAME.service was not running, and is left stopped."
     return 0
   fi
-  if ! { sudo systemctl enable --quiet "$LED_NAME.service" \
+  if [ "$how" = refresh ]; then
+    if ! sudo systemctl restart "$LED_NAME.service"; then
+      led_service_rollback "the service would not start" "$keep" "$was_active"
+      return 1
+    fi
+  elif ! { sudo systemctl enable --quiet "$LED_NAME.service" \
     && sudo systemctl restart "$LED_NAME.service"; }; then
     led_service_rollback "the service would not start" "$keep" "$was_active"
     return 1
@@ -2507,7 +2531,9 @@ led_service_rollback() {
     echo "   Rolled back, so nothing of it is left. journalctl -u $LED_NAME -b may" >&2
     echo "   say more. The rest of this run is unaffected." >&2
     led_service_remove
-    [ -z "$LED_WATCHER_SRC" ] || sudo rm -f "$LED_BIN"
+    if [ -n "$LED_WATCHER_SRC" ] && led_watcher_is_ours "$LED_BIN"; then
+      sudo rm -f "$LED_BIN"
+    fi
   fi
   # rmdir, so a directory something else has used since stays.
   for d in "${LED_CREATED_DIRS[@]}"; do
@@ -2579,11 +2605,26 @@ version_is_newer() {
   [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" = "$1" ]
 }
 
-# Prints the newest release tag the checkout $1 knows, or nothing. Only
-# vX.Y.Z counts: a pre-release or any other tag is not a release.
+# Prints the remote's main line in the checkout $1: what origin/HEAD points
+# at, as `git clone` sets it, or else origin/main. Nothing when it has neither.
+release_line_ref() {
+  local ref
+  ref="$(git -C "$1" symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null)" \
+    || ref=refs/remotes/origin/main
+  git -C "$1" rev-parse -q --verify "$ref^{commit}" >/dev/null 2>&1 || return 0
+  printf '%s\n' "$ref"
+}
+
+# Prints the newest release tag the checkout $1 knows, or nothing. A release
+# is a vX.Y.Z tag - not a pre-release, not any other tag - on the remote's
+# main line: the release workflow tags main, and a tag pushed onto some other
+# commit is no release, however high its number. The tags carry no
+# signatures, so this is as far as checking them can go (review, 2026-11-16).
 latest_release_tag() {
-  local tags
-  tags="$(git -C "$1" tag -l 'v*' 2>/dev/null || true)"
+  local ref tags
+  ref="$(release_line_ref "$1")"
+  [ -n "$ref" ] || return 0
+  tags="$(git -C "$1" tag -l --merged "$ref" 'v*' 2>/dev/null || true)"
   grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' <<<"$tags" | sort -V | tail -n1 || true
 }
 
@@ -2591,18 +2632,17 @@ latest_release_tag() {
 # release tag $3. Returns 0 when it can, and otherwise:
 #   1  that release is not newer than these files
 #   3  tracked files have local changes, which switching could lose
-#   4  the checkout is on a branch with commits the release does not have:
-#      it cannot be fast-forwarded, and rewinding it is not this tool's call
-# A checkout on no branch (at an older tag, say) simply moves to the new one.
+#   4  the checkout has commits the release does not have: a branch cannot be
+#      fast-forwarded, rewinding it is not this tool's call, and moving a
+#      checkout on no branch would leave its commits to the reflog
+# A checkout at an older release, on a branch or on none, moves.
 upgrade_checkout_movable() {
   local dir="$1" current="$2" tag="$3" head target
   [ -n "$tag" ] && version_is_newer "${tag#v}" "$current" || return 1
   git -C "$dir" diff --quiet HEAD -- 2>/dev/null || return 3
-  if git -C "$dir" symbolic-ref -q HEAD >/dev/null; then
-    head="$(git -C "$dir" rev-parse HEAD)" || return 4
-    target="$(git -C "$dir" rev-parse "$tag^{commit}")" || return 4
-    git -C "$dir" merge-base --is-ancestor "$head" "$target" || return 4
-  fi
+  head="$(git -C "$dir" rev-parse HEAD)" || return 4
+  target="$(git -C "$dir" rev-parse "$tag^{commit}")" || return 4
+  git -C "$dir" merge-base --is-ancestor "$head" "$target" || return 4
   return 0
 }
 
@@ -2648,6 +2688,10 @@ upgrade_checkout() {
     echo "Could not fetch from origin (offline?) - carrying on with ${TOOL_VERSION:-these files}."
     return 0
   fi
+  if [ -z "$(release_line_ref "$REPO_DIR")" ]; then
+    echo "No origin/main here to tell releases by - carrying on with ${TOOL_VERSION:-these files}."
+    return 0
+  fi
   tag="$(latest_release_tag "$REPO_DIR")"
   upgrade_checkout_movable "$REPO_DIR" "$TOOL_VERSION" "$tag" || rc=$?
   case "$rc" in
@@ -2662,8 +2706,8 @@ upgrade_checkout() {
       return 0
       ;;
     *)
-      echo "$tag is out, but this checkout's branch has commits $tag does not - not"
-      echo "moving it; carrying on with ${TOOL_VERSION:-these files}."
+      echo "$tag is out, but this checkout has commits $tag does not - not moving"
+      echo "it; carrying on with ${TOOL_VERSION:-these files}."
       return 0
       ;;
   esac

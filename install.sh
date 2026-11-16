@@ -358,9 +358,20 @@ fi
 echo "== tpm-keyring-unlock installer =="
 echo
 
-if [ "$UPGRADE" = true ] && [ -z "${TPM_KEYRING_UPGRADE_REEXEC:-}" ]; then
-  upgrade_checkout
-  echo
+if [ "$UPGRADE" = true ]; then
+  # An upgrade is of an install that exists. Without a sealed secret there is
+  # nothing to keep, and the run would be a first install by another name.
+  # Asked before the checkout moves: refusing after it had would leave the
+  # checkout switched for a run that then did nothing (review, 2026-11-16).
+  if [ ! -f "$DATA_DIR/seal.priv" ]; then
+    echo "Nothing to upgrade for $USER: no sealed secret in $DATA_DIR." >&2
+    echo "Run the installer without --upgrade to install." >&2
+    exit 1
+  fi
+  if [ -z "${TPM_KEYRING_UPGRADE_REEXEC:-}" ]; then
+    upgrade_checkout
+    echo
+  fi
 fi
 
 # --- 0. hard requirements - checked before touching anything, including
@@ -429,16 +440,10 @@ else
   echo
 fi
 
-# 1c. seal vs. re-seal
+# 1c. seal vs. re-seal (with --upgrade, a sealed secret is there: checked
+# before anything else)
 RESEAL=false
 [ -f "$DATA_DIR/seal.priv" ] && RESEAL=true
-# An upgrade is of an install that exists. Without a sealed secret there is
-# nothing to keep, and the run would be a first install by another name.
-if [ "$UPGRADE" = true ] && [ "$RESEAL" = false ]; then
-  echo "Nothing to upgrade for $USER: no sealed secret in $DATA_DIR." >&2
-  echo "Run the installer without --upgrade to install." >&2
-  exit 1
-fi
 
 # 1d. login PAM stacks that need the helper wired in - and every stack that
 # carries it already, keyring line or not. One whose keyring line was taken
@@ -983,7 +988,12 @@ if [ "$UPGRADE" = true ]; then
     SEAL_REASON="it no longer unseals - a Secure Boot change moves PCR7, and the seal with it"
   fi
   if [ -z "$SEAL_REASON" ]; then
+    # Unsealing proves the seal works, not that what it holds is still the
+    # keyring password - nothing here can check that. A plain re-run asks
+    # "Overwrite?", and Enter re-seals; --upgrade does not ask, so it says
+    # when to (review, 2026-11-16).
     echo "It unseals through the updated helper - kept. Nothing to type."
+    echo "Changed your keyring password since you sealed it? Then re-seal: $SEAL_SH"
   else
     echo "Re-sealing, because $SEAL_REASON."
     tpm_run "$SEAL_SH"

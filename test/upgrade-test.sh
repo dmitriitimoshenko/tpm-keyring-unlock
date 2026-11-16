@@ -76,6 +76,16 @@ check "before fetching, the newest release known is the clone's" "$(latest_relea
 g "$T/work" fetch -q --tags origin
 check "after fetching: the newest vX.Y.Z, not the rc or another tag" "$(latest_release_tag "$T/work")" v1.1.0
 
+# A release-looking tag on a commit that is not on main is no release.
+g "$T/upstream" switch -q -c side
+echo 9.0.0 >"$T/upstream/VERSION"
+g "$T/upstream" commit -q -am "not a release"
+g "$T/upstream" tag v9.0.0
+g "$T/upstream" switch -q main
+g "$T/upstream" push -q origin v9.0.0
+g "$T/work" fetch -q --tags origin
+check "a vX.Y.Z tag off main (v9.0.0 on a side commit) is no release" "$(latest_release_tag "$T/work")" v1.1.0
+
 mv_rc() { local rc=0; upgrade_checkout_movable "$T/work" "$1" "$2" || rc=$?; echo "$rc"; }
 check "on main at 1.0.0: can move to v1.1.0" "$(mv_rc 1.0.0 v1.1.0)" 0
 check "no release tag at all: nothing to move to" "$(mv_rc 1.0.0 '')" 1
@@ -103,6 +113,13 @@ g "$T/work" commit -q -m "my own change"
 mine="$(g "$T/work" rev-parse HEAD)"
 check "a branch with its own commits: not moved" "$(mv_rc 1.0.0 v1.1.0)" 4
 check "and left exactly where it was" "$(g "$T/work" rev-parse HEAD)" "$mine"
+
+# Commits made on no branch would be left to the reflog: not moved either.
+g "$T/work" -c advice.detachedHead=false checkout -q v1.0.0
+echo detached >"$T/work/detached-work"
+g "$T/work" add detached-work
+g "$T/work" commit -q -m "work on a detached HEAD"
+check "detached, with commits of its own: not moved" "$(mv_rc 1.0.0 v1.1.0)" 4
 
 # A checkout at an older tag, on no branch, moves to the new tag.
 g "$T/work" -c advice.detachedHead=false checkout -q v1.0.0
@@ -170,5 +187,24 @@ check "origin unreachable: carries on, says so" \
   "$(grep -c 'Could not fetch from origin' <<<"$out"):$(cat "$T/work/VERSION")" "1:1.0.0"
 
 check "install.sh --help documents --upgrade" "$("$REPO_DIR/install.sh" --help | grep -c -- '--upgrade')" 2
+
+# No main line to tell releases by: nothing counts as one.
+git clone -q "$T/origin.git" "$T/nomain"
+g "$T/nomain" remote set-head origin -d
+g "$T/nomain" update-ref -d refs/remotes/origin/main
+check "no origin/main or origin/HEAD: no release known" "$(latest_release_tag "$T/nomain")" ""
+
+# install.sh refuses an upgrade with nothing installed before it touches the
+# checkout: run in a pty (it insists on one), with a HOME that has no sealed
+# secret. It must stop before its first step, which would fetch.
+if command -v script >/dev/null 2>&1; then
+  mkdir -p "$T/home"
+  out="$(HOME="$T/home" script -qec "$REPO_DIR/install.sh --upgrade" /dev/null 2>&1 </dev/null || true)"
+  check "--upgrade with nothing installed: refused" "$(grep -c 'Nothing to upgrade' <<<"$out")" 1
+  check "--upgrade with nothing installed: refused before the checkout step" \
+    "$(grep -c 'Newest release' <<<"$out" || true)" 0
+else
+  echo "note - no 'script' here: the refusal order is not checked"
+fi
 
 exit "$fail"

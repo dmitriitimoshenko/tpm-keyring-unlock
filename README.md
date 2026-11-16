@@ -76,7 +76,12 @@ are rebuilt, the PAM stacks re-checked, and whatever the new version adds is
 offered, such as the [power-button LED](#power-button-led). Your sealed secret
 is kept if it still unseals through the new helper, so there is nothing to
 type. It is re-sealed only if it no longer unseals, or if it was sealed before
-logins got the fast path.
+logins got the fast path. That it unseals does not prove it is still your
+keyring password: if you changed that password since, re-seal with
+`bin/seal.sh`.
+
+Only a `vX.Y.Z` tag on the remote's main line counts as a release, and a
+checkout with commits of its own, on a branch or not, is never moved.
 
 1.6.0 and earlier have no `--upgrade` yet, so pull once by hand:
 
@@ -454,18 +459,23 @@ implementation in bash, the language the rest of this tool is written in:
   multicolour LED defaults to red, it lights only white.
 - A touch, the end of the prompt, or fprintd going away hands the LED back
   through its `chromeos-auto` trigger. One stretch of blinking lasts 60
-  seconds at most. A prompt that is already up when the service starts
-  blinks too: it asks fprintd once, at start.
+  seconds at most, and after that only a new prompt starts it again. A
+  prompt that is already up when the service starts blinks too: it asks
+  fprintd once, at start.
 - It only ever takes the LED from `chromeos-auto`. If you switched the
   button off yourself (`trigger none`), it stays off, and the service leaves
   it alone. While the LED is the service's, a note in
   `/run/tpm-keyring-led` says so. If the service is killed mid-blink, the
   note is how its next start tells "left dark by a crash" from "switched off
-  by you".
+  by you". If you set the LED's trigger while it blinks, the service lets go
+  of it and writes nothing more.
 - The service runs as a throwaway user (`DynamicUser=`) with no capabilities,
   sandboxed. `systemd-analyze security tpm-keyring-led` rates it 0.6. A udev
   rule lets its group, `tpm-keyring-led`, write the LED's `trigger`,
-  `brightness` and `multi_intensity`, and nothing else.
+  `brightness` and `multi_intensity`, and nothing else. A writable `trigger`
+  takes any trigger the kernel offers for that LED, not only the two the
+  service uses. File permissions cannot narrow that, so the limit is the
+  service itself: no capabilities, and a sandbox.
 
 It needs `gdbus` (the installer adds it to the packages when missing) and
 fprintd 1.92 or newer, which every release this tool supports ships.
@@ -475,8 +485,9 @@ Files: `/usr/local/sbin/tpm-keyring-led` (a package runs its own copy in
 `/etc/udev/rules.d/90-tpm-keyring-led.rules` and
 `/etc/sysusers.d/tpm-keyring-led.conf`. A later run updates them when they
 differ from the version it carries, or when the running watcher is older
-than the file (a package update), and leaves a service you disabled
-disabled. If an update fails, the earlier version is put back.
+than the file (a package update). An update restarts the service if it is
+running, leaves it stopped if it is not, and never changes whether it is
+enabled. If an update fails, the earlier version is put back.
 
 To switch the blinking off and keep everything else:
 

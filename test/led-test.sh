@@ -228,6 +228,24 @@ run_watcher off chromeos:white:power
 check "a button its owner switched off (trigger none) is not woken, at start or prompt" \
   "$(out off waiting)" "[none] kbd-capslock chromeos-auto|100|100"
 
+# Somebody sets the trigger while it blinks: theirs is the last word.
+rm -rf "$T/leds"
+make_led chromeos:white:power white 100
+cat >"$T/owner-set.sh" <<'EOF'
+needed true
+sleep 0.6
+printf '[heartbeat] none chromeos-auto\n' >"$LED/trigger"
+sleep 0.6; snap during; mark during-note
+needed false
+sleep 0.4; snap after
+EOF
+run_watcher owner-set chromeos:white:power
+check "a trigger set by somebody else mid-blink: the watcher lets go, writes nothing" \
+  "$(out owner-set during | cut -d'|' -f1)" "[heartbeat] none chromeos-auto"
+check "and drops its note" "$(out owner-set during-note)" "no note"
+check "and does not put chromeos-auto over it when the prompt ends" \
+  "$(out owner-set after | cut -d'|' -f1)" "[heartbeat] none chromeos-auto"
+
 # --- the safety cap, and a line split across a blink tick -------------------
 rm -rf "$T/leds"
 make_led chromeos:white:power white 100
@@ -238,11 +256,32 @@ needed true
 sleep 0.5; snap early
 sleep 3.0; snap capped
 sample capped-sampled 0.6
+# A retry: finger-needed false, then true again - a new prompt.
+needed false
+needed true
+sample retried 0.8
 EOF
 run_watcher cap chromeos:white:power 2
 check "cap: blinking at first" "$(act cap early)" "none"
 check "cap: back to the EC once it runs out, still needed" "$(act cap capped)" "chromeos-auto"
 check "cap: and no more blinking" "$(wc -w <"$T/out-cap/capped-sampled" | tr -d ' ')" "1"
+check "cap: a new prompt after it blinks again" "$(out cap retried)" "0 100 "
+
+# Lines arriving faster than the half period - a chatty second device - must
+# neither hold the LED still nor keep it past the cap.
+cat >"$T/stream.sh" <<'EOF'
+needed true
+for i in $(seq 30); do
+  if [ $((i % 2)) = 0 ]; then present false 1; else emit "/net/reactivated/Fprint/Device/1: net.reactivated.Fprint.Device.VerifyFingerSelected ('any',)"; fi
+  [ "$i" -gt 15 ] || cat "$LED/brightness" >>"$OUT/stream-values"
+  sleep 0.1
+done
+snap capped
+EOF
+run_watcher stream chromeos:white:power 2
+check "a stream of lines every 0.1 s: it still blinks, dark and lit" \
+  "$(sort -u "$T/out-stream/stream-values" | tr '\n' ' ')" "0 100 "
+check "a stream of lines: the cap still ends it" "$(act stream capped)" "chromeos-auto"
 
 cat >"$T/split.sh" <<'EOF'
 needed true
@@ -306,6 +345,15 @@ check "--restore with no note leaves the LED unwritten" \
 TPM_KEYRING_LED_SYSFS="$T/leds" bash "$WATCHER" --restore
 check "--restore with no runtime directory leaves it unwritten too" \
   "$(stat -c %Y "$LEDDIR/trigger")" "$(date -d '2000-01-01' +%s)"
+# A note, but the trigger is no longer the `none` the killed watcher left:
+# somebody set it since, and it stays.
+printf 'chromeos:white:power\n\n' >"$T/out-kill/run/taken"
+printf '[heartbeat] none chromeos-auto\n' >"$LEDDIR/trigger"
+RUNTIME_DIRECTORY="$T/out-kill/run" TPM_KEYRING_LED_SYSFS="$T/leds" bash "$WATCHER" --restore
+check "--restore leaves a trigger somebody set after the kill, and drops the note" \
+  "$(<"$LEDDIR/trigger"):$(ls "$T/out-kill/run")" "[heartbeat] none chromeos-auto:"
+printf '[none] kbd-capslock chromeos-auto\n' >"$LEDDIR/trigger"
+touch -d '2000-01-01' "$LEDDIR/trigger"
 # A note naming anything but a power-button LED is not acted on.
 printf '../../etc\n\n' >"$T/out-kill/run/taken"
 RUNTIME_DIRECTORY="$T/out-kill/run" TPM_KEYRING_LED_SYSFS="$T/leds" bash "$WATCHER" --restore
@@ -385,6 +433,11 @@ check "the udev rule runs on add only, not on every trigger write" \
 for f in "$UNIT_SRC" "$RULE_SRC" "$SYSUSERS_SRC"; do
   check "${f##*/} starts with the marker uninstall.sh knows it by" "$(head -n1 "$f")" "$LED_FILE_MARKER"
 done
+check "the watcher carries the marker under its shebang" "$(sed -n 2p "$WATCHER")" "$LED_FILE_MARKER"
+if led_watcher_is_ours "$WATCHER"; then got=yes; else got=no; fi
+check "led_watcher_is_ours knows the watcher" "$got" yes
+if led_watcher_is_ours "$UNIT_SRC"; then got=yes; else got=no; fi
+check "and nothing else (the unit has the marker on line 1)" "$got" no
 led_unit_render "$UNIT_SRC" /usr/local/sbin/tpm-keyring-led >"$T/unit"
 check "rendered unit: starts the watcher" "$(sed -n 's/^ExecStart=//p' "$T/unit")" "/usr/local/sbin/tpm-keyring-led"
 check "rendered unit: its ExecStopPost restores the LED, and may fail" \
@@ -538,12 +591,20 @@ chmod +x "$E/bin"/*
   STUB_MODE=""
 
   : >"$E/calls"
-  ENABLED_RC=1
+  ACTIVE_RC=1
   rc=0
   led_service_install refresh >"$E/out" 2>&1 || rc=$?
-  check "update of a disabled service: succeeds" "$rc" "0"
-  check "update of a disabled service: it stays disabled" \
+  check "update of a stopped service: succeeds" "$rc" "0"
+  check "update of a stopped service: not started, enablement untouched" \
     "$(ran 'systemctl enable'):$(ran 'systemctl restart')" "no:no"
+  ACTIVE_RC=0
+  : >"$E/calls"
+  ENABLED_RC=1
+  echo '# changed again' >>"$LED_RULE"
+  rc=0
+  led_service_install refresh >"$E/out" 2>&1 || rc=$?
+  check "update of a running service someone disabled: restarted, not enabled" \
+    "$rc:$(ran 'systemctl enable'):$(ran 'systemctl restart')" "0:no:yes"
   ENABLED_RC=0
 
   # Removal takes only what carries the marker; the group only when the
@@ -588,6 +649,15 @@ chmod +x "$E/bin"/*
   if reason="$(led_install_conflict)"; then got="$reason"; else got=none; fi
   check "conflict: a group by the name that this tool did not create" \
     "$got" "a group named $LED_GROUP exists already, and is not this tool's"
+
+  # Something else where the hand-rolled install copies the watcher.
+  fresh
+  printf '#!/bin/sh\necho somebody else\n' >"$LED_BIN"
+  if reason="$(led_install_conflict)"; then got="$reason"; else got=none; fi
+  check "conflict: a file at the watcher's path that is not this tool's" "$got" "$LED_BIN is there already, and is not this tool's"
+  rc=0
+  led_service_install install >"$E/out" 2>&1 || rc=$?
+  check "conflict: the install refuses and leaves that file alone" "$rc:$(sed -n 2p "$LED_BIN")" "1:echo somebody else"
 
   # A package's watcher: run where it lies, so it has to be root's alone.
   fresh

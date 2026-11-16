@@ -478,15 +478,18 @@ fi
 # tool's marker line; one by the same name without it is somebody else's, and
 # stays (bin/lib.sh, led_service_remove). Offered while any of the three is
 # this tool's, so a half-removed install is finished off. The watcher is
-# deleted only where install.sh copied it: a package's copy is the package
-# manager's. A watcher left behind by a unit removed by hand goes too.
+# deleted only where install.sh copied it, and only if it carries the marker:
+# a package's copy is the package manager's, and another file at that path is
+# somebody else's. A watcher left behind by a unit removed by hand goes too.
 if led_service_installed || led_file_is_ours "$LED_RULE" || led_file_is_ours "$LED_SYSUSERS" \
-  || { [ "$KEEP_PACKAGED_FILES" = false ] && [ -e "$LED_BIN_LOCAL" ] && [ ! -e "$LED_UNIT" ]; }; then
+  || { [ "$KEEP_PACKAGED_FILES" = false ] && led_watcher_is_ours "$LED_BIN_LOCAL" && [ ! -e "$LED_UNIT" ]; }; then
   echo
   if confirm "Remove the power-button LED service ($LED_NAME), which blinks the button while the reader waits?"; then
     led_service_remove
-    if [ "$KEEP_PACKAGED_FILES" = false ] && [ -e "$LED_BIN_LOCAL" ]; then
+    if [ "$KEEP_PACKAGED_FILES" = false ] && led_watcher_is_ours "$LED_BIN_LOCAL"; then
       sudo rm -f "$LED_BIN_LOCAL"
+    elif [ "$KEEP_PACKAGED_FILES" = false ] && [ -e "$LED_BIN_LOCAL" ]; then
+      echo "$LED_BIN_LOCAL is not this tool's watcher - left alone."
     fi
     echo "Removed."
   else

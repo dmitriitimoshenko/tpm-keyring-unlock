@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
+# tpm-keyring-unlock: power-button LED
+#
 # tpm-keyring-led: blinks the power-button LED of a Framework laptop while
 # fprintd waits for a finger. The fingerprint reader sits in that button, and
 # nothing else shows when it is listening - sudo, the lock screen, polkit.
+# (The line above is the marker install.sh and uninstall.sh know this file by:
+# a file at this path without it is not this tool's to replace or remove.)
 #
 # The optional part of tpm-keyring-unlock. install.sh offers it on a Framework
 # laptop only, and installs it as tpm-keyring-led.service: a throwaway user
@@ -23,6 +27,11 @@
 #
 # No `set -e`: one failed write to the LED must not end the watcher.
 set -uo pipefail
+# The C locale, for two things that read numbers: $EPOCHREALTIME is written
+# with the locale's decimal separator (a comma under de_DE, seen on a machine
+# with LC_NUMERIC=de_DE.UTF-8), and read -t's timeouts below are written with
+# a point.
+export LC_ALL=C
 
 # Overridable for the test suite. The service does not set it.
 LEDS="${TPM_KEYRING_LED_SYSFS:-/sys/class/leds}"
@@ -35,8 +44,8 @@ FPRINT_BUS=net.reactivated.Fprint
 # from here: install.sh copies this file alone.
 LED_CANDIDATES=(chromeos:white:power chromeos:multicolor:power)
 
-HALF=0.25     # seconds dark, then seconds lit
-COLOUR=white  # the only channel lit on a multicolour LED, whose default is red
+HALF_US=250000  # microseconds dark, then microseconds lit
+COLOUR=white    # the only channel lit on a multicolour LED, whose default is red
 # Seconds one stretch of blinking may last at most. Overridable for the test
 # suite, which cannot wait out a minute; the service does not set it.
 MAX_BLINK="${TPM_KEYRING_LED_MAX_BLINK:-60}"
@@ -56,16 +65,30 @@ max=100             # its max_brightness
 saved_intensity=""  # a multicolour LED's colours from before it was taken
 lit=false
 blinking=false
-blink_until=0
+blink_until=0       # microseconds: when the cap ends this stretch
+next_tick=0         # microseconds: when the LED next goes dark or lit
+capped=false        # the cap ended the last stretch, and no new prompt since
+fresh_need=false    # the line just read said finger-needed: <true>
 
 log() { printf 'tpm-keyring-led: %s\n' "$*" >&2; }
 
-# Succeeds when the EC drives the LED directory $1 right now. The kernel
-# brackets the active trigger.
-ec_has_it() {
+# Microseconds since the epoch, into $now. Either separator is taken out, in
+# case the locale above did not reach $EPOCHREALTIME.
+clock() { now="${EPOCHREALTIME/[.,]/}"; }
+
+# Prints the active trigger of the LED directory $1: the word the kernel
+# brackets in the list it reads back. A file holding a single word - which
+# sysfs never gives, but the test suite's plain files do - is that word.
+active_trigger() {
   local t
   { t="$(<"$1/trigger")"; } 2>/dev/null || return 1
-  [[ " $t " == *" [chromeos-auto] "* ]]
+  if [[ "$t" =~ \[([^]]+)\] ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+  elif [[ -n "$t" && "$t" != *" "* ]]; then
+    printf '%s\n' "$t"
+  else
+    return 1
+  fi
 }
 
 # Writes $3 into the attribute $2 of the LED directory $1.
@@ -74,8 +97,9 @@ put() {
 }
 
 # Gives back the LED the note says an earlier watcher took and never returned:
-# its colours first, then the EC. With no note, nothing is touched. Run at
-# startup and by the unit's ExecStopPost.
+# its colours first, then the EC - the trigger only if it is still the `none`
+# that watcher set, since any other is somebody's choice made since. With no
+# note, nothing is touched. Run at startup and by the unit's ExecStopPost.
 restore_marked() {
   local name="" intensity="" c known=false d
   [ -n "$MARK" ] && [ -f "$MARK" ] || return 0
@@ -86,7 +110,7 @@ restore_marked() {
   d="$LEDS/$name"
   if [ "$known" = true ] && [ -e "$d/trigger" ]; then
     [[ ! "$intensity" =~ ^[0-9]+(\ [0-9]+)*$ ]] || put "$d" multi_intensity "$intensity"
-    ec_has_it "$d" || put "$d" trigger chromeos-auto
+    [ "$(active_trigger "$d")" != none ] || put "$d" trigger chromeos-auto
   fi
   rm -f "$MARK" 2>/dev/null
 }
@@ -102,7 +126,7 @@ take_led() {
   led=""
   for name in "${LED_CANDIDATES[@]}"; do
     d="$LEDS/$name"
-    ec_has_it "$d" || continue
+    [ "$(active_trigger "$d")" = chromeos-auto ] || continue
     led="$d"
     break
   done
@@ -129,20 +153,30 @@ take_led() {
   return 0
 }
 
-# Hands the LED taken by take_led() back: its colours first, then the EC.
+# Lets go of the LED without writing to it: somebody else has set its trigger
+# while it blinked, and theirs is the last word.
+let_go() {
+  led=""
+  saved_intensity=""
+  blinking=false
+  [ -z "$MARK" ] || rm -f "$MARK" 2>/dev/null
+}
+
+# Hands the LED taken by take_led() back: its colours first, then the EC -
+# the trigger only if it is still the `none` take_led() set.
 give_back() {
   [ -n "$led" ] || return 0
   [ -z "$saved_intensity" ] || put "$led" multi_intensity "$saved_intensity"
-  saved_intensity=""
-  ec_has_it "$led" || put "$led" trigger chromeos-auto
-  led=""
-  [ -z "$MARK" ] || rm -f "$MARK" 2>/dev/null
+  [ "$(active_trigger "$led")" != none ] || put "$led" trigger chromeos-auto
+  let_go
 }
 
 blink_start() {
   take_led || return 0
   blinking=true
-  blink_until=$((SECONDS + MAX_BLINK))
+  clock
+  blink_until=$((now + MAX_BLINK * 1000000))
+  next_tick=$((now + HALF_US))
   # Dark first: the power LED is normally lit, so starting lit would show no
   # change for the first half period.
   lit=false
@@ -154,7 +188,15 @@ blink_stop() {
   give_back
 }
 
+# Flips the LED between dark and lit. Fails, having let go, when somebody else
+# set its trigger since it was taken: writing brightness then would undo their
+# setting.
 blink_toggle() {
+  if [ "$(active_trigger "$led")" != none ]; then
+    log "somebody else set $led's trigger - letting go of it"
+    let_go
+    return 1
+  fi
   if [ "$lit" = true ]; then
     put "$led" brightness 0
     lit=false
@@ -220,7 +262,7 @@ declare -A needed=() present=()
 note_props() {
   local path="$1" props="$2" changed=1
   case "$props" in
-    *"'finger-needed': <true>"*) needed[$path]=1; changed=0 ;;
+    *"'finger-needed': <true>"*) needed[$path]=1; fresh_need=true; changed=0 ;;
     *"'finger-needed': <false>"*) unset "needed[$path]"; changed=0 ;;
   esac
   case "$props" in
@@ -262,28 +304,42 @@ seed_state() {
 
 log "watching $FPRINT_BUS for the power-button LED"
 
-# read -t is the clock: while blinking, every half period without a line from
-# gdbus is a toggle. A timeout can land mid-line, and read keeps what it got,
-# so that part is carried over to the next read rather than lost.
+# While blinking, the clock decides: each pass toggles the LED when its half
+# period is up and ends the stretch when the cap is, and then waits for a line
+# from gdbus only until the next tick. Lines arriving faster than that - a
+# chatty device, a second reader - cannot hold the LED still or keep it past
+# the cap (review, 2026-11-16). A timeout can land mid-line, and read keeps
+# what it got, so that part is carried over to the next read.
 partial=""
 while :; do
   line=""
   if [ "$blinking" = true ]; then
+    clock
+    if [ "$now" -ge "$blink_until" ]; then
+      # The cap. Only a new prompt - finger-needed turning true again - starts
+      # it again. Any other line would not do: a stream of them, a second
+      # device's finger-present say, would otherwise take the LED straight
+      # back, and the cap would hold nothing (found by its test, 2026-11-16).
+      blink_stop
+      capped=true
+      continue
+    fi
+    if [ "$now" -ge "$next_tick" ]; then
+      blink_toggle || continue
+      next_tick=$((now + HALF_US))
+    fi
+    wait_us=$((next_tick - now))
+    [ "$wait_us" -gt 0 ] || wait_us=1
+    printf -v tmo '%d.%06d' $((wait_us / 1000000)) $((wait_us % 1000000))
     # Not `if ! read`: after that, $? is the negation's status, and a timeout
     # read as end of input. The first version did that, and stopped at the
     # first tick (JOURNAL.md, 2026-11-15).
     rc=0
-    IFS= read -r -t "$HALF" -u "$mon" line || rc=$?
+    IFS= read -r -t "$tmo" -u "$mon" line || rc=$?
     if [ "$rc" -ne 0 ]; then
       # Above 128 is a timeout; anything else is the end of gdbus's output.
       [ "$rc" -gt 128 ] || break
       partial+="$line"
-      if [ "$SECONDS" -ge "$blink_until" ]; then
-        # The cap. Only a new change reported by fprintd starts it again.
-        blink_stop
-      else
-        blink_toggle
-      fi
       continue
     fi
   else
@@ -308,10 +364,15 @@ while :; do
   fi
 
   if wants_blink; then
-    [ "$blinking" = true ] || blink_start
-  elif [ "$blinking" = true ]; then
-    blink_stop
+    if [ "$blinking" != true ] && { [ "$capped" = false ] || [ "$fresh_need" = true ]; }; then
+      capped=false
+      blink_start
+    fi
+  else
+    capped=false
+    [ "$blinking" != true ] || blink_stop
   fi
+  fresh_need=false
 done
 
 # gdbus's output ended. Leave the LED to the EC, make sure gdbus is gone too,
