@@ -1,3 +1,22 @@
+tpm-keyring-unlock (1.7.0-1) unstable; urgency=medium
+
+  * Release 1.7.0. See JOURNAL.md for the full history.
+  * On a Framework laptop, tpm-keyring-unlock-configure offers to blink
+    the power button's LED while the fingerprint reader in it waits for a
+    finger. It is a small sandboxed service with no root and no network.
+    It follows fprintd's own finger-needed property and hands the LED back
+    to the embedded controller afterwards. Asked only where that LED is
+    present and a finger is enrolled. Idea and design from
+    framework-fingerprint-led-blink by alejandroqh (Apache-2.0),
+    reimplemented in bash. tpm-keyring-unlock-deconfigure takes it out.
+  * tpm-keyring-unlock-configure --upgrade re-checks the configuration
+    after a package upgrade and offers what the new version adds. It keeps
+    the sealed secret, with nothing to type, while it still unseals through
+    the new helper, and re-seals only if it does not. To be offered the LED
+    after upgrading, run it once.
+
+ -- Dmitrii <dmitrii.timoshenko16@gmail.com>  Mon, 16 Nov 2026 16:25:47 +0100
+
 tpm-keyring-unlock (1.6.0-1) unstable; urgency=medium
 
   * Release 1.6.0. See JOURNAL.md for the full history.

@@ -7773,3 +7773,59 @@ for it: blinking during a real `fprintd-verify`, `chromeos-auto` after,
 `Result=success` on stop.
 `test/run-all.sh`: everything PASS (arm64 skipped here). `make test-vm`:
 all 46 checks ok, `install.sh --upgrade` among them.
+
+## Release 1.7.0 (2026-11-16)
+
+Carries the two features of #29 to the packages and to `--upgrade` itself:
+the power-button LED service on Framework laptops, and `install.sh
+--upgrade` (`tpm-keyring-unlock-configure --upgrade` for packages).
+
+**Why in #29 and not a release PR of its own.** Every earlier release was
+its own PR (#22, #25, #27). This time the repo owner pointed out, after #29
+was pushed, that the version had not been bumped, so the bump went into
+#29. The release workflow tags from `VERSION` on main, so merging #29 now
+tags `v1.7.0` and publishes it. Without the bump the merge would have
+tagged nothing.
+
+**`--upgrade` needs this tag.** `upgrade_checkout` moves a checkout only to
+a `vX.Y.Z` tag on the remote's main line that is newer than the checkout's
+`VERSION`. Until `v1.7.0` exists, the newest such tag is `v1.6.0`, which has
+no `--upgrade` and no LED. So `--upgrade` has nothing to bring until a
+release carries it. The bootstrap stays as README says: 1.6.0 and earlier
+pull once by hand, `git pull && ./install.sh --upgrade`.
+
+**Why 1.7.0.** Both are new features and change nothing the tool already
+did, so this is a minor release by semver, as 1.6.0 was for the polkit
+step. The owner can still pick another number: `scripts/bump-version.sh
+X.Y.Z` again, then carry the two changelog entries over by hand.
+
+**The changelogs.** `bump-version.sh` wrote the Debian entry's frame (name,
+address and date from git config, as for every earlier entry). The text of
+both entries is new. It says:
+
+- what the LED service does and what it is: sandboxed, no root, no
+  network, fprintd's own `finger-needed`, the LED handed back to the EC;
+- where it is asked: on a Framework laptop with that LED and an enrolled
+  finger;
+- whose design it follows: framework-fingerprint-led-blink by alejandroqh,
+  Apache-2.0;
+- that `tpm-keyring-unlock-deconfigure` takes it out;
+- what `--upgrade` keeps: the sealed secret, while it still unseals through
+  the new helper.
+
+The upgrade note on these entries is new as well. Earlier ones said to run
+`tpm-keyring-unlock-configure` again and answer `n` at "Overwrite?". This
+one says `--upgrade`, which asks no such question. The AUR `post_upgrade`
+already says the same since #29.
+
+**Where else it goes.** As for every earlier tag, the GitHub release is
+written by hand with the upgrade note on top. The workflow tags, pins the
+AUR checksum (left at the placeholder of 64 zeros by the script) and
+publishes to the Build Service.
+
+**Checked.** The release workflow's five-file version check, run locally:
+all five read 1.7.0. `dpkg-parsechangelog -l packaging/obs/debian.changelog
+-S Version` reads `1.7.0-1`. `rpmspec -q` reads `1.7.0-0`, and `rpmspec -P`
+shows the new `%changelog` entry on top. `test/upgrade-test.sh`: 44 ok. Its
+repositories carry versions of their own, so the real `VERSION` does not
+reach it.
