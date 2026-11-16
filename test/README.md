@@ -195,8 +195,9 @@ actually runs there, never skips.
   out of date; a unit, rule, group or watcher file by this tool's names that
   is not this tool's makes it refuse; removal takes only files with the
   marker; a packaged watcher this account could replace is refused. What it cannot
-  cover is the unit under the system manager (`DynamicUser=`, the sandbox)
-  on the real LED: `JOURNAL.md`, 2026-11-15, records what was checked by
+  cover is the unit under the system manager, which `make test-vm` starts
+  (its user, its sandbox, the system bus), and the udev rule on the real
+  LED: `JOURNAL.md`, 2026-11-15 and 2026-11-16, records what was checked by
   hand, and how.
 - **`test/upgrade-test.sh`** (no container, no root, no network) — the
   first step of `install.sh --upgrade`, which moves a git checkout to the

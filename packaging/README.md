@@ -70,9 +70,9 @@ files into `/etc` with the watcher's packaged path filled into the unit.
 `tpm-keyring-unlock-deconfigure` takes them out again. Removing the package
 without that step leaves them behind. The unit then has nothing to run, and
 its `ConditionPathExists=` keeps it from failing at every boot. Unlike the
-SELinux module, they are not removed in the package's own scripts: they give
-the LED to a group that nothing runs as any more, which is untidy, not
-unsafe.
+SELinux module, they are not removed in the package's own scripts: they leave
+a system user, `tpm-keyring-led`, with no login shell, and its group with the
+LED, and nothing runs as either any more. That is untidy, not unsafe.
 
 ## OBS (openSUSE, Fedora, RHEL, Debian, Ubuntu)
 

@@ -8,10 +8,10 @@
 # a file at this path without it is not this tool's to replace or remove.)
 #
 # The optional part of tpm-keyring-unlock. install.sh offers it on a Framework
-# laptop only, and installs it as tpm-keyring-led.service: a throwaway user
-# with no capabilities, sandboxed. A udev rule lets that service's group write
-# this LED's trigger, brightness and colour, and nothing else. README.md,
-# "Power-button LED".
+# laptop only, and installs it as tpm-keyring-led.service: a system user of
+# its own with no capabilities, sandboxed. A udev rule lets that user's group
+# write this LED's trigger, brightness and colour, and nothing else.
+# README.md, "Power-button LED".
 #
 # The idea and the approach come from framework-fingerprint-led-blink by
 # alejandroqh (https://github.com/alejandroqh/framework-fingerprint-led-blink,

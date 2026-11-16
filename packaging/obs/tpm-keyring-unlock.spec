@@ -3,7 +3,7 @@
 # Built by OBS from the tarball that _service pulls from the git tag.
 #
 Name:           tpm-keyring-unlock
-Version:        1.7.0
+Version:        1.7.1
 Release:        0
 Summary:        TPM-backed unlock of the GNOME login keyring at login
 License:        MIT
@@ -91,6 +91,18 @@ fi
 %{_bindir}/tpm-keyring-unlock-deconfigure
 
 %changelog
+* Mon Nov 16 2026 Dmitrii Timoshenko <dmitrii.timoshenko16@gmail.com> - 1.7.1-0
+- The power-button LED service of 1.7.0 never started. systemd refused its
+  throwaway user, whose name was the service's group's (status 217/USER).
+  tpm-keyring-unlock-configure noticed, took it out again and changed
+  nothing.
+- It now runs as a system user of its own, tpm-keyring-led, made by its
+  sysusers file: no login shell, no home, no password. A throwaway user
+  (DynamicUser=) cannot reach the system bus where that is dbus-daemon, as
+  on Debian and Ubuntu, so even with its name fixed it would not have
+  worked there. To get the service, run tpm-keyring-unlock-configure
+  --upgrade once and answer the LED question.
+
 * Mon Nov 16 2026 Dmitrii Timoshenko <dmitrii.timoshenko16@gmail.com> - 1.7.0-0
 - On a Framework laptop, tpm-keyring-unlock-configure offers to blink the
   power button's LED while the fingerprint reader in it waits for a finger.

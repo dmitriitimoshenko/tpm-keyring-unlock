@@ -38,10 +38,24 @@ RuntimeDirectoryPreserve=yes
 Restart=on-failure
 RestartSec=2
 
-# No root. A throwaway user, whose one extra group is the one the udev rule
-# lets write the LED's trigger, brightness and colour, and nothing else.
-DynamicUser=yes
-SupplementaryGroups=tpm-keyring-led
+# No root. A system user of its own, which the sysusers file creates with no
+# login shell, no home and no password, and whose group of the same name is
+# the one the udev rule lets write the LED's trigger, brightness and colour.
+# Not DynamicUser=, which 1.7.0 had, and which never started anywhere:
+# - it named the throwaway user after the unit, the static group's name, and
+#   systemd refused that ("Failed to update dynamic user credentials: User or
+#   group with specified name already exists", status 217/USER);
+# - and with a name of its own it still cannot reach the system bus where
+#   that is dbus-daemon, as on Debian and Ubuntu. dbus-daemon drops every
+#   client whose user it cannot look up ("Error connecting: The connection is
+#   closed"), and its lookups never reach PID 1, which holds the throwaway
+#   users. On Fedora, whose bus is dbus-broker, the same unit works.
+#   JOURNAL.md, 2026-11-16.
+User=tpm-keyring-led
+Group=tpm-keyring-led
+# What DynamicUser= implied and a system user does not get by itself; the
+# rest of it is set below already.
+RemoveIPC=yes
 CapabilityBoundingSet=
 AmbientCapabilities=
 NoNewPrivileges=yes

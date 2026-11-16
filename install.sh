@@ -690,9 +690,9 @@ fi
 LED_STEP=""
 if framework_power_led >/dev/null && user_has_enrolled_finger; then
   if LED_CONFLICT="$(led_install_conflict)"; then
-    # A unit, rule, sysusers file or group by this tool's names that is not
-    # this tool's: installing over it would take over what somebody else set
-    # up. Said once, not asked about.
+    # A unit, rule, sysusers file, user or group by this tool's names that is
+    # not this tool's: installing over it would take over what somebody else
+    # set up, or run the service as somebody else. Said once, not asked about.
     echo "Not offering to blink the power button: $LED_CONFLICT."
     echo
   elif led_service_installed; then

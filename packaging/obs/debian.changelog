@@ -1,3 +1,20 @@
+tpm-keyring-unlock (1.7.1-1) unstable; urgency=medium
+
+  * Release 1.7.1. See JOURNAL.md for the full history.
+  * The power-button LED service of 1.7.0 never started. systemd refused
+    its throwaway user, whose name was the service's group's (status
+    217/USER). tpm-keyring-unlock-configure noticed, took it out again
+    and changed nothing.
+  * It now runs as a system user of its own, tpm-keyring-led, made by its
+    sysusers file: no login shell, no home, no password. A throwaway user
+    (DynamicUser=) cannot reach the system bus where that is dbus-daemon,
+    as on Debian and Ubuntu, so even with its name fixed it would not
+    have worked there. To get the service, run
+    tpm-keyring-unlock-configure --upgrade once and answer the LED
+    question.
+
+ -- Dmitrii <dmitrii.timoshenko16@gmail.com>  Mon, 16 Nov 2026 16:42:05 +0100
+
 tpm-keyring-unlock (1.7.0-1) unstable; urgency=medium
 
   * Release 1.7.0. See JOURNAL.md for the full history.

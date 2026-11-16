@@ -458,9 +458,19 @@ for bad in relative/tpm-keyring-led "/opt/with space/x" '/opt/a|b' '/opt/a&b' '/
   if led_unit_render "$UNIT_SRC" "$bad" >/dev/null 2>&1; then got=rendered; else got=refused; fi
   check "rendered unit: refuses the path '$bad'" "$got" "refused"
 done
-check "the unit's group is the one the sysusers file creates" \
-  "$(sed -n 's/^SupplementaryGroups=//p' "$UNIT_SRC")" "$(awk '$1 == "g" { print $2 }' "$SYSUSERS_SRC")"
-check "and the one lib.sh names" "$LED_GROUP" "$(awk '$1 == "g" { print $2 }' "$SYSUSERS_SRC")"
+# The sysusers file's `u` line makes the user and a group of the same name.
+check "the unit runs as the user the sysusers file creates" \
+  "$(sed -n 's/^User=//p' "$UNIT_SRC")" "$(awk '$1 == "u" { print $2 }' "$SYSUSERS_SRC")"
+check "and with its group" \
+  "$(sed -n 's/^Group=//p' "$UNIT_SRC")" "$(awk '$1 == "u" { print $2 }' "$SYSUSERS_SRC")"
+check "the user and group lib.sh names are those" \
+  "$LED_USER $LED_GROUP" "$(awk '$1 == "u" { print $2" "$2 }' "$SYSUSERS_SRC")"
+# 1.7.0's DynamicUser= never started (status 217/USER), and a throwaway user
+# with a name of its own still cannot reach the system bus where that is
+# dbus-daemon, Debian's and Ubuntu's: it cannot look such users up, and drops
+# them (JOURNAL.md, 2026-11-16).
+if grep -q '^DynamicUser=' "$UNIT_SRC"; then got=yes; else got=no; fi
+check "the unit has no DynamicUser= (dbus-daemon turns those away)" "$got" "no"
 # ProtectKernelTunables=yes makes /sys read-only, and the LED lives there.
 if grep -q '^ProtectKernelTunables=yes' "$UNIT_SRC"; then got=yes; else got=no; fi
 check "the unit does not make /sys read-only" "$got" "no"
@@ -518,7 +528,7 @@ if [ "$1" = trigger ] && [ "${STUB_MODE:-}" != noudev ]; then
 fi
 exit 0
 EOF
-for c in systemd-sysusers groupdel restorecon; do
+for c in systemd-sysusers userdel groupdel restorecon; do
   printf '#!/usr/bin/env bash\necho "%s $*" >>"$E/calls"\n' "$c" >"$E/bin/$c"
 done
 chmod +x "$E/bin"/*
@@ -535,14 +545,21 @@ chmod +x "$E/bin"/*
   LED_GROUP="$(id -gn)"
   sudo() { "$@"; }
   sleep() { :; }
-  # Whether a group by LED_GROUP's name exists, as the scenario says.
-  getent() { [ -n "${GROUP_EXISTS:-}" ]; }
+  # Whether a group by LED_GROUP's name and a user by LED_USER's exist, as
+  # the scenario says.
+  getent() {
+    case "$1:$2" in
+      "group:$LED_GROUP") [ -n "${GROUP_EXISTS:-}" ] && echo "$LED_GROUP:x:990:" ;;
+      "passwd:$LED_USER") [ -n "${USER_EXISTS:-}" ] && echo "$LED_USER:x:990:990::/:/usr/sbin/nologin" ;;
+      *) return 2 ;;
+    esac
+  }
   fresh() {
     rm -rf "$E/etc" "$E/sbin" "$E/calls" "$E/pid"
     mkdir -p "$E/etc/systemd/system" "$E/etc/udev/rules.d" "$E/sbin"
     rm -rf "$T/leds"
     make_led chromeos:white:power white 100
-    STUB_MODE="" STARTED="" ENABLED_RC=0 ACTIVE_RC=0 GROUP_EXISTS=""
+    STUB_MODE="" STARTED="" ENABLED_RC=0 ACTIVE_RC=0 GROUP_EXISTS="" USER_EXISTS=""
   }
   attr_mode() { stat -c %a "$T/leds/chromeos:white:power/trigger"; }
   ran() { if grep -qF -- "$1" "$E/calls" 2>/dev/null; then echo yes; else echo no; fi; }
@@ -611,13 +628,13 @@ chmod +x "$E/bin"/*
   # sysusers file did.
   printf '# somebody else'"'"'s rule\n' >"$LED_RULE"
   : >"$E/calls"
-  GROUP_EXISTS=1
+  GROUP_EXISTS=1 USER_EXISTS=1
   led_service_remove
   check "remove: the unit and the sysusers file go" \
     "$([ -e "$LED_UNIT" ] || [ -e "$LED_SYSUSERS" ] && echo left || echo gone)" "gone"
   check "remove: a rule by the same name that is not this tool's stays" "$(head -n1 "$LED_RULE")" "# somebody else's rule"
   check "remove: the LED loses group write" "$(attr_mode)" "644"
-  check "remove: the group it created goes" "$(ran groupdel)" "yes"
+  check "remove: the user and the group it created go" "$(ran "userdel $LED_USER"):$(ran groupdel)" "yes:yes"
   check "remove: the kept runtime directory is cleaned" "$(ran 'systemctl clean --what=runtime tpm-keyring-led.service')" "yes"
   check "remove: never writes the LED's trigger" "$(<"$T/leds/chromeos:white:power/trigger")" "$TRIGGERS"
 
@@ -649,6 +666,25 @@ chmod +x "$E/bin"/*
   if reason="$(led_install_conflict)"; then got="$reason"; else got=none; fi
   check "conflict: a group by the name that this tool did not create" \
     "$got" "a group named $LED_GROUP exists already, and is not this tool's"
+
+  # A user by the service's name that this tool did not create: the service
+  # would run as somebody else's account.
+  fresh
+  USER_EXISTS=1
+  if reason="$(led_install_conflict)"; then got="$reason"; else got=none; fi
+  check "conflict: a user by the name that this tool did not create" \
+    "$got" "a user named $LED_USER exists already, and is not this tool's"
+  rc=0
+  led_service_install install >"$E/out" 2>&1 || rc=$?
+  check "conflict: the install refuses, writing nothing" \
+    "$rc:$([ -e "$LED_UNIT" ] || [ -e "$LED_BIN" ] && echo wrote || echo nothing)" "1:nothing"
+  # The user this tool's own sysusers file made is no conflict.
+  rc=0
+  USER_EXISTS=""
+  led_service_install install >"$E/out" 2>&1 || rc=$?
+  USER_EXISTS=1 GROUP_EXISTS=1
+  if reason="$(led_install_conflict)"; then got="$reason"; else got=none; fi
+  check "no conflict: the user and group this tool's sysusers file made" "$rc:$got" "0:none"
 
   # Something else where the hand-rolled install copies the watcher.
   fresh

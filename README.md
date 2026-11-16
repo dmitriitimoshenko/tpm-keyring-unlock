@@ -442,8 +442,8 @@ embedded controller can take back, and only if you have a finger enrolled.
 Everyone else never sees it. It is not asked when
 [framework-fingerprint-led-blink](https://github.com/alejandroqh/framework-fingerprint-led-blink)
 is installed: two blinkers would fight over one LED. Nor when a unit, udev
-rule, sysusers file or group by this feature's names is already there and
-is not this tool's. The run names what it found.
+rule, sysusers file, user or group by this feature's names is already there
+and is not this tool's. The run names what it found.
 
 The idea and the design are that project's, by alejandroqh. This is a separate
 implementation in bash, the language the rest of this tool is written in:
@@ -469,13 +469,14 @@ implementation in bash, the language the rest of this tool is written in:
   note is how its next start tells "left dark by a crash" from "switched off
   by you". If you set the LED's trigger while it blinks, the service lets go
   of it and writes nothing more.
-- The service runs as a throwaway user (`DynamicUser=`) with no capabilities,
-  sandboxed. `systemd-analyze security tpm-keyring-led` rates it 0.6. A udev
-  rule lets its group, `tpm-keyring-led`, write the LED's `trigger`,
-  `brightness` and `multi_intensity`, and nothing else. A writable `trigger`
-  takes any trigger the kernel offers for that LED, not only the two the
-  service uses. File permissions cannot narrow that, so the limit is the
-  service itself: no capabilities, and a sandbox.
+- The service runs as a system user of its own, `tpm-keyring-led`, with no
+  login shell, no home, no password and no capabilities, sandboxed.
+  `systemd-analyze security tpm-keyring-led` rates it 0.5. A udev rule
+  lets its group, `tpm-keyring-led`, write the
+  LED's `trigger`, `brightness` and `multi_intensity`, and nothing else. A
+  writable `trigger` takes any trigger the kernel offers for that LED, not
+  only the two the service uses. File permissions cannot narrow that, so the
+  limit is the service itself: no capabilities, and a sandbox.
 
 It needs `gdbus` (the installer adds it to the packages when missing) and
 fprintd 1.92 or newer, which every release this tool supports ships.

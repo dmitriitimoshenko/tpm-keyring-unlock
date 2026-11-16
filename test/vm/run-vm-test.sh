@@ -220,6 +220,8 @@ packages:
   - gcc
   - libpam0g-dev
   - make
+  # gdbus, which the power-button LED's watcher runs (its scenario below).
+  - libglib2.0-bin
 EOF
 }
 
@@ -822,6 +824,64 @@ if [ "$B1_OK" -eq 1 ]; then
       "$INSTALL_SECRET" "$WORK/upgrade-unseal.err"
 
     echo
+    echo "-- the power-button LED unit, under the real system manager --"
+    # test/led-test.sh runs led_service_install against stand-in system
+    # tools, and this VM is no Framework laptop, so the unit had never run
+    # under a real systemd before a release - and 1.7.0 shipped one systemd
+    # refuses to start (status 217/USER), whose watcher, with that fixed,
+    # could not reach dbus-daemon either (JOURNAL.md 2026-11-16). Here the
+    # rendered unit, the sysusers user and the real watcher go in as
+    # led_service_install puts them, and the service starts under the real
+    # system manager, with its user, its sandbox and the system bus. The udev rule
+    # stays out: it needs the LED, and the guest has none (uleds, which could
+    # make one, is in linux-modules-extra on this image's kernel).
+    # uninstall.sh, next, takes it out again.
+    vm_ssh "$B2_SSHPORT" 'bash -s' >"$WORK/led-unit.out" 2>&1 <<'GUEST'
+cd ~/tpm-keyring-unlock || exit 1
+source bin/lib.sh
+{ [ -d /etc/sysusers.d ] || sudo install -d -o root -g root -m 0755 /etc/sysusers.d; } \
+  && sudo install -o root -g root -m 0755 led/tpm-keyring-led.sh "$LED_BIN_LOCAL" \
+  && sudo install -o root -g root -m 0644 led/tpm-keyring-led.sysusers "$LED_SYSUSERS" \
+  && led_unit_render led/tpm-keyring-led.service "$LED_BIN_LOCAL" >/tmp/tpm-keyring-led.unit \
+  && sudo install -o root -g root -m 0644 /tmp/tpm-keyring-led.unit "$LED_UNIT" \
+  && sudo systemd-sysusers "$LED_SYSUSERS" \
+  && sudo systemctl daemon-reload \
+  && sudo systemctl start "$LED_NAME.service" || exit 1
+# The same test led_service_install makes: one process outlasting RestartSec=2.
+# The watcher is past connecting to the bus by then: a refused connection
+# ended it within a second in the runs that found it.
+pid="$(systemctl show -P MainPID "$LED_NAME.service")"
+sleep 4
+[ "$pid" != 0 ] && [ "$(systemctl show -P MainPID "$LED_NAME.service")" = "$pid" ] && rc=0 || rc=1
+systemctl status "$LED_NAME.service" --no-pager
+[ "$rc" = 0 ] || sudo journalctl -u "$LED_NAME.service" --no-pager -o cat | tail -n 30
+exit "$rc"
+GUEST
+    if [ $? -eq 0 ]; then got=up; else got=down; fi
+    check "the LED unit starts under the real system manager and stays up" "$got" "up" "$WORK/led-unit.out"
+
+    # Who the watcher runs as: the sysusers user, whose group is the one the
+    # udev rule hands the LED to, and that gdbus is connected to the bus.
+    LED_PROBE="$(vm_ssh "$B2_SSHPORT" 'bash -s' 2>"$WORK/led-probe.err" <<'GUEST'
+pid="$(systemctl show -P MainPID tpm-keyring-led.service)"
+if [ -z "$pid" ] || [ "$pid" = 0 ]; then echo "no-process no no"; exit 0; fi
+user="$(ps -o user:32= -p "$pid" | tr -d ' ')"
+gid="$(getent group tpm-keyring-led | cut -d: -f3)"
+if [ -n "$gid" ] && [ "$(awk '/^Gid:/ { print $2 }' "/proc/$pid/status")" = "$gid" ]; then grp=yes; else grp=no; fi
+# The watcher's gdbus, a child of it, as the bus lists its connections.
+gpid="$(pgrep -P "$pid" -x gdbus | head -n 1)"
+if [ -n "$gpid" ] && busctl --system --no-legend list 2>/dev/null | awk -v p="$gpid" '$2 == p { f = 1 } END { exit !f }'; then
+  bus=yes
+else
+  bus=no
+fi
+echo "$user $grp $bus"
+GUEST
+)"
+    check "the watcher runs as tpm-keyring-led with its group, its gdbus on the system bus" \
+      "$LED_PROBE" "tpm-keyring-led yes yes" "$WORK/led-probe.err"
+
+    echo
     echo "-- uninstall.sh end to end --"
     # Every prompt here defaults to yes, so one repeating rule - answer Enter
     # to anything ending in [Y/n] - accepts the whole run, however many
@@ -840,6 +900,9 @@ if [ "$B1_OK" -eq 1 ]; then
       "gone" "$WORK/uninstall.out"
     check "uninstall.sh deleted the sealed secret" \
       "$(vm_ssh "$B2_SSHPORT" 'test ! -e ~/.local/share/tpm-keyring-unlock/seal.priv && echo gone || echo left')" \
+      "gone" "$WORK/uninstall.out"
+    check "uninstall.sh took the LED service out: unit, user, group and watcher" \
+      "$(vm_ssh "$B2_SSHPORT" 'test ! -e /etc/systemd/system/tpm-keyring-led.service && ! getent passwd tpm-keyring-led >/dev/null && ! getent group tpm-keyring-led >/dev/null && test ! -e /usr/local/sbin/tpm-keyring-led && ! systemctl is-active --quiet tpm-keyring-led && echo gone || echo left')" \
       "gone" "$WORK/uninstall.out"
 
     echo
