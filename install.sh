@@ -39,17 +39,34 @@ source "$LIB_SH"
 SELINUX_CIL="$REPO_DIR/selinux/$SELINUX_MODULE_NAME.cil"
 [ -f "$SELINUX_CIL" ] || SELINUX_CIL="$REPO_DIR/$SELINUX_MODULE_NAME.cil"
 
+# And for the optional power-button LED service's files.
+LED_SRC_DIR="$REPO_DIR/led"
+[ -f "$LED_SRC_DIR/$LED_NAME.service" ] || LED_SRC_DIR="$REPO_DIR"
+
 # --no-build: the PAM module and the helper are already on disk, put there by
 # a distribution package, so this run must not compile or install them - it
 # only does the parts a package is not allowed to do (sealing a secret, which
 # needs the user's password, and editing /etc/pam.d, which needs consent).
+#
+# --upgrade: an install from an earlier version moves to the newest one. A git
+# checkout first moves to the newest release and the run starts over from
+# there (bin/lib.sh, upgrade_checkout); then every step runs again, as on any
+# re-run, except that a sealed secret that still unseals is kept rather than
+# re-sealed. What the new version adds is offered as it would be to a new
+# install. JOURNAL.md, 2026-11-15.
+ORIG_ARGS=("$@")
 DO_BUILD=true
+UPGRADE=false
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --no-build) DO_BUILD=false ;;
+    --upgrade) UPGRADE=true ;;
     -h | --help)
-      echo "usage: ${0##*/} [--no-build]"
+      echo "usage: ${0##*/} [--no-build] [--upgrade]"
       echo "  --no-build  configure only; expects the module and helper to be installed"
+      echo "  --upgrade   move an install from an earlier version to the newest one:"
+      echo "              a git checkout first moves to the newest release, then every"
+      echo "              step runs again, keeping the sealed secret if it still unseals"
       exit 0
       ;;
     *)
@@ -59,6 +76,22 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
+
+# The version these files are. A package's libexec directory has no VERSION;
+# it is only ever printed.
+TOOL_VERSION="$(tr -d '[:space:]' <"$REPO_DIR/VERSION" 2>/dev/null || true)"
+
+# The power-button LED watcher the unit runs. The hand-rolled install copies
+# it beside the unseal helper; a package ships it next to this script, and it
+# is run from there, as the helper is. bin/lib.sh's led_service_install()
+# reads all three.
+if [ "$DO_BUILD" = true ]; then
+  LED_BIN="$LED_BIN_LOCAL"
+  LED_WATCHER_SRC="$LED_SRC_DIR/$LED_NAME.sh"
+else
+  LED_BIN="$REPO_DIR/$LED_NAME"
+  LED_WATCHER_SRC=""
+fi
 
 confirm() {
   local prompt="$1"
@@ -188,6 +221,18 @@ fprintd_conflict_offer() {
   confirm "$(pam_fprintd_conflict_question "$prompts" "${#losers[@]}")"
 }
 
+# Whether the user has a finger enrolled, asked of fprintd once per run. Two
+# questions want the answer, polkit's and the power-button LED's, and each
+# fprintd-list starts fprintd and can take seconds. Nothing in a run changes
+# the answer.
+FINGER_ENROLLED=""
+user_has_enrolled_finger() {
+  if [ -z "$FINGER_ENROLLED" ]; then
+    if fprintd_user_has_enrolled_finger "$USER"; then FINGER_ENROLLED=yes; else FINGER_ENROLLED=no; fi
+  fi
+  [ "$FINGER_ENROLLED" = yes ]
+}
+
 # Succeeds, with POLKIT_STACK set to polkit's file, when the question below is
 # worth asking: pam_fprintd knows the line's options, polkit's file has the
 # shape the line goes into, and you have a finger enrolled. The caller has
@@ -196,7 +241,7 @@ fprintd_conflict_offer() {
 polkit_fprintd_offerable() {
   pam_fprintd_supports_attempt_options || return 1
   POLKIT_STACK="$(pam_polkit_fprintd_target)" || return 1
-  fprintd_user_has_enrolled_finger "$USER"
+  user_has_enrolled_finger
 }
 
 # Asks whether polkit's prompts get a fingerprint line of their own, and
@@ -313,6 +358,22 @@ fi
 echo "== tpm-keyring-unlock installer =="
 echo
 
+if [ "$UPGRADE" = true ]; then
+  # An upgrade is of an install that exists. Without a sealed secret there is
+  # nothing to keep, and the run would be a first install by another name.
+  # Asked before the checkout moves: refusing after it had would leave the
+  # checkout switched for a run that then did nothing (review, 2026-11-16).
+  if [ ! -f "$DATA_DIR/seal.priv" ]; then
+    echo "Nothing to upgrade for $USER: no sealed secret in $DATA_DIR." >&2
+    echo "Run the installer without --upgrade to install." >&2
+    exit 1
+  fi
+  if [ -z "${TPM_KEYRING_UPGRADE_REEXEC:-}" ]; then
+    upgrade_checkout
+    echo
+  fi
+fi
+
 # --- 0. hard requirements - checked before touching anything, including
 # before installing dependencies, so a machine that can't use this tool
 # finds out immediately instead of after a sudo package install -----------
@@ -332,30 +393,40 @@ command -v tpm2_createprimary >/dev/null || missing+=(tpm2-tools)
 command -v gcc >/dev/null || missing+=(gcc)
 [ -f /usr/include/security/pam_modules.h ] || missing+=(pam-dev)
 
+# Looked up whether or not anything is missing yet: the power-button LED
+# question in 1h can add gdbus to the list.
 PKG_MGR=""
+for m in apt dnf pacman zypper; do
+  if command -v "$m" >/dev/null; then
+    PKG_MGR="$m"
+    break
+  fi
+done
 PKGS=()
 if [ "${#missing[@]}" -gt 0 ]; then
   # Package names differ across distros; pam-dev is a placeholder above,
   # translated per package manager below. gcc's placeholder stays literal
   # everywhere except Arch, where it comes from the base-devel group.
-  if command -v apt >/dev/null; then
-    PKG_MGR=apt
-    for m in "${missing[@]}"; do [ "$m" = pam-dev ] && PKGS+=(libpam0g-dev) || PKGS+=("$m"); done
-  elif command -v dnf >/dev/null; then
-    PKG_MGR=dnf
-    for m in "${missing[@]}"; do [ "$m" = pam-dev ] && PKGS+=(pam-devel) || PKGS+=("$m"); done
-  elif command -v pacman >/dev/null; then
-    PKG_MGR=pacman
-    for m in "${missing[@]}"; do case "$m" in gcc) PKGS+=(base-devel);; pam-dev) PKGS+=(pam);; *) PKGS+=("$m");; esac; done
-  elif command -v zypper >/dev/null; then
-    PKG_MGR=zypper
-    for m in "${missing[@]}"; do case "$m" in pam-dev) PKGS+=(pam-devel);; tpm2-tools) PKGS+=(tpm2.0-tools);; *) PKGS+=("$m");; esac; done
-  else
-    echo "Missing: ${missing[*]}" >&2
-    echo "No apt/dnf/pacman/zypper found - install tpm2-tools, gcc and the PAM" >&2
-    echo "headers (security/pam_modules.h) yourself, then re-run." >&2
-    exit 1
-  fi
+  case "$PKG_MGR" in
+    apt)
+      for m in "${missing[@]}"; do [ "$m" = pam-dev ] && PKGS+=(libpam0g-dev) || PKGS+=("$m"); done
+      ;;
+    dnf)
+      for m in "${missing[@]}"; do [ "$m" = pam-dev ] && PKGS+=(pam-devel) || PKGS+=("$m"); done
+      ;;
+    pacman)
+      for m in "${missing[@]}"; do case "$m" in gcc) PKGS+=(base-devel);; pam-dev) PKGS+=(pam);; *) PKGS+=("$m");; esac; done
+      ;;
+    zypper)
+      for m in "${missing[@]}"; do case "$m" in pam-dev) PKGS+=(pam-devel);; tpm2-tools) PKGS+=(tpm2.0-tools);; *) PKGS+=("$m");; esac; done
+      ;;
+    *)
+      echo "Missing: ${missing[*]}" >&2
+      echo "No apt/dnf/pacman/zypper found - install tpm2-tools, gcc and the PAM" >&2
+      echo "headers (security/pam_modules.h) yourself, then re-run." >&2
+      exit 1
+      ;;
+  esac
 fi
 
 # 1b. tss group (passwordless TPM access)
@@ -369,7 +440,8 @@ else
   echo
 fi
 
-# 1c. seal vs. re-seal
+# 1c. seal vs. re-seal (with --upgrade, a sealed secret is there: checked
+# before anything else)
 RESEAL=false
 [ -f "$DATA_DIR/seal.priv" ] && RESEAL=true
 
@@ -606,6 +678,53 @@ if selinux_is_enabled \
   esac
 fi
 
+# 1h. the power-button LED. Nothing to do with the keyring: a Framework laptop
+# keeps the fingerprint reader in its power button, and nothing shows when the
+# reader is waiting for a finger. Asked only on such a laptop, with that LED
+# under the EC's control and a finger enrolled to wait for (the owner's call,
+# 2026-11-15) - everyone else never sees the question. An install from an
+# earlier run is brought up to date without asking again, as wired stacks are
+# re-checked, and only when its files differ or the running watcher is older
+# than the one on disk. See bin/lib.sh, framework_power_led() and
+# led_service_install(), and README.md, "Power-button LED".
+LED_STEP=""
+if framework_power_led >/dev/null && user_has_enrolled_finger; then
+  if LED_CONFLICT="$(led_install_conflict)"; then
+    # A unit, rule, sysusers file or group by this tool's names that is not
+    # this tool's: installing over it would take over what somebody else set
+    # up. Said once, not asked about.
+    echo "Not offering to blink the power button: $LED_CONFLICT."
+    echo
+  elif led_service_installed; then
+    led_service_up_to_date || LED_STEP=refresh
+  elif led_upstream_present; then
+    # Two blinkers would fight over one LED.
+    echo "The power button already blinks through $LED_UPSTREAM_UNIT - not"
+    echo "offering a second blinker."
+    echo
+  else
+    LED_GDBUS_PKG=""
+    if ! command -v gdbus >/dev/null 2>&1; then
+      case "$PKG_MGR" in
+        apt) LED_GDBUS_PKG=libglib2.0-bin ;;
+        dnf | pacman) LED_GDBUS_PKG=glib2 ;;
+        zypper) LED_GDBUS_PKG=glib2-tools ;;
+      esac
+    fi
+    if command -v gdbus >/dev/null 2>&1 || [ -n "$LED_GDBUS_PKG" ]; then
+      echo "Optional: blink the power button's LED while the fingerprint reader in it"
+      echo "waits for a finger - a small sandboxed service, no root (README.md)."
+      if confirm "Blink the power button while the reader waits?"; then
+        LED_STEP=install
+        [ -z "$LED_GDBUS_PKG" ] || PKGS+=("$LED_GDBUS_PKG")
+      else
+        echo "Left as it is."
+      fi
+      echo
+    fi
+  fi
+fi
+
 # --- 2. print the full plan and ask for approval exactly once ------------
 # Every path listed below is in the same directory, so the lists print as bare
 # service names with the directory named once.
@@ -633,7 +752,10 @@ else
   echo "  $n. Mask systemd's eager gnome-keyring-daemon startup."
 fi
 n=$((n + 1))
-if [ "$RESEAL" = true ]; then
+if [ "$UPGRADE" = true ]; then
+  echo "  $n. Keep your sealed secret if it still unseals with the updated helper"
+  echo "     (checked with sudo, nothing shown); re-seal only if it does not."
+elif [ "$RESEAL" = true ]; then
   echo "  $n. Re-seal (overwrite) the existing sealed secret at $DATA_DIR."
 else
   echo "  $n. Seal your keyring password into the TPM."
@@ -708,6 +830,16 @@ if [ "$SELINUX_FIX" = true ]; then
   echo "  $n. Load the SELinux module $SELINUX_MODULE_NAME (sudo), once a stack is wired."
   echo "     GDM runs the helper as xdm_t, which may not open the TPM; this lets"
   echo "     every xdm_t process open it, not only the helper. README.md, 'SELinux'."
+  n=$((n + 1))
+fi
+if [ "$LED_STEP" = install ]; then
+  echo "  $n. Install $LED_NAME.service (sudo), which blinks the power button while"
+  echo "     the reader waits: no root, sandboxed; a udev rule lets its group, and"
+  echo "     nothing else, write that LED's trigger, brightness and colour."
+  n=$((n + 1))
+elif [ "$LED_STEP" = refresh ]; then
+  echo "  $n. Update $LED_NAME.service, the power-button LED service an earlier run"
+  echo "     installed, to this version's files (sudo)."
   n=$((n + 1))
 fi
 # Reported whether or not anything is being wired up: a refused stack is the
@@ -842,12 +974,38 @@ else
 fi
 
 echo
-if [ "$RESEAL" = true ]; then
-  echo "-- Re-seal into the TPM --"
+if [ "$UPGRADE" = true ]; then
+  # Asked of the helper every login runs, just installed, as README's
+  # troubleshooting asks it: as root, the secret into /dev/null, only the exit
+  # status kept. Re-sealing needs the keyring password typed again, so it
+  # happens only when keeping would not do: the secret no longer unseals, or
+  # it predates the persisted primary that makes logins fast.
+  echo "-- Sealed secret --"
+  SEAL_REASON=""
+  if [ ! -f "$DATA_DIR/primary.handle" ]; then
+    SEAL_REASON="it was sealed before logins got the fast path (no primary.handle)"
+  elif ! sudo "$HELPER_DST" "$USER" >/dev/null; then
+    SEAL_REASON="it no longer unseals - a Secure Boot change moves PCR7, and the seal with it"
+  fi
+  if [ -z "$SEAL_REASON" ]; then
+    # Unsealing proves the seal works, not that what it holds is still the
+    # keyring password - nothing here can check that. A plain re-run asks
+    # "Overwrite?", and Enter re-seals; --upgrade does not ask, so it says
+    # when to (review, 2026-11-16).
+    echo "It unseals through the updated helper - kept. Nothing to type."
+    echo "Changed your keyring password since you sealed it? Then re-seal: $SEAL_SH"
+  else
+    echo "Re-sealing, because $SEAL_REASON."
+    tpm_run "$SEAL_SH"
+  fi
 else
-  echo "-- Seal into the TPM --"
+  if [ "$RESEAL" = true ]; then
+    echo "-- Re-seal into the TPM --"
+  else
+    echo "-- Seal into the TPM --"
+  fi
+  tpm_run "$SEAL_SH"
 fi
-tpm_run "$SEAL_SH"
 
 echo
 if [ "$UNLIMIT_FPRINTD" = true ]; then
@@ -1037,8 +1195,20 @@ if [ "$SELINUX_FIX" = true ]; then
   fi
 fi
 
+# The power-button LED, after everything the keyring needs: it is independent
+# of all of it, and a failure here rolls back to no LED service and leaves the
+# run going.
+if [ -n "$LED_STEP" ]; then
+  echo
+  led_service_install "$LED_STEP" || true
+fi
+
 echo
-echo "Log out and back in to test."
+if [ "$UPGRADE" = true ]; then
+  echo "Upgraded${TOOL_VERSION:+ to $TOOL_VERSION}. Log out and back in to test."
+else
+  echo "Log out and back in to test."
+fi
 
 # --- 4. did the fingerprint side actually end up able to work? -----------
 # The attempt stack fails silently when it loses the sensor: it returns

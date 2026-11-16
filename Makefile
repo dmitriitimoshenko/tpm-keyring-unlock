@@ -34,7 +34,7 @@ MODULE      := pam/pam_tpm_keyring_authtok.so
 
 INSTALL     ?= install
 
-.PHONY: all test test-regex test-runtime test-packaging test-vm test-vm-selinux build install uninstall clean
+.PHONY: all test test-regex test-led test-upgrade test-runtime test-packaging test-vm test-vm-selinux build install uninstall clean
 
 # MUST stay the first rule in this file. `make` with no target is what every
 # packaging recipe runs (rpm's %make_build, dh_auto_build), and before this
@@ -53,6 +53,16 @@ test:
 # Just the fast, no-docker regex/detection logic test.
 test-regex:
 	./test/unit-regex-test.sh
+
+# The power-button LED watcher, against a fake gdbus and a fake LED; no
+# docker, no root.
+test-led:
+	./test/led-test.sh
+
+# install.sh --upgrade's move of a git checkout to the newest release, against
+# a local bare repository; no network, no root.
+test-upgrade:
+	./test/upgrade-test.sh
 
 # Real TPM/Secure Boot round trip in a VM (swtpm + OVMF) - the layer Docker
 # structurally can't cover. Needs swtpm, qemu, and /dev/kvm; degrades to a
@@ -106,6 +116,13 @@ install: build
 	# from the TPM. Shipped, never loaded by the package: it widens a domain's
 	# rights, which is the admin's call, made when the configure step asks.
 	$(INSTALL) -m 0644 selinux/tpm_keyring_unlock.cil $(DESTDIR)$(LIBEXECDIR)/tpm_keyring_unlock.cil
+	# The optional power-button LED service (Framework laptops): the watcher,
+	# run from here, and the unit, udev rule and sysusers file the configure
+	# step installs into /etc when asked to. Never enabled by the package -
+	# it is offered only on a Framework laptop, and installed only on a yes.
+	$(INSTALL) -m 0755 led/tpm-keyring-led.sh $(DESTDIR)$(LIBEXECDIR)/tpm-keyring-led
+	$(INSTALL) -m 0644 led/tpm-keyring-led.service led/90-tpm-keyring-led.rules \
+		led/tpm-keyring-led.sysusers $(DESTDIR)$(LIBEXECDIR)/
 	$(INSTALL) -m 0755 bin/seal.sh $(DESTDIR)$(LIBEXECDIR)/seal.sh
 	$(INSTALL) -m 0755 install.sh $(DESTDIR)$(LIBEXECDIR)/configure.sh
 	$(INSTALL) -m 0755 uninstall.sh $(DESTDIR)$(LIBEXECDIR)/deconfigure.sh

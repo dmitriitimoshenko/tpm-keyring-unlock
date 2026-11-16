@@ -20,5 +20,8 @@ override_dh_auto_install:
 # gives it. It would also mark the SELinux policy module executable, as it
 # does everything under /usr/libexec, and that is data: lintian's
 # executable-not-elf-or-script. It keeps the 0644 `make install` gives it.
+# So do the power-button LED service's unit, udev rule and sysusers file,
+# which are data too, until the configure step copies them into /etc.
 override_dh_fixperms:
-	dh_fixperms -X tpm-keyring-unseal -X tpm_keyring_unlock.cil
+	dh_fixperms -X tpm-keyring-unseal -X tpm_keyring_unlock.cil \
+		-X tpm-keyring-led.service -X 90-tpm-keyring-led.rules -X tpm-keyring-led.sysusers

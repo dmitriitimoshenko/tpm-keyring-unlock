@@ -2170,3 +2170,563 @@ selinux_domain_may_use_tpm() {
   [[ "$allowed" =~ ^[0-9a-fA-F]+$ ]] || return 2
   [ $(( 0x$allowed & want )) -eq "$want" ]
 }
+
+# --- the power-button LED (optional) -------------------------------------------
+#
+# On a Framework laptop the fingerprint reader sits in the power button, and
+# nothing shows when it is waiting for a finger. install.sh offers a small
+# service that blinks the button's LED meanwhile: led/tpm-keyring-led.sh, run
+# by tpm-keyring-led.service as a throwaway user with no capabilities, which a
+# udev rule lets write that LED and nothing else. It has nothing to do with
+# the keyring: it is offered in the same run because this tool is where its
+# owner's fingerprint setup lives. README.md, "Power-button LED"; JOURNAL.md,
+# 2026-11-15. The idea is framework-fingerprint-led-blink's, by alejandroqh.
+#
+# The whole of the install lives here rather than in install.sh, so that
+# test/led-test.sh runs these very functions against stand-in paths. A copy
+# of them driven by hand missed that /etc/sysusers.d does not exist on Ubuntu,
+# Debian or Arch (review, 2026-11-15). The caller sets three things:
+#   LED_SRC_DIR      where the unit, udev rule and sysusers file are
+#   LED_BIN          the watcher the unit runs
+#   LED_WATCHER_SRC  the watcher to copy to LED_BIN, or empty when a package
+#                    owns LED_BIN and it is run where it is
+
+LED_NAME=tpm-keyring-led
+LED_GROUP=tpm-keyring-led
+LED_UNIT="/etc/systemd/system/$LED_NAME.service"
+LED_RULE="/etc/udev/rules.d/90-$LED_NAME.rules"
+LED_SYSUSERS="/etc/sysusers.d/$LED_NAME.conf"
+# Where the hand-rolled install puts the watcher, beside the unseal helper. A
+# package ships it in its libexec directory instead.
+LED_BIN_LOCAL="/usr/local/sbin/$LED_NAME"
+# The first line of the unit, the udev rule and the sysusers file as led/
+# ships them. A file by one of those names without it is not this tool's to
+# replace or remove.
+LED_FILE_MARKER='# tpm-keyring-unlock: power-button LED'
+# The power-button LED: chromeos:white:power on most models, the multicolour
+# chromeos:multicolor:power on the older Framework 13 (Intel 11th-13th gen).
+# NOTE: led/tpm-keyring-led.sh (LED_CANDIDATES) and the udev rule (KERNEL==)
+# name the same two, and the rule the same attributes. Neither can read this
+# file, so test/led-test.sh holds all three to each other.
+LED_SYSFS_NAMES=(chromeos:white:power chromeos:multicolor:power)
+# The attributes the udev rule hands to LED_GROUP.
+LED_ATTRS=(trigger brightness multi_intensity)
+# framework-fingerprint-led-blink's own service. Two blinkers would fight
+# over one LED, so with that one installed this tool offers nothing.
+LED_UPSTREAM_UNIT=framework-fingerprint-led-blink.service
+# The directories led_service_install() had to create, for its rollback.
+LED_CREATED_DIRS=()
+
+# Prints the power-button LED's sysfs directory, and succeeds, only on a
+# Framework laptop with that LED under the EC's control. Every condition is
+# one the feature needs, and the owner's call (2026-11-15) is that nobody
+# else is asked about it:
+#   - DMI says Framework, and a laptop: every Framework laptop so far keeps
+#     the reader in the power button, the Desktop has none there, and other
+#     ChromeOS-EC machines expose the same LED with no reader in the button.
+#     Product names start "Laptop" on all of them, the first 13s included.
+#   - the LED is one of LED_SYSFS_NAMES;
+#   - it offers the chromeos-auto trigger, which hands it back to the EC.
+#     The watcher only ever takes an LED from that trigger and returns it
+#     there.
+# LED_SYSFS and DMI_DIR are overridable for the test suite.
+framework_power_led() {
+  local leds="${LED_SYSFS:-/sys/class/leds}" dmi="${DMI_DIR:-/sys/class/dmi/id}"
+  local vendor="" product="" name d t
+  { vendor="$(<"$dmi/sys_vendor")"; } 2>/dev/null || return 1
+  { product="$(<"$dmi/product_name")"; } 2>/dev/null || return 1
+  [ "$vendor" = Framework ] || return 1
+  [[ "$product" == Laptop* ]] || return 1
+  for name in "${LED_SYSFS_NAMES[@]}"; do
+    d="$leds/$name"
+    { t="$(<"$d/trigger")"; } 2>/dev/null || continue
+    [[ " $t " == *" chromeos-auto "* || " $t " == *" [chromeos-auto] "* ]] || continue
+    printf '%s\n' "$d"
+    return 0
+  done
+  return 1
+}
+
+# Succeeds when the file $1 is one this tool installed: it is there, and its
+# first line is the marker. Read with `read`, not head | grep -q, for the
+# reason _pam_logical_lines gives.
+led_file_is_ours() {
+  local first=""
+  [ -f "$1" ] || return 1
+  IFS= read -r first <"$1" || [ -n "$first" ] || return 1
+  [ "$first" = "$LED_FILE_MARKER" ]
+}
+
+# Succeeds when the watcher file $1 is this tool's: the marker is its second
+# line, under the shebang. The hand-rolled install copies it to
+# /usr/local/sbin, a path anything else could have taken first.
+led_watcher_is_ours() {
+  local first="" second=""
+  [ -f "$1" ] || return 1
+  { IFS= read -r first && IFS= read -r second; } <"$1" 2>/dev/null || return 1
+  [ "$second" = "$LED_FILE_MARKER" ]
+}
+
+# Succeeds when the LED service's unit is installed, and is this tool's.
+led_service_installed() {
+  led_file_is_ours "$LED_UNIT"
+}
+
+# Succeeds when systemd knows framework-fingerprint-led-blink's service, in
+# whatever directory it was installed to (its installer: /etc; its AUR
+# package: /usr/lib). Captured rather than piped, for pipefail.
+led_upstream_present() {
+  local out
+  out="$(systemctl list-unit-files --no-legend "$LED_UPSTREAM_UNIT" 2>/dev/null || true)"
+  [[ "$out" == *"$LED_UPSTREAM_UNIT"* ]]
+}
+
+# Succeeds, printing why, when something by one of this tool's names is there
+# and is not this tool's: a unit, udev rule or sysusers file without the
+# marker, a file where the hand-rolled install would copy the watcher, or the
+# group with no sysusers file of this tool's to have created it. Installing over any of them would be taking over state this tool did
+# not create - a group somebody already uses would get the LED, and uninstall
+# would later delete it. install.sh asks nothing while this holds, and
+# led_service_install() checks it again before it writes.
+led_install_conflict() {
+  local f
+  for f in "$LED_UNIT" "$LED_RULE" "$LED_SYSUSERS"; do
+    if [ -e "$f" ] && ! led_file_is_ours "$f"; then
+      echo "$f is there already, and is not this tool's"
+      return 0
+    fi
+  done
+  if [ -n "${LED_WATCHER_SRC:-}" ] && [ -e "$LED_BIN" ] && ! led_watcher_is_ours "$LED_BIN"; then
+    echo "$LED_BIN is there already, and is not this tool's"
+    return 0
+  fi
+  if ! led_file_is_ours "$LED_SYSUSERS" && getent group "$LED_GROUP" >/dev/null 2>&1; then
+    echo "a group named $LED_GROUP exists already, and is not this tool's"
+    return 0
+  fi
+  return 1
+}
+
+# Succeeds when nobody but root can replace the file $1: a regular file, not
+# a link, owned by root with no group or other write bit - and the same for
+# every directory above it, since whoever can write a directory can swap what
+# is in it. For the packaged watcher, which the unit runs where it lies.
+led_path_is_roots_alone() {
+  local p="$1" meta
+  [ -f "$p" ] && [ ! -L "$p" ] || return 1
+  while :; do
+    meta="$(stat -c '%u %a' -- "$p" 2>/dev/null)" || return 1
+    [ "${meta%% *}" = 0 ] || return 1
+    (( (8#${meta##* } & 8#022) == 0 )) || return 1
+    [ "$p" != / ] || return 0
+    p="$(dirname -- "$p")"
+  done
+}
+
+# Prints the unit file $1 (led/tpm-keyring-led.service) with the watcher's
+# path $2 in place of @LED_BIN@. Refuses any path but a plain absolute one: it
+# lands unquoted in ExecStart= and in a sed replacement, where a space, a
+# `$`, `|` or `&` would mean something else.
+led_unit_render() {
+  local src="$1" bin="$2"
+  [[ "$bin" =~ ^/[A-Za-z0-9._/+-]+$ ]] || return 1
+  sed "s|@LED_BIN@|$bin|g" "$src"
+}
+
+# Succeeds when the LED service on disk is what this run would install: the
+# unit as rendered for LED_BIN, the udev rule, the sysusers file, the watcher
+# where this tool copies it - and the running watcher is not older than the
+# file it was started from. That last one is for a package, which replaces
+# its watcher under a service that keeps running the old one: the file's
+# change time (when the package manager wrote it; its modification time is
+# the build's) against the service's start.
+led_service_up_to_date() {
+  local started changed
+  cmp -s <(led_unit_render "$LED_SRC_DIR/$LED_NAME.service" "$LED_BIN") "$LED_UNIT" || return 1
+  cmp -s "$LED_SRC_DIR/90-$LED_NAME.rules" "$LED_RULE" || return 1
+  cmp -s "$LED_SRC_DIR/$LED_NAME.sysusers" "$LED_SYSUSERS" || return 1
+  if [ -n "$LED_WATCHER_SRC" ]; then
+    cmp -s "$LED_WATCHER_SRC" "$LED_BIN" || return 1
+  fi
+  # "@<seconds>" for a running service, empty for a stopped one, and
+  # something else from a systemd too old for --timestamp=unix - which then
+  # simply is not compared.
+  started="$(systemctl show --timestamp=unix -P ExecMainStartTimestamp "$LED_NAME.service" 2>/dev/null || true)"
+  changed="$(stat -c %Z -- "$LED_BIN" 2>/dev/null || true)"
+  if [[ "$started" =~ ^@[0-9]+$ ]] && [[ "$changed" =~ ^[0-9]+$ ]]; then
+    [ "${started#@}" -ge "$changed" ] || return 1
+  fi
+  return 0
+}
+
+# Installs the LED service ($1 = install), or brings an earlier run's up to
+# date ($1 = refresh). Never fatal to the caller's run: the keyring work
+# before it stands either way. Call it as `... || true`; that turns `set -e`
+# off in here, so every step checks itself.
+#
+# A failure leaves no half-installed service. A fresh install is taken out
+# again - a udev rule handing the LED to a group, with no running service to
+# show for it, is access given for nothing. A failed update puts the earlier
+# files back and restarts what was running: a working service must not be
+# lost to a bad update.
+led_service_install() {
+  local how="$1" led reason rendered a perm pid d keep="" was_active=false
+  LED_CREATED_DIRS=()
+  echo "-- Power-button LED --"
+  # Re-checked against the machine as it is now, as every write here is.
+  if ! led="$(framework_power_led)"; then
+    echo "The power-button LED is not there any more - left alone." >&2
+    return 0
+  fi
+  if [ "$how" = refresh ] && ! led_service_installed; then
+    echo "$LED_UNIT is no longer this tool's - left alone." >&2
+    return 0
+  fi
+  if [ "$how" = install ] && led_service_installed; then
+    echo "$LED_UNIT appeared since the plan was printed - left alone." >&2
+    return 0
+  fi
+  if reason="$(led_install_conflict)"; then
+    echo "Not installing the power-button LED service: $reason." >&2
+    return 1
+  fi
+  if ! command -v gdbus >/dev/null 2>&1; then
+    echo "No gdbus, which the service reads fprintd's signals with - not installed." >&2
+    return 1
+  fi
+  if ! led_unit_render "$LED_SRC_DIR/$LED_NAME.service" "$LED_BIN" >/dev/null; then
+    echo "The watcher's path, $LED_BIN, cannot go into a unit file - not installed." >&2
+    return 1
+  fi
+  # A package's watcher is run where it lies, by a unit this run writes, so it
+  # gets more than the presence check --no-build gives the module and the
+  # helper: a watcher somebody other than root can replace is code of their
+  # choosing, run by a service with the LED in its hands.
+  if [ -z "$LED_WATCHER_SRC" ] && ! led_path_is_roots_alone "$LED_BIN"; then
+    echo "$LED_BIN is missing, or somebody other than root can replace it or a" >&2
+    echo "directory above it - the power-button LED service is not installed." >&2
+    return 1
+  fi
+
+  if [ "$how" = refresh ]; then
+    keep="$(mktemp -d)"
+    cp -- "$LED_UNIT" "$keep/unit" 2>/dev/null || true
+    cp -- "$LED_RULE" "$keep/rule" 2>/dev/null || true
+    cp -- "$LED_SYSUSERS" "$keep/sysusers" 2>/dev/null || true
+    [ -z "$LED_WATCHER_SRC" ] || cp -- "$LED_BIN" "$keep/bin" 2>/dev/null || true
+    ! systemctl is-active --quiet "$LED_NAME.service" 2>/dev/null || was_active=true
+  fi
+
+  # /etc/sysusers.d is not there on Ubuntu, Debian or Arch until something
+  # puts a file in it. Only a missing directory is created: `install -d` on
+  # one that exists would reset its mode and owner.
+  for d in "${LED_SYSUSERS%/*}" "${LED_RULE%/*}" "${LED_UNIT%/*}"; do
+    [ ! -d "$d" ] || continue
+    if ! sudo install -d -o root -g root -m 0755 "$d"; then
+      led_service_rollback "creating $d failed" "$keep" "$was_active"
+      return 1
+    fi
+    LED_CREATED_DIRS+=("$d")
+  done
+
+  if [ -n "$LED_WATCHER_SRC" ] \
+    && ! sudo install -o root -g root -m 0755 "$LED_WATCHER_SRC" "$LED_BIN"; then
+    led_service_rollback "copying the watcher failed" "$keep" "$was_active"
+    return 1
+  fi
+  rendered="$(mktemp)"
+  led_unit_render "$LED_SRC_DIR/$LED_NAME.service" "$LED_BIN" >"$rendered"
+  if ! { sudo install -o root -g root -m 0644 "$LED_SRC_DIR/$LED_NAME.sysusers" "$LED_SYSUSERS" \
+    && sudo install -o root -g root -m 0644 "$LED_SRC_DIR/90-$LED_NAME.rules" "$LED_RULE" \
+    && sudo install -o root -g root -m 0644 "$rendered" "$LED_UNIT"; }; then
+    rm -f "$rendered"
+    led_service_rollback "copying its files failed" "$keep" "$was_active"
+    return 1
+  fi
+  rm -f "$rendered"
+  if command -v restorecon >/dev/null 2>&1; then
+    sudo restorecon "$LED_SYSUSERS" "$LED_RULE" "$LED_UNIT" >/dev/null 2>&1 || true
+    [ -z "$LED_WATCHER_SRC" ] || sudo restorecon "$LED_BIN" >/dev/null 2>&1 || true
+  fi
+
+  # The group first, since the rule names it, then the rule applied to the LED
+  # that is already there - the rule fires on "add" only - and checked: a
+  # service that cannot write the LED would sit there doing nothing, all of it
+  # looking fine.
+  if ! { sudo systemd-sysusers "$LED_SYSUSERS" \
+    && sudo udevadm control --reload \
+    && sudo udevadm trigger --action=add "$led" \
+    && sudo udevadm settle; }; then
+    led_service_rollback "creating its group or applying the udev rule failed" "$keep" "$was_active"
+    return 1
+  fi
+  for a in "${LED_ATTRS[@]}"; do
+    [ -e "$led/$a" ] || continue
+    perm="$(stat -c '%G %a' -- "$led/$a" 2>/dev/null || true)"
+    if [ "${perm%% *}" != "$LED_GROUP" ] || ! (( 8#${perm##* } & 8#020 )); then
+      led_service_rollback "the udev rule did not reach $led/$a (it is ${perm:-unreadable})" "$keep" "$was_active"
+      return 1
+    fi
+  done
+
+  if ! sudo systemctl daemon-reload; then
+    led_service_rollback "systemctl daemon-reload failed" "$keep" "$was_active"
+    return 1
+  fi
+  # An update restarts a running service, so its new watcher runs, and leaves
+  # a stopped one stopped. Whether it is enabled is never changed: that is
+  # its owner's setting. (Deciding by is-enabled restarted a service stopped
+  # by hand, and left one disabled but running on the old watcher, out of
+  # date at every later run: review, 2026-11-16.)
+  if [ "$how" = refresh ] && [ "$was_active" = false ]; then
+    rm -rf -- "$keep"
+    echo "Updated. $LED_NAME.service was not running, and is left stopped."
+    return 0
+  fi
+  if [ "$how" = refresh ]; then
+    if ! sudo systemctl restart "$LED_NAME.service"; then
+      led_service_rollback "the service would not start" "$keep" "$was_active"
+      return 1
+    fi
+  elif ! { sudo systemctl enable --quiet "$LED_NAME.service" \
+    && sudo systemctl restart "$LED_NAME.service"; }; then
+    led_service_rollback "the service would not start" "$keep" "$was_active"
+    return 1
+  fi
+  # A service failing in a loop still reads "active" straight after a restart,
+  # so the same process has to outlast its RestartSec=2.
+  pid="$(systemctl show -P MainPID "$LED_NAME.service" 2>/dev/null || echo 0)"
+  sleep 3
+  if [ "$pid" = 0 ] || [ "$(systemctl show -P MainPID "$LED_NAME.service" 2>/dev/null)" != "$pid" ]; then
+    systemctl status "$LED_NAME.service" --no-pager >&2 || true
+    led_service_rollback "the service did not stay up" "$keep" "$was_active"
+    return 1
+  fi
+  [ -z "$keep" ] || rm -rf -- "$keep"
+  echo "Done. Test: run fprintd-verify and watch the power button."
+  echo "Off again: sudo systemctl disable --now $LED_NAME (later runs leave it off)."
+  echo "uninstall.sh removes it; it asks about the keyring parts first, and n keeps those."
+}
+
+# Undoes a failed led_service_install(), and says so. $1 is what failed. $2
+# is the directory holding the files of the install that was being updated,
+# or empty for a fresh install; $3 is whether that install's service was
+# running. An update goes back to those files, a fresh install to nothing.
+led_service_rollback() {
+  local reason="$1" keep="${2:-}" was_active="${3:-false}" d
+  if [ -n "$keep" ]; then
+    echo "!! The power-button LED service was not updated: $reason." >&2
+    echo "   Its earlier files are back in place. journalctl -u $LED_NAME -b may" >&2
+    echo "   say more. The rest of this run is unaffected." >&2
+    [ ! -f "$keep/sysusers" ] || sudo install -o root -g root -m 0644 "$keep/sysusers" "$LED_SYSUSERS" || true
+    [ ! -f "$keep/rule" ] || sudo install -o root -g root -m 0644 "$keep/rule" "$LED_RULE" || true
+    [ ! -f "$keep/unit" ] || sudo install -o root -g root -m 0644 "$keep/unit" "$LED_UNIT" || true
+    [ ! -f "$keep/bin" ] || sudo install -o root -g root -m 0755 "$keep/bin" "$LED_BIN" || true
+    sudo systemctl daemon-reload >/dev/null 2>&1 || true
+    sudo udevadm control --reload >/dev/null 2>&1 || true
+    [ "$was_active" = false ] || sudo systemctl restart "$LED_NAME.service" >/dev/null 2>&1 || true
+    rm -rf -- "$keep"
+  else
+    echo "!! The power-button LED service is not installed: $reason." >&2
+    echo "   Rolled back, so nothing of it is left. journalctl -u $LED_NAME -b may" >&2
+    echo "   say more. The rest of this run is unaffected." >&2
+    led_service_remove
+    if [ -n "$LED_WATCHER_SRC" ] && led_watcher_is_ours "$LED_BIN"; then
+      sudo rm -f "$LED_BIN"
+    fi
+  fi
+  # rmdir, so a directory something else has used since stays.
+  for d in "${LED_CREATED_DIRS[@]}"; do
+    sudo rmdir -- "$d" 2>/dev/null || true
+  done
+  LED_CREATED_DIRS=()
+}
+
+# Takes the LED service out: stopped and disabled first, so the watcher gives
+# the LED back to the EC, then its unit, udev rule and sysusers file deleted,
+# each only if it carries this tool's marker. The LED's attributes keep the
+# group the rule gave them until the next boot otherwise, so they go back to
+# root without group write, and the group is deleted - both only when the
+# sysusers file was this tool's, which is what says the group is. The LED's
+# trigger is not written here: the watcher returns what it took, and any other
+# trigger is its owner's setting. The watcher itself is not deleted either:
+# the caller knows whether it is this tool's file or a package's. Best effort
+# throughout, and no exit status worth checking - led_service_rollback() calls
+# it to undo a half-done install, uninstall.sh to undo a whole one.
+led_service_remove() {
+  local leds="${LED_SYSFS:-/sys/class/leds}" name d a f group_ours=false
+  ! led_file_is_ours "$LED_SYSUSERS" || group_ours=true
+  if led_service_installed; then
+    sudo systemctl disable --now "$LED_NAME.service" >/dev/null 2>&1 || true
+    # The runtime directory is kept across stops (RuntimeDirectoryPreserve=);
+    # with the service gone for good, so is its note.
+    sudo systemctl clean --what=runtime "$LED_NAME.service" >/dev/null 2>&1 || true
+  fi
+  for f in "$LED_UNIT" "$LED_RULE" "$LED_SYSUSERS"; do
+    ! led_file_is_ours "$f" || sudo rm -f -- "$f"
+  done
+  sudo systemctl daemon-reload >/dev/null 2>&1 || true
+  sudo systemctl reset-failed "$LED_NAME.service" >/dev/null 2>&1 || true
+  sudo udevadm control --reload >/dev/null 2>&1 || true
+  [ "$group_ours" = true ] || return 0
+  for name in "${LED_SYSFS_NAMES[@]}"; do
+    d="$leds/$name"
+    for a in "${LED_ATTRS[@]}"; do
+      [ -e "$d/$a" ] || continue
+      [ "$(stat -c %G -- "$d/$a" 2>/dev/null)" = "$LED_GROUP" ] || continue
+      sudo chgrp root "$d/$a" 2>/dev/null || true
+      sudo chmod g-w "$d/$a" 2>/dev/null || true
+    done
+  done
+  if getent group "$LED_GROUP" >/dev/null 2>&1; then
+    sudo groupdel "$LED_GROUP" >/dev/null 2>&1 || true
+  fi
+}
+
+# --- install.sh --upgrade: a checkout to the newest release --------------------
+#
+# `install.sh --upgrade` first moves a git checkout of this repository to its
+# newest release, then starts over with the new installer. Releases are the
+# tags vX.Y.Z the release workflow makes from VERSION on main. JOURNAL.md,
+# 2026-11-15.
+
+# Succeeds when the directory $1 is the top of a git work tree of its own: a
+# checkout, rather than a package's libexec directory, or a copy inside some
+# other repository.
+upgrade_checkout_is_git() {
+  local top
+  top="$(git -C "$1" rev-parse --show-toplevel 2>/dev/null)" || return 1
+  [ "$(cd "$top" && pwd -P)" = "$(cd "$1" && pwd -P)" ]
+}
+
+# Succeeds when version $1 is newer than version $2, comparing X.Y.Z
+# numerically: 1.10.0 is newer than 1.9.0.
+version_is_newer() {
+  [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" = "$1" ]
+}
+
+# Prints the remote's main line in the checkout $1: what origin/HEAD points
+# at, as `git clone` sets it, or else origin/main. Nothing when it has neither.
+release_line_ref() {
+  local ref
+  ref="$(git -C "$1" symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null)" \
+    || ref=refs/remotes/origin/main
+  git -C "$1" rev-parse -q --verify "$ref^{commit}" >/dev/null 2>&1 || return 0
+  printf '%s\n' "$ref"
+}
+
+# Prints the newest release tag the checkout $1 knows, or nothing. A release
+# is a vX.Y.Z tag - not a pre-release, not any other tag - on the remote's
+# main line: the release workflow tags main, and a tag pushed onto some other
+# commit is no release, however high its number. The tags carry no
+# signatures, so this is as far as checking them can go (review, 2026-11-16).
+latest_release_tag() {
+  local ref tags
+  ref="$(release_line_ref "$1")"
+  [ -n "$ref" ] || return 0
+  tags="$(git -C "$1" tag -l --merged "$ref" 'v*' 2>/dev/null || true)"
+  grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' <<<"$tags" | sort -V | tail -n1 || true
+}
+
+# Decides whether the checkout $1, whose files say version $2, can move to the
+# release tag $3. Returns 0 when it can, and otherwise:
+#   1  that release is not newer than these files
+#   3  tracked files have local changes, which switching could lose
+#   4  the checkout has commits the release does not have: a branch cannot be
+#      fast-forwarded, rewinding it is not this tool's call, and moving a
+#      checkout on no branch would leave its commits to the reflog
+# A checkout at an older release, on a branch or on none, moves.
+upgrade_checkout_movable() {
+  local dir="$1" current="$2" tag="$3" head target
+  [ -n "$tag" ] && version_is_newer "${tag#v}" "$current" || return 1
+  git -C "$dir" diff --quiet HEAD -- 2>/dev/null || return 3
+  head="$(git -C "$dir" rev-parse HEAD)" || return 4
+  target="$(git -C "$dir" rev-parse "$tag^{commit}")" || return 4
+  git -C "$dir" merge-base --is-ancestor "$head" "$target" || return 4
+  return 0
+}
+
+# Moves the checkout $1 to the tag $2: a fast-forward of the branch it is on,
+# so it stays on that branch, or a checkout of the tag when it is on none.
+upgrade_checkout_move() {
+  local dir="$1" tag="$2"
+  if git -C "$dir" symbolic-ref -q HEAD >/dev/null; then
+    git -C "$dir" merge --ff-only --quiet "$tag"
+  else
+    git -C "$dir" -c advice.detachedHead=false checkout --quiet "$tag"
+  fi
+}
+
+# --upgrade's first step: a git checkout of this repository moves to the
+# newest release tag, and the run starts over with the installer that comes
+# with it, so every step after this one is the new version's. It shows what
+# changes and asks first. It never rewrites history: a branch is only
+# fast-forwarded, and a checkout with local changes, or with commits the
+# release does not have, stays where it is - the run then carries on with the
+# files it has, and says so. A package's files are its package manager's to
+# upgrade.
+#
+# In bin/lib.sh rather than install.sh so that test/upgrade-test.sh runs this
+# very function. The caller provides REPO_DIR, TOOL_VERSION, DO_BUILD,
+# ORIG_ARGS (its own command line) and confirm(), install.sh's [Y/n]. On a
+# switch it does not return: it execs the new $REPO_DIR/install.sh.
+upgrade_checkout() {
+  local tag rc=0 commits count
+  echo "-- Newest release --"
+  if [ "$DO_BUILD" = false ]; then
+    echo "Packaged install: your package manager brings the newest files. This run"
+    echo "re-checks the configuration against them."
+    return 0
+  fi
+  if ! upgrade_checkout_is_git "$REPO_DIR"; then
+    echo "$REPO_DIR is not a git checkout - carrying on with these files${TOOL_VERSION:+ ($TOOL_VERSION)}."
+    return 0
+  fi
+  # The remote this checkout came from, as `git clone` set it up - the same
+  # trust as the first install, which ran what that clone fetched.
+  if ! timeout 60 git -C "$REPO_DIR" fetch --quiet --tags origin; then
+    echo "Could not fetch from origin (offline?) - carrying on with ${TOOL_VERSION:-these files}."
+    return 0
+  fi
+  if [ -z "$(release_line_ref "$REPO_DIR")" ]; then
+    echo "No origin/main here to tell releases by - carrying on with ${TOOL_VERSION:-these files}."
+    return 0
+  fi
+  tag="$(latest_release_tag "$REPO_DIR")"
+  upgrade_checkout_movable "$REPO_DIR" "$TOOL_VERSION" "$tag" || rc=$?
+  case "$rc" in
+    0) ;;
+    1)
+      echo "Already at the newest release${TOOL_VERSION:+ ($TOOL_VERSION)}."
+      return 0
+      ;;
+    3)
+      echo "$tag is out, but $REPO_DIR has local changes - not switching versions;"
+      echo "carrying on with ${TOOL_VERSION:-these files}. Commit or stash them, then re-run."
+      return 0
+      ;;
+    *)
+      echo "$tag is out, but this checkout has commits $tag does not - not moving"
+      echo "it; carrying on with ${TOOL_VERSION:-these files}."
+      return 0
+      ;;
+  esac
+  commits="$(git -C "$REPO_DIR" log --no-merges --format='  %s' "HEAD..$tag" 2>/dev/null || true)"
+  count="$(grep -c . <<<"$commits" || true)"
+  echo "$tag is out; these files are ${TOOL_VERSION:-older}. What comes with it:"
+  head -n 15 <<<"$commits"
+  [ "$count" -le 15 ] || echo "  ... and $((count - 15)) more (git log HEAD..$tag)"
+  if ! confirm "Switch $REPO_DIR to $tag and carry on with it?"; then
+    echo "Carrying on with ${TOOL_VERSION:-these files}."
+    return 0
+  fi
+  if ! upgrade_checkout_move "$REPO_DIR" "$tag"; then
+    echo "Could not switch (git says why above) - carrying on with ${TOOL_VERSION:-these files}." >&2
+    return 0
+  fi
+  echo "Now at $tag. Starting over with its installer."
+  echo
+  # The marker keeps the new installer from fetching again. exec, so nothing
+  # of this old script runs after the switch.
+  TPM_KEYRING_UPGRADE_REEXEC=1 exec "$REPO_DIR/install.sh" "${ORIG_ARGS[@]}"
+}

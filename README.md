@@ -59,6 +59,36 @@ it may refuse with `Can't read TPM PCRs`: the installer ran the TPM steps
 inside `sg tss`, and your own shell only picks up the new group membership
 after a logout.
 
+### Upgrading
+
+```bash
+cd tpm-keyring-unlock
+./install.sh --upgrade
+```
+
+It fetches, lists what the newest release brings, and asks before moving this
+checkout there. A branch is only fast-forwarded. With local changes, or
+commits of your own on it, the checkout stays where it is and the run says
+so.
+
+Then every step runs again with the new version. The module and the helper
+are rebuilt, the PAM stacks re-checked, and whatever the new version adds is
+offered, such as the [power-button LED](#power-button-led). Your sealed secret
+is kept if it still unseals through the new helper, so there is nothing to
+type. It is re-sealed only if it no longer unseals, or if it was sealed before
+logins got the fast path. That it unseals does not prove it is still your
+keyring password: if you changed that password since, re-seal with
+`bin/seal.sh`.
+
+Only a `vX.Y.Z` tag on the remote's main line counts as a release, and a
+checkout with commits of its own, on a branch or not, is never moved.
+
+1.6.0 and earlier have no `--upgrade` yet, so pull once by hand:
+
+```bash
+git pull && ./install.sh --upgrade
+```
+
 ### From a distribution package
 
 Prebuilt `x86_64` packages for openSUSE, Fedora, Debian and Ubuntu are
@@ -109,10 +139,10 @@ Use one method or the other on a given machine, not both: `./install.sh` and a
 package write the same PAM module filename, so whichever ran last wins. See
 `packaging/README.md`.
 
-After upgrading the package, run `tpm-keyring-unlock-configure` once more. It
-re-checks the PAM stacks an older version wired, and takes the helper back out
-of any that the current checks refuse. Answer `n` at "Overwrite?" to keep your
-sealed secret.
+After upgrading the package, run `tpm-keyring-unlock-configure --upgrade`. It
+re-checks the PAM stacks an older version wired, takes the helper back out of
+any that the current checks refuse, and offers what the new version adds. It
+keeps your sealed secret if it still unseals.
 
 ## What this protects, and what it doesn't
 
@@ -394,6 +424,88 @@ it back.
 
 `gdm-password` stays password-only this way, so the gap described above stays
 closed.
+
+## Power-button LED
+
+On a Framework laptop the fingerprint reader is in the power button, and
+nothing shows when it is waiting for a finger. `install.sh` offers to blink
+the button's LED while it waits, wherever the finger is asked for: the lock
+screen, `sudo`, polkit. It has nothing to do with the keyring, and the run
+asks about it separately:
+
+```
+Blink the power button while the reader waits? [Y/n]
+```
+
+The question appears only on a Framework laptop whose power-button LED the
+embedded controller can take back, and only if you have a finger enrolled.
+Everyone else never sees it. It is not asked when
+[framework-fingerprint-led-blink](https://github.com/alejandroqh/framework-fingerprint-led-blink)
+is installed: two blinkers would fight over one LED. Nor when a unit, udev
+rule, sysusers file or group by this feature's names is already there and
+is not this tool's. The run names what it found.
+
+The idea and the design are that project's, by alejandroqh. This is a separate
+implementation in bash, the language the rest of this tool is written in:
+
+- `tpm-keyring-led.service` runs `gdbus monitor --system --dest
+  net.reactivated.Fprint`, which receives only signals fprintd itself sent.
+  The bus stamps the sender, so another local user cannot start or stop the
+  blinking with a forged signal. They can make it blink by starting a real
+  verification (`fprintd-verify`), because then fprintd really is waiting.
+- While fprintd's `finger-needed` property is true and no finger is on the
+  sensor, the service takes the LED from the embedded controller and blinks
+  it: 0.25 s dark, then 0.25 s lit. On the older Framework 13, whose
+  multicolour LED defaults to red, it lights only white.
+- A touch, the end of the prompt, or fprintd going away hands the LED back
+  through its `chromeos-auto` trigger. One stretch of blinking lasts 60
+  seconds at most, and after that only a new prompt starts it again. A
+  prompt that is already up when the service starts blinks too: it asks
+  fprintd once, at start.
+- It only ever takes the LED from `chromeos-auto`. If you switched the
+  button off yourself (`trigger none`), it stays off, and the service leaves
+  it alone. While the LED is the service's, a note in
+  `/run/tpm-keyring-led` says so. If the service is killed mid-blink, the
+  note is how its next start tells "left dark by a crash" from "switched off
+  by you". If you set the LED's trigger while it blinks, the service lets go
+  of it and writes nothing more.
+- The service runs as a throwaway user (`DynamicUser=`) with no capabilities,
+  sandboxed. `systemd-analyze security tpm-keyring-led` rates it 0.6. A udev
+  rule lets its group, `tpm-keyring-led`, write the LED's `trigger`,
+  `brightness` and `multi_intensity`, and nothing else. A writable `trigger`
+  takes any trigger the kernel offers for that LED, not only the two the
+  service uses. File permissions cannot narrow that, so the limit is the
+  service itself: no capabilities, and a sandbox.
+
+It needs `gdbus` (the installer adds it to the packages when missing) and
+fprintd 1.92 or newer, which every release this tool supports ships.
+
+Files: `/usr/local/sbin/tpm-keyring-led` (a package runs its own copy in
+`/usr/libexec/tpm-keyring-unlock`), `/etc/systemd/system/tpm-keyring-led.service`,
+`/etc/udev/rules.d/90-tpm-keyring-led.rules` and
+`/etc/sysusers.d/tpm-keyring-led.conf`. A later run updates them when they
+differ from the version it carries, or when the running watcher is older
+than the file (a package update). An update restarts the service if it is
+running, leaves it stopped if it is not, and never changes whether it is
+enabled. If an update fails, the earlier version is put back.
+
+To switch the blinking off and keep everything else:
+
+```bash
+sudo systemctl disable --now tpm-keyring-led
+```
+
+`uninstall.sh` removes it for good, but it asks about the keyring parts
+first. Answer `n` to those to keep them.
+
+To test it, run `fprintd-verify` and watch the button. If it does not blink,
+`journalctl -u tpm-keyring-led -b` says why. A watcher that cannot run at
+all stops after ten tries in two minutes rather than restarting for ever.
+If the LED ever stays dark, give it back to the embedded controller by hand:
+
+```bash
+echo chromeos-auto | sudo tee /sys/class/leds/chromeos:*:power/trigger
+```
 
 ## SELinux
 

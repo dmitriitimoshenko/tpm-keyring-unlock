@@ -60,6 +60,20 @@ the reasoning. It is data, so `debian.rules` keeps it out of `dh_fixperms`
 too, which would make it executable along with everything else under
 `/usr/libexec`.
 
+`make install` also ships the optional power-button LED service (README.md,
+"Power-button LED"): the watcher `tpm-keyring-led`, 0755, which runs from
+the libexec directory, and its unit, udev rule and sysusers file, 0644, as
+data. No package installs or enables any of it. `tpm-keyring-unlock-configure`
+offers it only on a Framework laptop, and on a yes copies the three data
+files into `/etc` with the watcher's packaged path filled into the unit.
+`debian.rules` keeps the three out of `dh_fixperms` like the `.cil`.
+`tpm-keyring-unlock-deconfigure` takes them out again. Removing the package
+without that step leaves them behind. The unit then has nothing to run, and
+its `ConditionPathExists=` keeps it from failing at every boot. Unlike the
+SELinux module, they are not removed in the package's own scripts: they give
+the LED to a group that nothing runs as any more, which is untidy, not
+unsafe.
+
 ## OBS (openSUSE, Fedora, RHEL, Debian, Ubuntu)
 
 Files in `obs/`. One OBS package directory holds both recipes - OBS picks the

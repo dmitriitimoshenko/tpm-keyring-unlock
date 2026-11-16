@@ -7170,3 +7170,662 @@ replicated locally; `dpkg-parsechangelog -l packaging/obs/debian.changelog
 -S Version` reads `1.6.0-1`; `rpmspec -q` reads `1.6.0-0` and `rpmspec -P`
 shows the new `%changelog` entry on top. The packaging jobs of this PR
 build both packages from them.
+
+## The power button blinks while the reader waits: an optional service for Framework laptops (2026-11-15)
+
+*Partly superseded the same evening by the next entry, after a code review:
+the watcher no longer writes `chromeos-auto` to an LED it did not take,
+`--restore` acts on a note only, the udev rule fires on `add` only, a failed
+update puts the earlier version back instead of removing it, and the install
+code moved from install.sh into bin/lib.sh. The rest stands.*
+
+The repo owner asked for what
+[framework-fingerprint-led-blink](https://github.com/alejandroqh/framework-fingerprint-led-blink)
+(alejandroqh, Apache-2.0) does, offered as an optional step of the install:
+blink the power-button LED while fprintd waits for a finger. On a Framework
+laptop the reader is in that button, and nothing shows when it is listening.
+Added mid-task, also the owner's: offer it **only** on a Framework that has
+that LED. It has nothing to do with the keyring; it lives here because this
+is where the owner's fingerprint setup lives. README.md, "Power-button LED".
+
+**Read before anything was written.** The upstream repo was cloned at
+`445e984` into a scratch directory and read whole: a Python watcher, a
+systemd unit, a udev rule, a sysusers file, an installer. Its design is what
+was taken over, because each part of it is the right call:
+
+- `gdbus monitor --system --dest net.reactivated.Fprint` subscribes to
+  signals from the current owner of fprintd's name only. The bus stamps the
+  sender, so a local user cannot fake them. It needs no privilege, which
+  `busctl monitor` / `dbus-monitor` do.
+- It blinks on fprintd's own `finger-needed` device property (fprintd 1.92+),
+  paused while `finger-present` is true, and hands the LED back to the EC
+  with its `chromeos-auto` trigger.
+- `DynamicUser=` with no capabilities, plus a udev rule that gives one group
+  write access to the LED's `trigger`, `brightness` and `multi_intensity`.
+
+**Why a rewrite in bash, not a copy or a download.** Three ways were weighed:
+
+- *Fetch upstream at install time* - rejected first. That runs whatever is at
+  a third party's HEAD as root, on every install. CLAUDE.md's first rule.
+- *Vendor upstream's files* - Apache-2.0 code in an MIT repo is allowed, but
+  every packaging recipe's license field and `debian.copyright` would turn
+  mixed. It would also make Python a runtime dependency of a tool that is
+  otherwise bash and C, and tie this repo to a Python program it does not own.
+- *Own implementation, same design* - chosen. `led/tpm-keyring-led.sh` was
+  written for this repo and shares no code with upstream; the credit is in
+  its header and in README. One deliberate difference: `read -t` is the
+  clock. Every half period with no line from gdbus is a toggle, so one
+  process does what upstream does with a thread.
+
+**Who is asked** (`bin/lib.sh`, `framework_power_led`). Every condition is
+one the feature needs, and together they are the owner's "only a Framework
+with that blinking button":
+
+- DMI `sys_vendor` is `Framework` and `product_name` starts with `Laptop`.
+  Every Framework laptop so far keeps the reader in the power button, and the
+  first 13s are named plain `Laptop`. The Desktop has no reader there.
+  Chromebooks run the same ChromeOS EC and can expose the same LED with no
+  reader in the button.
+- `chromeos:white:power` exists, or the older 13's `chromeos:multicolor:power`
+  (the same two, in the same order, the watcher looks for).
+- The LED offers the `chromeos-auto` trigger. Without it the watcher could
+  take the LED and never give it back, so it never touches such an LED.
+- The user has a finger enrolled (`fprintd_user_has_enrolled_finger`, as the
+  polkit offer uses). Nothing to wait for otherwise.
+- framework-fingerprint-led-blink's unit is not installed. Two blinkers on one
+  LED would fight; the run says so in one line instead of asking.
+- `gdbus` is there, or the package manager can add it: `libglib2.0-bin`,
+  `glib2` (dnf and pacman), `glib2-tools` (zypper). Each was checked in that
+  distro's container (`dnf provides`, `zypper se --provides`, `pacman -F`)
+  and with `dpkg -S` here. Package-manager detection moved out of 1a for it.
+  It is now looked up whether or not anything is missing, in the same order.
+
+**The question is `[Y/n]`, Enter installs.** The standing rule (2026-09-14,
+2026-09-16): every prompt defaults to yes, so a run can be held through with
+Enter. The polkit question is the one asked the other
+way round, because its yes adds a way to approve root actions. This adds no
+way in: it changes nothing about who authenticates, only what the LED shows.
+What it does give out is in the plan line: a group that may write that LED.
+
+**The unit** (`led/tpm-keyring-led.service`), and how it differs from
+upstream's:
+
+- `SystemCallErrorNumber=EPERM` added, so a syscall the filter refuses
+  returns an error instead of killing the service. Neither bash nor gdbus
+  makes one under the test below, but a future glibc that does should get an
+  error, not a SIGSYS restart loop.
+- `ExecStopPost=-<watcher> --restore`. A mode of the watcher itself instead
+  of a shell loop in the unit, and allowed to fail (the `-`), so a watcher
+  that is gone does not turn the stop into a failure.
+- `ConditionPathExists=<watcher>`. A package removed without the deconfigure
+  step takes the watcher with it; the unit then stays out of the way instead
+  of failing at every boot.
+- Not `ProtectKernelTunables=`: it makes `/sys` read-only, LED included.
+  The test suite checks it stays out.
+- `systemd-analyze security --offline=true` on the rendered unit: **0.6
+  SAFE**, upstream's figure. `systemd-analyze verify`: clean.
+
+**Install, and how it fails.** `led_service_install` in install.sh runs last,
+after SELinux, and is never fatal: the keyring work before it stands either
+way. Each step is checked, because a failure rolls back to *no* service.
+A udev rule handing the LED to a group, with nothing running to show for it,
+is access given for nothing. After the rule is applied (`udevadm trigger
+--action=change` on the LED), the attributes must read group `tpm-keyring-led`
+with group write. The service must keep the same MainPID across 3 s, past its
+`RestartSec=2`: a crash loop still reads "active" right after a restart.
+Both checks are upstream's. A packaged watcher must be root's and not group-
+or other-writable before a unit points at it. The unit's path goes through
+`led_unit_render`, which refuses anything but a plain absolute path. It lands
+unquoted in `ExecStart=` and in a sed replacement.
+
+A later run compares the installed files with the ones it carries. When they
+differ it plans an update, without asking again, the way wired stacks are
+re-checked. It leaves a service the owner disabled by hand disabled.
+
+**Uninstall** (step 2c) acts only on a unit whose first line is the marker
+`# tpm-keyring-unlock: power-button LED`. A unit by that name without it is
+somebody else's. `led_service_remove` stops the service first, so its
+ExecStopPost hands the LED back. It resets only the attributes that still
+carry `tpm-keyring-led`, so a group someone else gave them stays, and then
+deletes the group. The watcher is deleted only from `/usr/local/sbin`; a
+package's copy belongs to the package manager.
+
+**Packages** ship the watcher (0755) and the three data files (0644) in the
+libexec directory, out of `dh_fixperms` like the `.cil`. Nothing is installed
+or enabled by the package. No removal scriptlet takes the `/etc` copies out,
+unlike the SELinux module. That module widens a security domain for nothing
+once the helper is gone. The leftovers here give one LED to a group nothing
+runs as, which is untidy, not unsafe, and `ConditionPathExists=` keeps the
+unit quiet. packaging/README.md says to run the deconfigure step first, as it
+already did for the PAM lines.
+
+**A bug the new test caught before anything ran for real.** The first loop
+read `if ! IFS= read -r -t "$HALF" ...; then rc=$?`. After `if !`, `$?` is the
+negation's status, 0, so the first blink tick was taken for the end of
+gdbus's output. The watcher stopped the moment it started blinking. The log
+said `tpm-keyring-led: gdbus monitor exited` right after the
+`finger-needed: <true>` line. 17 of the first 22 checks failed, and the run
+died at the SIGTERM check, whose watcher had already exited. Now `rc=0; read ...
+|| rc=$?`, with a comment saying why.
+
+**A test failure that was the fake.** A plain file is not sysfs. Sysfs reads
+`trigger` back as the whole list, the active one bracketed (`[none] ...
+chromeos-auto ...`). A file holds the last word written. The first `--restore`
+check wrote plain `none`, and the watcher, correctly, refused an LED that does
+not offer `chromeos-auto`. The fixture now writes what sysfs would. The test
+header names the difference.
+
+**Process substitution replaced by a coprocess.** `exec {mon}< <(gdbus ...)`
+opens `/dev/fd/63`, and `PrivateDevices=` gives the service a `/dev` of its
+own. systemd's private `/dev` should have the `/dev/fd` link, but nothing
+here could show it without root. A `coproc` is plain pipes and needs no
+`/dev/fd`. Its descriptor is copied at once, because bash unsets `MON` once
+it has reaped gdbus.
+
+**Observed on this machine** (Framework Laptop 13, Ryzen AI 300; Ubuntu
+26.04.1; fprintd 1.94.5-4; glib 2.88.0; systemd 259.9; bash 5.3.9):
+
+- The LED is `chromeos:white:power`, `max_brightness` 100, triggers list ends
+  `[chromeos-auto]`. It is a multicolour-class LED with one channel:
+  `multi_index` `white`, `multi_intensity` `100`. The watcher picks colours
+  only with two channels or more, so it leaves this one alone.
+- `gdbus monitor --dest` *activates* fprintd: the name went to a new owner
+  (`:1.155`) 0.45 s after the monitor started. fprintd then idled out at 30 s
+  (`The name net.reactivated.Fprint does not have an owner`), and the monitor
+  kept running. So every start of the service starts fprintd once, briefly.
+  Upstream behaves the same.
+- `fprintd-verify` sends `VerifyFingerSelected`, then `finger-needed: <true>`.
+  When it is killed (`timeout 4`), fprintd sends `finger-needed: <false>` and
+  `VerifyStatus ('verify-no-match', true)`. gdbus flushes each line at once,
+  even into a pipe.
+
+**Checked, and how.**
+
+- `test/led-test.sh`: 55 ok. New in `make test`, `run-all.sh` and CI (a `led`
+  job). test/README.md lists what it covers.
+- The real bus and fprintd, no root: the watcher pointed at a stand-in LED
+  directory. A forged `PropertiesChanged` with `finger-needed: <true>`, sent
+  from this account (`gdbus emit --system --object-path
+  /net/reactivated/Fprint/Device/0 ...`, exit 0, so the bus accepted it),
+  changed nothing in 1 s. A real `fprintd-verify` then blinked it (10 samples
+  dark, 10 lit, every 0.1 s). Once it ended, the LED was back to
+  `chromeos-auto`. SIGTERM exited 0.
+- The same, as a transient `systemd-run --user` service under the unit's
+  syscall filter (`@system-service`, minus `@privileged @resources`),
+  `MemoryDenyWriteExecute=`, `RestrictAddressFamilies=AF_UNIX`, and the rest
+  of the seccomp set: active, blinked, `Result=success` on stop.
+- `led_service_install` with `sudo`, `systemctl`, `udevadm`, `install` and
+  `systemd-sysusers` stubbed, against stand-in paths. A good run calls
+  sysusers, the udev reload, trigger and settle, daemon-reload, enable,
+  restart, and checks MainPID twice. A udev rule that did not apply, or a
+  changing MainPID, rolls back to no files and the LED attributes back at
+  644. An update leaves a disabled service disabled. An install finding the
+  unit already there leaves it alone.
+- `make install` into a staging tree: the four files land, modes 0755/0644.
+- `test/run-all.sh`: everything PASS (arm64 SKIPPED here, no binfmt, as
+  always). `make test-vm`: all 40 checks ok. It runs install.sh end to end,
+  through the reworked package-manager lookup, and `make install` plus the
+  configure step in the guest. The LED question never printed there: QEMU's
+  DMI is no Framework.
+
+**Dead end: systemd-run --user with the full sandbox.**
+`CapabilityBoundingSet=`, and `ProtectKernelModules=`, `ProtectClock=`,
+`PrivateDevices=` and the rest, each drop capabilities. A user manager cannot
+do that: `Failed to drop capabilities: Operation not permitted`, `status=218/
+CAPABILITIES`. The namespace options were skipped with a warning. So the user
+service tested the seccomp half of the sandbox only.
+
+**Not checked yet.** The unit under the system manager, `DynamicUser=` and
+`SupplementaryGroups=` included, on the real LED. That needs root, so it
+waits for the owner's own `./install.sh` run. The installer's MainPID check
+and rollback are what stand between a unit that cannot run there and a
+leftover udev rule. The multicolour path ran on the stand-in only, with no
+older Framework 13 at hand. The VM test copies `led/` now, since `make
+install` needs it; it can only show the question staying away from a
+machine that is not a Framework.
+
+## The LED service after review: fourteen findings, one of them fatal on the owner's machine (2026-11-15, later)
+
+*Partly superseded by the 2026-11-16 entry: an update now restarts by
+`is-active` and never touches enablement, the watcher lets go of an LED whose
+trigger somebody set mid-blink, and toggling and the cap run on the clock.*
+
+The owner ran `/code-review xhigh` on the uncommitted work: the diff
+against HEAD plus the untracked `led/` and `test/led-test.sh`, not the
+whole repository. It returned fourteen findings. Every one held up when
+checked, and each is fixed below with what checked it. None was public yet;
+nothing had been committed.
+
+**1. The install could never succeed on Ubuntu, Debian or Arch.**
+`/etc/sysusers.d` does not exist there until something puts a file in it
+(`ls: cannot access '/etc/sysusers.d'` on this machine; the reviewer saw the
+same in ubuntu 24.04, debian 13 and arch images). `install` into a missing
+directory fails, and the rollback took everything out again. So on the
+owner's own Framework the answer "yes" would have ended in "not installed".
+The stub run recorded in the entry above missed it, because its stand-in
+`/etc` had every directory already. Now `led_service_install` creates a
+missing directory with `install -d`, and only a missing one: `install -d` on
+a directory that exists would reset its mode and owner. A rollback `rmdir`s
+what it created, so a directory something else has used since stays.
+
+**Why the install code moved to bin/lib.sh.** Finding 1 got through because
+the earlier stub run drove a copy of the functions, cut out of install.sh by
+`sed`. `led_service_install`, `led_service_up_to_date` and
+`led_service_rollback` now live in bin/lib.sh. The caller sets
+`LED_SRC_DIR`, `LED_BIN` and `LED_WATCHER_SRC` (empty when a package owns
+the watcher), and `test/led-test.sh` runs those very functions. Its `/etc`
+has no `sysusers.d`.
+
+**2. A failed update deleted a working install.** `refresh` failing at any
+step went to the same rollback as a fresh install, `led_service_remove`. Now
+an update first copies the unit, rule, sysusers file and (hand-rolled) the
+watcher aside. A failure puts them back and restarts the service if it was
+running. The test checks the four files' sha256 before and after, and that
+`restart` ran twice.
+
+**3. Step 1h asked about an install it would then refuse.** A unit by the
+name without the marker passed the plan, got the question and a plan line,
+and failed at the write with "appeared since the plan was printed", which
+was false. Now `led_install_conflict` is asked first, in the plan and again
+before the writes. If anything stands in the way it says what, once, and
+asks nothing.
+
+**11. Only the unit was checked for being this tool's.** The udev rule and
+the sysusers file were overwritten and deleted on sight. The group was
+created by `systemd-sysusers`, which leaves an existing group alone, so the
+rule would have handed the LED to whoever was already in a group of that
+name. Uninstall would later `groupdel` it. Now all three files carry the marker
+`# tpm-keyring-unlock: power-button LED` as their first line
+(`LED_FILE_MARKER`). `led_install_conflict` refuses when any of them is
+there without it, or when the group exists without this tool's sysusers file
+to have made it. `led_service_remove` deletes only marked files, and touches
+the LED's attributes and the group only when the sysusers file was this
+tool's.
+
+**4. The watcher overwrote an LED its owner had switched off.** `restore_all`
+ran at every start and stop and wrote `chromeos-auto` to any power LED not
+on it, and `led_service_remove` did the same. A button switched off with
+`trigger none` lit up again. "A crashed watcher left it dark" and "its owner
+switched it off" both read `trigger none`, so the trigger alone cannot tell
+them apart. Now:
+
+- `take_led` takes only an LED whose *active* trigger is `chromeos-auto`.
+  Giving back is therefore always correct, and a switched-off button is
+  never woken.
+- Before its first write it notes the LED in `$RUNTIME_DIRECTORY/taken`: the
+  name, then a multicolour LED's colours. Giving back removes the note.
+- `--restore` (ExecStopPost) and the start act on the note only. A note
+  naming anything but the two power-button LEDs is dropped unread. Without
+  systemd (no `RUNTIME_DIRECTORY`) there is no note, so nothing is recovered.
+- `led_service_remove` no longer writes the trigger at all.
+
+**A dead end in 4, found by checking it on the real systemd.** The note
+first lived in a plain `RuntimeDirectory=`. A transient user service
+(`systemd-run --user`, the unit's ExecStopPost and runtime directory) was
+blinking on a real `fprintd-verify` and was killed with `systemctl --user
+kill -s KILL`. The LED stayed `none`. The journal said why: `Control
+process exited, code=killed, status=9/KILL`. `systemctl kill` signals the
+whole cgroup, and ExecStopPost, just forked into it, died with the rest. The
+runtime directory was then removed with the note in it. With the new rule
+(never take an LED off `chromeos-auto`), the button would have stayed dark
+until reboot. A plain `kill -9` of the main PID, which is what a crash looks
+like, was fine: ExecStopPost ran with `RUNTIME_DIRECTORY=/run/user/1000/...`
+and `SERVICE_RESULT=signal` and saw the note. An OOM kill takes the cgroup
+the way `systemctl kill` does, so the directory is now
+`RuntimeDirectoryPreserve=yes`, kept until reboot. Checked the same way: after
+the whole-cgroup SIGKILL the note was still there. The next start gave the
+LED back and removed the note. A reboot hands the LED to the EC anyway,
+since the driver's default trigger is `chromeos-auto`. `led_service_remove`
+runs `systemctl clean --what=runtime` after the stop, so the kept directory
+does not outlive the service.
+
+**5. A prompt already up when the watcher started never blinked.** Signals
+report changes only. Now, on the first "is owned by" line, the subscription
+is in place, so nothing between the answer and the next signal is lost. The
+watcher then asks fprintd once: `Manager.GetDevices`, then
+`Properties.GetAll` on each device. The answers come from the name's owner,
+routed by the bus, as the signals do. Checked against this machine's fprintd
+first. Idle, GetAll gave `{'name': <'Goodix MOC Fingerprint Sensor'>, ...,
+'finger-present': <false>, 'finger-needed': <false>}`; during
+`fprintd-verify` it gave `'finger-needed': <true>`. Then the watcher was
+started as a sandboxed user service 1.2 s into a running `fprintd-verify`,
+with no new signal coming. It blinked (`none:0`/`none:100` alternating).
+Later owners are not asked again: a new fprintd starts with nothing waiting,
+and the signals cover it.
+
+**6. A watcher that cannot run would restart for ever.** It exits within a
+second every time, and with `RestartSec=2` the default limit (5 starts in
+10 s) is never reached. Now `StartLimitIntervalSec=120` and
+`StartLimitBurst=10`.
+
+**7. A package update left the old watcher running.** The packaged watcher
+is not compared, since it is the package's. Nothing restarted the service,
+so the old code ran until reboot. `led_service_up_to_date` now also compares
+the service's `ExecMainStartTimestamp` (`systemctl show --timestamp=unix`,
+which reads `@<seconds>` for a running service and nothing for a stopped one)
+with the file's change time. That is the time the package manager wrote it;
+its modification time is the build's. A running watcher older than its file
+means an update with a restart. A systemd too old for `--timestamp=unix`
+prints nothing usable, and the comparison is skipped.
+
+**8. The packaged watcher's check stopped at the file.** Whoever can write
+a directory above it can swap the file. `led_path_is_roots_alone` walks every
+directory up to `/`: root's, no group or other write. A symlink is refused.
+The test's first sample was `/usr/bin/env`, and the check said no. On Ubuntu
+26.04 that is a symlink to rust coreutils
+(`/usr/bin/env -> ../lib/cargo/bin/coreutils/env`), so the check was right
+and the sample wrong. It is `/etc/passwd` now.
+
+**12. The udev rule ran on every trigger write.** The kernel sends a `change`
+uevent for each one, two per prompt, and each started `/bin/sh` and
+`chgrp`/`chmod` to set what was set already. The rule is `ACTION=="add"` now.
+install.sh applies it to the LED already there with `udevadm trigger
+--action=add`. The attributes keep their group for as long as the device
+exists. `udevadm verify` passes.
+
+**13. The LED names and attributes lived in four places.** bin/lib.sh now has
+one `LED_SYSFS_NAMES`, used by `framework_power_led` and
+`led_service_remove`. The watcher and the udev rule cannot read lib.sh, so
+the test checks the watcher's `LED_CANDIDATES`, the rule's `KERNEL==` and
+the rule's attribute list against `LED_SYSFS_NAMES` and `LED_ATTRS`.
+
+**10. "Undo: uninstall.sh" pointed at the whole uninstaller**, whose earlier
+questions take out the PAM lines, the module and the sealed secret, all
+`[Y/n]`. The install now ends with how to switch only the LED off
+(`systemctl disable --now tpm-keyring-led`; a later run leaves it off).
+It adds that uninstall.sh asks about the keyring parts first, and `n` keeps
+them. README says the same.
+
+**14. Small things.** The unit is rendered once per check, through `cmp -s
+<(...)`. `fprintd-list`, which starts fprintd and can take seconds, now runs
+once per run (`user_has_enrolled_finger` caches it for polkit's question and
+the LED's). An unused variable in the test is gone.
+
+**9. A test that could fail on a slow runner, and one that did.** The cap
+check had a 0.25 s margin: with a 2 s cap, blinking ends 1 to 2.25 s in. The
+check now runs at 3.5 s. Then, with every CPU busy (32 spinning loops on 16
+CPUs), a different check failed once: `finger-present on another device
+does not stop it` got `[none] kbd-capslock disk-activity chromeos-auto
+rfkill-any` instead of `none`. The state was right: `none` was active. The
+fake sysfs had already turned the watcher's bare word back into the list,
+because the watcher, slowed down, wrote before the fake sent its next line.
+Checks of the active trigger now read the bracketed word or the bare one
+(`act`). Raw content is compared only where the point is that nothing was
+written. Under the same load, run twice: 118 ok both times.
+
+**Checked after the fixes.** `test/led-test.sh`: 118 ok, three runs idle
+and two under full load. `systemd-analyze verify` on the rendered unit:
+clean. `systemd-analyze security --offline=true`: still 0.6 SAFE. `udevadm
+verify` on the rule: success. The sandboxed user-service runs above, against
+this machine's fprintd.
+
+**Still not checked:** the unit under the system manager, with
+`DynamicUser=`, `SupplementaryGroups=`, `PrivateDevices=` and a preserved
+runtime directory, on the real LED. That needs root, so it waits for the
+owner's `./install.sh`.
+
+## `install.sh --upgrade`: from an earlier version to the newest, keeping the sealed secret (2026-11-15, late)
+
+*Partly superseded by the 2026-11-16 entry: only tags on the remote's main
+line count as releases, a detached checkout with commits of its own is not
+moved, and the "nothing to upgrade" refusal comes before the checkout step.*
+
+The owner asked for an upgrade path beside the install. The case in point is
+the power-button LED: someone on 1.6.0 should get offered it without
+re-installing. Until now the way was `git pull` and a full re-run, which
+plans "Re-seal (overwrite)". seal.sh then asks "Overwrite?", and the
+documented answer is `n`, a trap for anyone holding Enter. Packages had the
+same in post_upgrade: run the configure step, "Answer n at 'Overwrite?'".
+
+**What `--upgrade` does.** Two steps:
+
+1. **A git checkout moves to the newest release first** (`upgrade_checkout`
+   in bin/lib.sh). It runs `git fetch --tags origin`, takes the highest
+   `vX.Y.Z` tag (an `-rc` or any other tag is no release), compares it with
+   VERSION numerically (`sort -V`, so 1.10.0 is after 1.9.0), lists the
+   commit subjects coming with it, and asks `[Y/n]`. Then it execs the new
+   version's install.sh with the same options and a marker
+   (`TPM_KEYRING_UPGRADE_REEXEC`) that skips this step. So everything after
+   it is the new version's code, not the old script carrying on. git writes
+   the new files as new inodes, so the running bash keeps reading the old
+   one until the exec.
+2. **Then every step runs again**, as on any re-run: packages, tss, the
+   module and helper rebuilt, the mask, the PAM stacks re-checked, and every
+   optional question the new version has, the LED among them. The difference
+   is the seal step.
+
+**The seal step keeps what works.** The plan says "Keep your sealed secret if
+it still unseals with the updated helper; re-seal only if it does not". At
+that point the helper has just been installed. It is asked as README's
+troubleshooting asks it: `sudo "$HELPER_DST" "$USER" >/dev/null`, only the
+exit status kept, the secret into /dev/null. It is re-sealed only when it no
+longer unseals (PCR7 moved with a Secure Boot change), or when it has no
+`primary.handle`, which means it predates the persisted primary that makes
+logins fast. In either case seal.sh runs as before, with its own question.
+
+**Where it will not move a checkout**, carrying on with the files it has and
+saying why:
+
+- local changes to tracked files - switching could lose them;
+- a branch with commits the release lacks - a fast-forward is impossible,
+  and rewinding someone's branch is not this tool's call;
+- a checkout already past the release, such as a developer's main;
+- no git checkout at all (a tarball);
+- `origin` unreachable.
+
+A branch is only ever fast-forwarded (`merge --ff-only`), so the user stays on
+`main`. A checkout on no branch, an older tag say, checks out the new tag.
+`upgrade_checkout_is_git` insists the directory is the top of its own work
+tree. Inside some other repository, `git -C` would otherwise answer for that
+one.
+
+**Trust.** The fetch is from `origin` as `git clone` set it up: the same
+trust as the first install, which ran what that clone fetched. The tags
+carry no signatures, so there is nothing more to check them against. The
+step shows what is coming and asks before anything moves.
+
+**Packages.** With `--no-build` the files are the package manager's, and the
+step only says so. `tpm-keyring-unlock-configure --upgrade` then does the
+rest, and that is what the AUR install script's post_upgrade, and README, now
+tell people to run after a package upgrade. The release changelogs already
+published stay as written.
+
+**No upgrade without an install.** `--upgrade` with no sealed secret for this
+user stops and points at the plain installer. Without one there is nothing to
+keep, and the run would be a first install under another name.
+
+**Tested the way the review of the LED work taught.** `upgrade_checkout`
+lives in bin/lib.sh, not install.sh, so that `test/upgrade-test.sh` runs the
+function itself rather than a copy. That test uses a bare repository as the
+remote, with releases tagged after the clone. A switch execs the new
+installer, so each call runs in a subshell, and the release carries a
+stand-in install.sh that prints how it was started. That is how the test sees
+the same options and the marker arrive. It has 39 checks, listed in
+test/README.md. The rest needs a TPM: `test/vm/run-vm-test.sh` now runs
+`install.sh --upgrade` between the install and the uninstall. The plan must
+be the only prompt, `seal.priv` must keep its sha256, the stack must read
+"already wired in", and the secret must still unseal.
+
+**Bootstrap.** 1.6.0 and earlier have no `--upgrade`, so the first time is
+`git pull && ./install.sh --upgrade`. README says so.
+
+**Checked.** `test/upgrade-test.sh`: 39 ok. `make test-vm`: all 46 checks ok,
+the five new `--upgrade` ones among them. Its run ended with the plan as its
+only prompt, printed "It unseals through the updated helper - kept", and
+left `seal.priv` with the same sha256. `test/run-all.sh`: everything PASS,
+arm64 skipped here as always.
+
+## A second review: ten findings in the LED service and `--upgrade`, and one more its own test found (2026-11-16)
+
+The owner ran `/code-review medium` on PR #29, the LED service and
+`install.sh --upgrade`. It returned ten findings, all of which held. While
+fixing them the new tests found an eleventh. And one worry of mine was ruled
+out. Each is below, with what checked it.
+
+**Ruled out first: gdbus speaking another language.** The watcher matches
+gdbus's own lines, "The name ... is owned by" and "does not have an
+owner", and a system service gets the system locale. It turned out not to
+matter: run under `LANG=de_DE.UTF-8 LANGUAGE=de LC_ALL=de_DE.UTF-8` (de_DE is
+installed here), gdbus still printed English. That check did turn up
+something else. This machine has `LC_NUMERIC=de_DE.UTF-8`, and under it
+`$EPOCHREALTIME` reads `1794790274,374873`, with a comma. That mattered for
+finding 6.
+
+**6, and the eleventh: the blinking ran off read's timeout.** It toggled
+only when a read timed out, so lines arriving faster than every 0.25 s held
+the LED still and kept it past the cap. Now the clock decides. Each pass
+toggles when the half period is up (`$EPOCHREALTIME`, in microseconds) and
+ends the stretch at the cap, then waits for a line only until the next tick.
+The watcher exports `LC_ALL=C` for the decimal point, and strips either
+separator anyway. The cap is now exact to the microsecond rather than whole
+seconds.
+
+The test written for it - a line every 0.1 s for 3 s, with a 2 s cap - then
+failed: `a stream of lines: the cap still ends it (got: none, want:
+chromeos-auto)`. The cap did end the stretch. But the next line was a second
+device's `finger-present: <false>`, and it counted as "a new change from
+fprintd", which took the LED straight back. That had been the rule since the
+first version, and upstream's too, so under such a stream the cap held
+nothing. Now, after the cap, only a new prompt starts the blinking again:
+`finger-needed: <true>`, either from a retry or from a fresh prompt. A test
+covers that.
+
+**7. An LED whose trigger somebody set mid-blink got overwritten.**
+`give_back` wrote `chromeos-auto` whenever the EC did not have the LED. Now
+every tick first reads the active trigger. If it is no longer the `none`
+the watcher set, the watcher lets go of the LED: no further write, and the
+note is dropped. `give_back`, and `--restore` acting on a note, write
+`chromeos-auto` only over that `none`. One case stays out of reach. An
+owner who writes `none` themselves mid-blink looks the same as the
+watcher's own `none`, so their choice is overridden when the prompt ends.
+`active_trigger` reads the bracketed word, and treats a file holding a
+single word as that word. Sysfs never gives that; the test's plain files
+do. So the fake sysfs needs no special casing in the watcher's logic.
+
+**8. An update decided by `is-enabled`.** This came from the first review's
+own fix. A service that was disabled but still running got its watcher
+replaced and was not restarted. From then on every run called it out of
+date, since the running watcher was older than the file. And a service that
+was enabled but stopped by hand was started again. Now an update restarts a
+service that is running, leaves one that is stopped stopped, and never calls
+`enable`: whether it is enabled is its owner's setting. Only a fresh install
+enables it.
+
+**5. The watcher at `/usr/local/sbin` was not checked for being this
+tool's.** A fresh install overwrote whatever was at that path, a rollback
+deleted it, and uninstall deleted it. The watcher now carries the marker as
+its second line, under the shebang (`led_watcher_is_ours`).
+`led_install_conflict` refuses when a file is at the hand-rolled path
+without it. The rollback and uninstall delete only a marked watcher, and
+uninstall says when it leaves one alone.
+
+**3. Any `vX.Y.Z` on the remote counted as a release.** It is now only a
+tag on the remote's main line: `git tag -l --merged` of what origin/HEAD
+points at, or origin/main. The release workflow tags main, so a tag pushed
+onto some other commit is no release, however high its number. The tags are
+unsigned, so there is no signature to check. A checkout with neither ref has
+no releases, and the run says so.
+
+**4. A detached HEAD with commits of its own was moved anyway**, leaving
+those commits to the reflog. The ancestry check that guarded branches now
+guards a detached HEAD too.
+
+**2. `--upgrade` with nothing installed refused only after the checkout had
+moved**, after the switch and the exec of the new installer. Now the check
+for a sealed secret comes before the checkout step.
+`test/upgrade-test.sh` runs `install.sh --upgrade` in a pty (`script`) with
+an empty HOME, and checks that it refuses without printing the checkout
+step's heading.
+
+**1. A kept secret is not proved to be the current keyring password.** That
+it unseals proves the seal works, not what it holds. A plain re-run asks
+"Overwrite?" and Enter re-seals; `--upgrade` asks nothing. Nothing can
+compare the secret with the keyring password: unlocking the keyring with it
+would be a change of state, and the keyring file's change time moves
+whenever any secret is stored. So the run says, right where it keeps the
+secret, to re-seal after a password change, and README says the same.
+
+**9. The group can write any trigger.** A writable `trigger` takes any
+trigger the kernel offers, not only `none` and `chromeos-auto`, and file
+permissions cannot narrow that. So it is documented as the limit: the
+service's sandbox and missing capabilities are what keep it to those two.
+README's security bullet says so.
+
+**10. A comment overstated a check.** It said the packaged watcher is checked
+"like the module and the helper", but `--no-build` only checks that those
+two exist. It now says the watcher gets more than that presence check, and
+why: a unit this run writes runs it where it lies.
+
+**A slip while making these.** One edit was a Python script fed to bash
+through a heredoc ending in `EOF`. The test text inside it had heredocs of
+its own ending in `EOF`, so bash ended the outer one early and ran the rest
+as shell commands. Python had stopped at a syntax error, so no file was
+edited. The stray commands failed for unset variables (`>"$LED/trigger"`
+went to `/trigger`, refused for a non-root user), and nothing was created:
+`ls /trigger /stream.sh ...` found nothing, and `git status` showed only the
+intended files. The scripts now go through a file with a delimiter of their
+own.
+
+**Checked.** `test/led-test.sh`: 131 ok, idle and twice with every CPU busy.
+`test/upgrade-test.sh`: 44 ok. On this machine's fprintd, as a sandboxed user
+service under the unit's syscall filter and with `LC_NUMERIC=de_DE.UTF-8` set
+for it: blinking during a real `fprintd-verify`, `chromeos-auto` after,
+`Result=success` on stop.
+`test/run-all.sh`: everything PASS (arm64 skipped here). `make test-vm`:
+all 46 checks ok, `install.sh --upgrade` among them.
+
+## Release 1.7.0 (2026-11-16)
+
+Carries the two features of #29 to the packages and to `--upgrade` itself:
+the power-button LED service on Framework laptops, and `install.sh
+--upgrade` (`tpm-keyring-unlock-configure --upgrade` for packages).
+
+**Why in #29 and not a release PR of its own.** Every earlier release was
+its own PR (#22, #25, #27). This time the repo owner pointed out, after #29
+was pushed, that the version had not been bumped, so the bump went into
+#29. The release workflow tags from `VERSION` on main, so merging #29 now
+tags `v1.7.0` and publishes it. Without the bump the merge would have
+tagged nothing.
+
+**`--upgrade` needs this tag.** `upgrade_checkout` moves a checkout only to
+a `vX.Y.Z` tag on the remote's main line that is newer than the checkout's
+`VERSION`. Until `v1.7.0` exists, the newest such tag is `v1.6.0`, which has
+no `--upgrade` and no LED. So `--upgrade` has nothing to bring until a
+release carries it. The bootstrap stays as README says: 1.6.0 and earlier
+pull once by hand, `git pull && ./install.sh --upgrade`.
+
+**Why 1.7.0.** Both are new features and change nothing the tool already
+did, so this is a minor release by semver, as 1.6.0 was for the polkit
+step. The owner can still pick another number: `scripts/bump-version.sh
+X.Y.Z` again, then carry the two changelog entries over by hand.
+
+**The changelogs.** `bump-version.sh` wrote the Debian entry's frame (name,
+address and date from git config, as for every earlier entry). The text of
+both entries is new. It says:
+
+- what the LED service does and what it is: sandboxed, no root, no
+  network, fprintd's own `finger-needed`, the LED handed back to the EC;
+- where it is asked: on a Framework laptop with that LED and an enrolled
+  finger;
+- whose design it follows: framework-fingerprint-led-blink by alejandroqh,
+  Apache-2.0;
+- that `tpm-keyring-unlock-deconfigure` takes it out;
+- what `--upgrade` keeps: the sealed secret, while it still unseals through
+  the new helper.
+
+The upgrade note on these entries is new as well. Earlier ones said to run
+`tpm-keyring-unlock-configure` again and answer `n` at "Overwrite?". This
+one says `--upgrade`, which asks no such question. The AUR `post_upgrade`
+already says the same since #29.
+
+**Where else it goes.** As for every earlier tag, the GitHub release is
+written by hand with the upgrade note on top. The workflow tags, pins the
+AUR checksum (left at the placeholder of 64 zeros by the script) and
+publishes to the Build Service.
+
+**Checked.** The release workflow's five-file version check, run locally:
+all five read 1.7.0. `dpkg-parsechangelog -l packaging/obs/debian.changelog
+-S Version` reads `1.7.0-1`. `rpmspec -q` reads `1.7.0-0`, and `rpmspec -P`
+shows the new `%changelog` entry on top. `test/upgrade-test.sh`: 44 ok. Its
+repositories carry versions of their own, so the real `VERSION` does not
+reach it.

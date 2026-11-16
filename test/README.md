@@ -156,6 +156,66 @@ actually runs there, never skips.
   line gone, and an include that later jumps into the session line; vendor
   stacks are listed; and `/usr/lib64/security` is tried before the
   directories 32-bit PAM fills.
+- **`test/led-test.sh`** (no container, no root) — the optional
+  power-button LED service. The watcher, `led/tpm-keyring-led.sh`, runs
+  against a fake `gdbus` first in `PATH` that plays fprintd's signals exactly
+  as `gdbus monitor` prints them and answers `gdbus call` as fprintd does,
+  with a directory of plain files standing in for `/sys/class/leds`. The fake
+  turns a bare trigger word back into the bracketed list sysfs reads back,
+  and looks at the LED at chosen points of its script, so each check follows
+  the signal that caused it. Covers: the watcher subscribes with `--dest`
+  (what keeps forged signals out); `finger-needed` blinks it, dark and lit;
+  a finger on the sensor stops it and lifting it off resumes; `finger-needed`
+  false and fprintd losing its bus name hand it back to `chromeos-auto`; a
+  prompt already up when the watcher starts blinks too, with fprintd asked
+  once; a finger on one device does not hide another device that wants one;
+  the older Framework 13's multicolour LED lights only white and gets its
+  colours back; an LED off `chromeos-auto` - including a button its owner
+  switched off with `trigger none` - is never taken or woken; a trigger
+  somebody sets mid-blink makes it let go without another write; the
+  60-second cap (shortened for the test, with the checks a second clear of
+  its window), after which only a new prompt starts it again; a stream of
+  lines every 0.1 s neither holds the LED still nor outlasts the cap; a line
+  cut in two by a blink tick still counts; SIGTERM
+  mid-blink restores the LED and stops `gdbus`; SIGKILL leaves the note that
+  `--restore` and the next start act on, and `--restore` without a note, with
+  one naming anything else, or with a trigger set since the kill, writes
+  nothing. Then `framework_power_led()`,
+  which decides who is asked at all. Then the files: the LED names and
+  attributes the watcher, the udev rule and `bin/lib.sh` each carry are held
+  to each other, every file starts with the marker, and the rendered unit
+  is checked line by line. Then `bin/lib.sh`'s install, update, rollback and
+  removal, run for real against stub `sudo`, `systemctl`, `udevadm`,
+  `install` and `systemd-sysusers` and an `/etc` with no `sysusers.d`, as on
+  Ubuntu, Debian and Arch: a fresh install creates it; a failed fresh install
+  leaves nothing, the directory included; a failed update puts the earlier
+  files back byte for byte and restarts the service; a stopped service stays
+  stopped through an update and a running one is restarted, with its
+  enablement never touched; a running watcher older than its file counts as
+  out of date; a unit, rule, group or watcher file by this tool's names that
+  is not this tool's makes it refuse; removal takes only files with the
+  marker; a packaged watcher this account could replace is refused. What it cannot
+  cover is the unit under the system manager (`DynamicUser=`, the sandbox)
+  on the real LED: `JOURNAL.md`, 2026-11-15, records what was checked by
+  hand, and how.
+- **`test/upgrade-test.sh`** (no container, no root, no network) — the
+  first step of `install.sh --upgrade`, which moves a git checkout to the
+  newest release. A bare repository under a temp directory plays the GitHub
+  remote, with releases tagged after the clone. Covers: versions compare as
+  numbers (1.10.0 after 1.9.0); only `vX.Y.Z` on the remote's main line
+  counts as a release, not an `-rc`, another tag, or a `v9.0.0` pushed onto
+  a side commit; a branch is fast-forwarded and stays a branch, a detached
+  checkout at an older release moves to the tag, untracked files do not
+  block it; a local change to a tracked file, commits of its own (on a
+  branch or detached), or a checkout already past the release are left where
+  they are; a directory inside a repository or a plain one is no checkout.
+  `install.sh --upgrade` with no sealed secret is refused before the
+  checkout step, run in a pty with an empty HOME. Then `upgrade_checkout`
+  itself, the function install.sh runs, in a subshell because a switch execs
+  the new installer: declined, accepted (the release's stand-in installer
+  starts with the same options and the re-exec marker), already newest,
+  local changes, no checkout, a packaged install, and an unreachable origin.
+  The rest of an upgrade needs a TPM; `run-vm-test.sh` runs it.
 - **`test/runtime-test.sh`** (one container, distro doesn't matter) — the
   compiled PAM module's actual fork/exec/pipe/timeout/`PAM_AUTHTOK` logic,
   using `pamtester` + a fake helper script standing in for
@@ -260,7 +320,10 @@ script). Two scenarios:
   `tpm-keyring-unlock-configure` (which must not compile anything), and
   `-deconfigure`, which must leave files a package owns alone. Until this
   existed, nothing in the repo had ever executed `install.sh` - the distro
-  tests mirror its logic, they do not run it.
+  tests mirror its logic, they do not run it. Between the two it runs
+  `install.sh --upgrade`: it has to finish with the plan as its only prompt,
+  keep the sealed blob byte for byte (no "Overwrite?", no password), find
+  the stack wired already, and leave the secret unsealing.
 
 ### Driving the prompts: `test/vm/pty-drive.py`
 

@@ -3,7 +3,7 @@
 # Built by OBS from the tarball that _service pulls from the git tag.
 #
 Name:           tpm-keyring-unlock
-Version:        1.6.0
+Version:        1.7.0
 Release:        0
 Summary:        TPM-backed unlock of the GNOME login keyring at login
 License:        MIT
@@ -76,6 +76,12 @@ fi
 # Loaded by tpm-keyring-unlock-configure on SELinux systems, never here.
 %{_libexecdir}/%{name}/tpm_keyring_unlock.cil
 %{_libexecdir}/%{name}/seal.sh
+# The optional power-button LED service. tpm-keyring-unlock-configure installs
+# the last three into /etc on a Framework laptop, when asked to; never here.
+%{_libexecdir}/%{name}/tpm-keyring-led
+%{_libexecdir}/%{name}/tpm-keyring-led.service
+%{_libexecdir}/%{name}/90-tpm-keyring-led.rules
+%{_libexecdir}/%{name}/tpm-keyring-led.sysusers
 %{_libexecdir}/%{name}/configure.sh
 %{_libexecdir}/%{name}/deconfigure.sh
 # root-only: it unseals the keyring password and is executed by PAM as root.
@@ -85,6 +91,21 @@ fi
 %{_bindir}/tpm-keyring-unlock-deconfigure
 
 %changelog
+* Mon Nov 16 2026 Dmitrii Timoshenko <dmitrii.timoshenko16@gmail.com> - 1.7.0-0
+- On a Framework laptop, tpm-keyring-unlock-configure offers to blink the
+  power button's LED while the fingerprint reader in it waits for a finger.
+  It is a small sandboxed service with no root and no network. It follows
+  fprintd's own finger-needed property and hands the LED back to the
+  embedded controller afterwards. Asked only where that LED is present and
+  a finger is enrolled. Idea and design from framework-fingerprint-led-blink
+  by alejandroqh (Apache-2.0), reimplemented in bash.
+  tpm-keyring-unlock-deconfigure takes it out.
+- tpm-keyring-unlock-configure --upgrade re-checks the configuration after
+  a package upgrade and offers what the new version adds. It keeps the
+  sealed secret, with nothing to type, while it still unseals through the
+  new helper, and re-seals only if it does not. To be offered the LED after
+  upgrading, run it once.
+
 * Fri Oct 23 2026 Dmitrii Timoshenko <dmitrii.timoshenko16@gmail.com> - 1.6.0-0
 - tpm-keyring-unlock-configure can give polkit prompts (App Center and snap
   installs, other admin actions) a fingerprint line of their own, which the

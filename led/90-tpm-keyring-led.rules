@@ -1,0 +1,16 @@
+# tpm-keyring-unlock: power-button LED
+# Installed by install.sh when asked to, removed by uninstall.sh, which knows
+# it by the line above. README.md, "Power-button LED".
+#
+# Lets group tpm-keyring-led write the Framework power-button LED's trigger,
+# brightness and colour (multi_intensity, where it has one), and nothing
+# else, so tpm-keyring-led.service runs without root. chromeos:white:power on
+# most models, chromeos:multicolor:power on the older Framework 13.
+#
+# On "add" only. The kernel sends a "change" event for every write to an
+# LED's trigger, which is two per fingerprint prompt, and each would start
+# this shell again to set what is set already. The attributes keep their group
+# for as long as the LED exists. install.sh applies the rule to the LED that
+# is already there with `udevadm trigger --action=add`.
+ACTION=="add", SUBSYSTEM=="leds", KERNEL=="chromeos:white:power|chromeos:multicolor:power", \
+  RUN+="/bin/sh -c 'cd /sys%p || exit 0; for a in trigger brightness multi_intensity; do [ -e $$a ] || continue; chgrp tpm-keyring-led $$a && chmod g+w $$a; done'"

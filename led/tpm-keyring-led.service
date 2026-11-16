@@ -1,0 +1,77 @@
+# tpm-keyring-unlock: power-button LED
+# Installed by install.sh (or tpm-keyring-unlock-configure) when asked to,
+# removed by uninstall.sh, which knows it by this first line. install.sh
+# fills in the watcher's path (bin/lib.sh, led_unit_render). README.md,
+# "Power-button LED".
+[Unit]
+Description=Blink the power-button LED while fprintd waits for a finger
+Documentation=https://github.com/dmitriitimoshenko/tpm-keyring-unlock#power-button-led
+After=dbus.service systemd-udevd.service
+# A package removed without running the deconfigure step first takes the
+# watcher with it. The unit then stays out of the way instead of failing at
+# every boot.
+ConditionPathExists=@LED_BIN@
+# A watcher that cannot run at all - gdbus gone, the bus refusing it - exits
+# within a second, every time. With RestartSec=2 the default limit (5 starts
+# in 10 s) is never reached, and it would restart for ever, two journal lines
+# each time. Ten starts in two minutes end it as failed instead.
+StartLimitIntervalSec=120
+StartLimitBurst=10
+
+[Service]
+Type=simple
+ExecStart=@LED_BIN@
+# The watcher gives the LED back to the EC when it stops, and this covers a
+# watcher that could not: killed, or crashed. While the LED is the watcher's,
+# a note of that sits in the runtime directory, and --restore acts on the
+# note alone: an LED its owner switched off looks the same otherwise.
+ExecStopPost=-@LED_BIN@ --restore
+RuntimeDirectory=tpm-keyring-led
+RuntimeDirectoryMode=0700
+# Kept until reboot, not removed at every stop. `systemctl kill` and an OOM
+# kill take the whole cgroup, ExecStopPost included (seen: "Control process
+# exited, code=killed"), and the note would go with the directory - leaving
+# the LED dark for good, since an LED off the EC's trigger is never taken
+# again. Kept, the next start finds the note and gives the LED back. A reboot
+# hands the LED to the EC by itself.
+RuntimeDirectoryPreserve=yes
+Restart=on-failure
+RestartSec=2
+
+# No root. A throwaway user, whose one extra group is the one the udev rule
+# lets write the LED's trigger, brightness and colour, and nothing else.
+DynamicUser=yes
+SupplementaryGroups=tpm-keyring-led
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+
+# Sandbox. Not ProtectKernelTunables=: it makes /sys read-only, LED included.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+IPAddressDeny=any
+# The system bus is a Unix socket.
+RestrictAddressFamilies=AF_UNIX
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

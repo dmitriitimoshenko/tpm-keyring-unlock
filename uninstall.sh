@@ -472,6 +472,34 @@ if command -v semodule >/dev/null 2>&1 && [ -d /var/lib/selinux ]; then
   fi
 fi
 
+# --- 2c. the power-button LED service -------------------------------------
+# install.sh offers it on a Framework laptop (bin/lib.sh, framework_power_led).
+# Its unit, udev rule and sysusers file each go only if they start with this
+# tool's marker line; one by the same name without it is somebody else's, and
+# stays (bin/lib.sh, led_service_remove). Offered while any of the three is
+# this tool's, so a half-removed install is finished off. The watcher is
+# deleted only where install.sh copied it, and only if it carries the marker:
+# a package's copy is the package manager's, and another file at that path is
+# somebody else's. A watcher left behind by a unit removed by hand goes too.
+if led_service_installed || led_file_is_ours "$LED_RULE" || led_file_is_ours "$LED_SYSUSERS" \
+  || { [ "$KEEP_PACKAGED_FILES" = false ] && led_watcher_is_ours "$LED_BIN_LOCAL" && [ ! -e "$LED_UNIT" ]; }; then
+  echo
+  if confirm "Remove the power-button LED service ($LED_NAME), which blinks the button while the reader waits?"; then
+    led_service_remove
+    if [ "$KEEP_PACKAGED_FILES" = false ] && led_watcher_is_ours "$LED_BIN_LOCAL"; then
+      sudo rm -f "$LED_BIN_LOCAL"
+    elif [ "$KEEP_PACKAGED_FILES" = false ] && [ -e "$LED_BIN_LOCAL" ]; then
+      echo "$LED_BIN_LOCAL is not this tool's watcher - left alone."
+    fi
+    echo "Removed."
+  else
+    echo "Left $LED_NAME installed."
+  fi
+elif [ -e "$LED_UNIT" ]; then
+  echo
+  echo "$LED_UNIT does not start with this tool's marker line - left alone."
+fi
+
 # --- 3. unmask the systemd units ----------------------------------------
 if systemctl --user is-enabled gnome-keyring-daemon.service 2>/dev/null | grep -q masked; then
   if confirm "Unmask gnome-keyring-daemon systemd units (restores the original,\npre-tpm-keyring-unlock behavior on this machine)?"; then
