@@ -2176,11 +2176,12 @@ selinux_domain_may_use_tpm() {
 # On a Framework laptop the fingerprint reader sits in the power button, and
 # nothing shows when it is waiting for a finger. install.sh offers a small
 # service that blinks the button's LED meanwhile: led/tpm-keyring-led.sh, run
-# by tpm-keyring-led.service as a throwaway user with no capabilities, which a
-# udev rule lets write that LED and nothing else. It has nothing to do with
-# the keyring: it is offered in the same run because this tool is where its
-# owner's fingerprint setup lives. README.md, "Power-button LED"; JOURNAL.md,
-# 2026-11-15. The idea is framework-fingerprint-led-blink's, by alejandroqh.
+# by tpm-keyring-led.service as a system user of its own with no
+# capabilities, which a udev rule lets write that LED and nothing else. It has
+# nothing to do with the keyring: it is offered in the same run because this
+# tool is where its owner's fingerprint setup lives. README.md, "Power-button
+# LED"; JOURNAL.md, 2026-11-15. The idea is framework-fingerprint-led-blink's,
+# by alejandroqh.
 #
 # The whole of the install lives here rather than in install.sh, so that
 # test/led-test.sh runs these very functions against stand-in paths. A copy
@@ -2193,6 +2194,11 @@ selinux_domain_may_use_tpm() {
 
 LED_NAME=tpm-keyring-led
 LED_GROUP=tpm-keyring-led
+# The system user the unit runs as (User=). The sysusers file creates it with
+# a group of the same name, LED_GROUP. Not a DynamicUser= throwaway user:
+# dbus-daemon, the system bus on Debian and Ubuntu, cannot resolve those and
+# turns them away (the unit file; JOURNAL.md, 2026-11-16).
+LED_USER=tpm-keyring-led
 LED_UNIT="/etc/systemd/system/$LED_NAME.service"
 LED_RULE="/etc/udev/rules.d/90-$LED_NAME.rules"
 LED_SYSUSERS="/etc/sysusers.d/$LED_NAME.conf"
@@ -2302,6 +2308,10 @@ led_install_conflict() {
   fi
   if ! led_file_is_ours "$LED_SYSUSERS" && getent group "$LED_GROUP" >/dev/null 2>&1; then
     echo "a group named $LED_GROUP exists already, and is not this tool's"
+    return 0
+  fi
+  if ! led_file_is_ours "$LED_SYSUSERS" && getent passwd "$LED_USER" >/dev/null 2>&1; then
+    echo "a user named $LED_USER exists already, and is not this tool's"
     return 0
   fi
   return 1
@@ -2546,8 +2556,8 @@ led_service_rollback() {
 # the LED back to the EC, then its unit, udev rule and sysusers file deleted,
 # each only if it carries this tool's marker. The LED's attributes keep the
 # group the rule gave them until the next boot otherwise, so they go back to
-# root without group write, and the group is deleted - both only when the
-# sysusers file was this tool's, which is what says the group is. The LED's
+# root without group write, and the user and its group are deleted - all only
+# when the sysusers file was this tool's, which is what says they are. The LED's
 # trigger is not written here: the watcher returns what it took, and any other
 # trigger is its owner's setting. The watcher itself is not deleted either:
 # the caller knows whether it is this tool's file or a package's. Best effort
@@ -2578,6 +2588,9 @@ led_service_remove() {
       sudo chmod g-w "$d/$a" 2>/dev/null || true
     done
   done
+  if getent passwd "$LED_USER" >/dev/null 2>&1; then
+    sudo userdel "$LED_USER" >/dev/null 2>&1 || true
+  fi
   if getent group "$LED_GROUP" >/dev/null 2>&1; then
     sudo groupdel "$LED_GROUP" >/dev/null 2>&1 || true
   fi

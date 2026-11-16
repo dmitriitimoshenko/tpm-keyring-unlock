@@ -1,5 +1,6 @@
 # tpm-keyring-unlock: power-button LED
-# The group that may write the LED (90-tpm-keyring-led.rules);
-# tpm-keyring-led.service runs with it. Installed by install.sh when asked
-# to, removed by uninstall.sh, which knows it by the line above.
-g tpm-keyring-led -
+# The system user tpm-keyring-led.service runs as - no login shell, no home,
+# no password - and its group of the same name, which may write the LED
+# (90-tpm-keyring-led.rules). Installed by install.sh when asked to, removed
+# by uninstall.sh, which knows it by the line above.
+u tpm-keyring-led - "tpm-keyring-unlock power-button LED" - -

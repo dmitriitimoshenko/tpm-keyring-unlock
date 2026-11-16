@@ -7179,6 +7179,12 @@ the watcher no longer writes `chromeos-auto` to an LED it did not take,
 update puts the earlier version back instead of removing it, and the install
 code moved from install.sh into bin/lib.sh. The rest stands.*
 
+*Superseded in one point by "1.7.1: the LED service never started"
+(2026-11-16): `DynamicUser=` is gone. It never started (status 217/USER),
+and a throwaway user cannot reach the system bus where that is dbus-daemon.
+The service runs as a system user, `tpm-keyring-led`, from its sysusers
+file.*
+
 The repo owner asked for what
 [framework-fingerprint-led-blink](https://github.com/alejandroqh/framework-fingerprint-led-blink)
 (alejandroqh, Apache-2.0) does, offered as an optional step of the install:
@@ -7375,7 +7381,8 @@ do that: `Failed to drop capabilities: Operation not permitted`, `status=218/
 CAPABILITIES`. The namespace options were skipped with a warning. So the user
 service tested the seccomp half of the sandbox only.
 
-**Not checked yet.** The unit under the system manager, `DynamicUser=` and
+**Not checked yet** *(and it was broken twice over: see "1.7.1: the LED
+service never started", 2026-11-16)*. The unit under the system manager, `DynamicUser=` and
 `SupplementaryGroups=` included, on the real LED. That needs root, so it
 waits for the owner's own `./install.sh` run. The installer's MainPID check
 and rollback are what stand between a unit that cannot run there and a
@@ -7829,3 +7836,198 @@ all five read 1.7.0. `dpkg-parsechangelog -l packaging/obs/debian.changelog
 shows the new `%changelog` entry on top. `test/upgrade-test.sh`: 44 ok. Its
 repositories carry versions of their own, so the real `VERSION` does not
 reach it.
+
+## 1.7.1: the LED service never started - 217/USER, and behind it a system bus that turns throwaway users away (2026-11-16)
+
+**Found by the owner**, right after #29 was merged and 1.7.0 tagged: "у меня
+не мигает сенсор когда я делаю sudo". No LED service was on the machine at
+all: no unit, no udev rule, no sysusers file, no watcher in
+`/usr/local/sbin`. The module and helper were dated 16:33 that day and
+`seal.priv` 23 October, so a `--upgrade` had run and kept the seal.
+
+**Diagnosis, without root.** The owner is in `adm`, so the system journal is
+readable. The sudo trail of that run (`journalctl _COMM=sudo`, the
+`COMMAND=` field) shows the install going through step by step:
+
+- `install -d /etc/sysusers.d`, then the watcher, the sysusers file, the
+  rule and the unit;
+- `systemd-sysusers`, `udevadm control --reload`, `udevadm trigger
+  --action=add /sys/class/leds/chromeos:white:power`, `udevadm settle`;
+- `daemon-reload`, `enable`, `restart`.
+
+Then the rollback came, whole:
+
+- `disable --now`, `clean --what=runtime`, the three files removed;
+- `chgrp root` and `chmod g-w` on `trigger`, `brightness` and
+  `multi_intensity`, then `groupdel tpm-keyring-led`;
+- the watcher removed, `rmdir /etc/sysusers.d`.
+
+The group and mode check comes before the restart and had passed, so the
+udev rule worked. The unit's own journal (`journalctl -u tpm-keyring-led`)
+said why the service failed, on every start:
+
+    tpm-keyring-led.service: Failed to update dynamic user credentials: User or group with specified name already exists.
+    tpm-keyring-led.service: Failed at step USER spawning /usr/local/sbin/tpm-keyring-led: Operation not supported
+    tpm-keyring-led.service: Main process exited, code=exited, status=217/USER
+
+**First cause.** With `DynamicUser=yes` and no `User=`, systemd names the
+throwaway user, and its group, after the unit: `tpm-keyring-led`. The
+sysusers file created a static group of exactly that name, for the udev rule
+to hand the LED to. systemd uses a static user and group in place of a
+dynamic one when both exist. Here only the group did, so it refused. That
+happens on every machine, so 1.7.0's LED service never ran anywhere. The
+installer's MainPID check caught it on the first restart, and the rollback
+left nothing behind (above). Nothing was weakened, but the feature did
+nothing.
+
+**Why nothing caught it before the release.** Both JOURNAL entries of
+2026-11-15 list "the unit under the system manager" as not checked: it needs
+root, and was left for the owner's own run. test/led-test.sh runs the
+install against stand-in `systemctl`, `udevadm` and `systemd-sysusers`. The
+sandboxed runs on this machine were *user* services (`systemd-run --user`),
+where `DynamicUser=` is not available at all, and they connected to the
+system bus as the owner's own uid. The VM test is no Framework, so the
+question never appeared there. The release went out with that gap written
+down, not closed.
+
+**First fix, a dead end: `User=tpm-keyring-blink` beside `DynamicUser=`.**
+A name of its own for the throwaway user, with the static group keeping
+`tpm-keyring-led`. It got past 217/USER, and showed the next failure (below).
+
+**A VM scenario for the gap.** `test/vm/run-vm-test.sh` now starts the unit
+under the real system manager. The pieces go in as `led_service_install`
+puts them: the watcher, the sysusers file, the unit rendered by
+`led_unit_render`. Then come `systemd-sysusers`, `daemon-reload` and
+`systemctl start`. gdbus comes from `libglib2.0-bin`, added to the guest's
+packages. Two copies of the test ran in parallel: the first fix, and a copy
+whose unit had the `User=` line taken out, the unit 1.7.0 shipped. The copy
+failed exactly as on the owner's machine: `Process:
+ExecStart=/usr/local/sbin/tpm-keyring-led (code=exited, status=217/USER)`.
+The first fix got past that step and then failed for a reason of its own.
+
+*Dead end: a real LED in the guest.* The first version of the scenario made
+one with `uleds`, which lets a process create an LED class device of any
+name. Then the whole of `led_service_install` would have run, udev rule and
+group check included, with only `framework_power_led` replaced. On this
+machine's kernel (7.0, Ubuntu 26.04) `uleds.ko` is in `linux-modules`. On
+the VM's 24.04 minimal image it is not: `modprobe: FATAL: Module uleds not
+found in directory /lib/modules/6.8.0-147-generic`. It ships in
+`linux-modules-extra` there, which the minimal image leaves out. Installing
+that package in the guest means over 100 MB on every CI run, for one
+module. So the udev rule stays covered by led-test.sh's stand-ins and by the
+owner's machine, where its check passed (the sudo trail above).
+
+**Second cause: dbus-daemon turns throwaway users away.** With a name of its
+own, the watcher started and exited 1 at once, on every restart:
+
+    tpm-keyring-led: watching net.reactivated.Fprint for the power-button LED
+    Error connecting: The connection is closed
+    tpm-keyring-led: gdbus monitor exited
+
+gdbus could not connect to the system bus at all. It was not the missing
+fprintd: on this machine, `gdbus monitor --system --dest
+net.reactivated.NoSuchName` prints "does not have an owner" and keeps
+running. Diagnostic copies of the VM test narrowed it down. First, three
+runs:
+
+- gdbus alone, as the unit's `ExecStart=` in a drop-in: the same error;
+- the same with `SystemCallFilter=` emptied: the same error, so seccomp is
+  not the cause;
+- `bash -x` on the watcher: it reaches its first read and gets EOF.
+
+Then a bisection through `systemd-run --wait --pipe`, each run calling
+`org.freedesktop.DBus.GetId`:
+
+    [root, no sandbox]                   ok
+    [DynamicUser only (unit-named)]      Error connecting: The connection is closed
+    [DynamicUser + User=]                Error connecting: The connection is closed
+    [static nobody + full sandbox]       ok
+    [full]                               Error connecting: The connection is closed
+    [full minus <each property in turn>] Error connecting: The connection is closed
+
+The sandbox has nothing to do with it. Any throwaway user is turned away.
+
+*A first reading, wrong: nss-systemd.* The guest's nsswitch.conf read
+`passwd: files` and `group: files`, since the minimal image has no
+libnss-systemd. `getent passwd tpm-keyring-blink` printed nothing while a
+unit ran as it, though `/run/systemd/dynamic-uid/direct:65406 ->
+tpm-keyring-blink` was there. A check for `systemd` in nsswitch.conf was
+written, with tests, and the guest was given libnss-systemd. Then `getent`
+and `id` resolved the throwaway user (`uid=65406(tpm-keyring-blink)`), and
+gdbus was still turned away. The check was dropped again.
+
+*What it is.* One more diagnostic run, with nss-systemd on:
+
+- uid 65406 through `setpriv`, while the unit held it: turned away;
+- uid 60000, unknown to NSS: turned away;
+- a static user created with uid 61500, inside the dynamic range: accepted;
+- `busctl` as a throwaway user: `Call failed: Transport endpoint is not
+  connected`;
+- `strace` of dbus-daemon during a refused call: it looks for
+  `/etc/userdb/65406.user`, `/run/userdb/65406.user`, ... up to
+  `/usr/lib/userdb/65406.user` (all ENOENT), and connects nowhere;
+- dbus-daemon's environment has `SYSTEMD_NSS_DYNAMIC_BYPASS=1`.
+
+PID 1 sets that variable for the bus daemon. With it, nss-systemd in
+dbus-daemon leaves PID 1's throwaway users out, which is what the strace
+shows: drop-in files only, no connection to PID 1. As far as recalled, not
+re-read here, systemd's reason is to keep PID 1 and the bus from waiting on
+each other. So dbus-daemon cannot resolve a throwaway user, whatever NSS
+says, and it drops a client it cannot resolve: uid 60000 shows that without
+any systemd involved. dbus-broker evidently does without that lookup. It is
+Fedora's bus, the only one upstream lists as tested, with the same
+`DynamicUser=` unit.
+Ubuntu, this machine included, and Debian run dbus-daemon. This machine was
+not tested as root, but its dbus.service is the same `dbus-daemon --system`,
+and the variable comes from systemd, not from the distribution.
+
+**The fix: a system user of its own.** The sysusers file's `g` line is now
+`u tpm-keyring-led - "tpm-keyring-unlock power-button LED" - -`. That makes
+a system user with a group of the same name and the same id
+(`systemd-sysusers --dry-run`: "Creating group 'tpm-keyring-led' with GID
+979. Creating user 'tpm-keyring-led' ... with UID 979 and GID 979."), with
+no login shell, no home and no password. The unit runs as
+`User=tpm-keyring-led`, `Group=tpm-keyring-led`, with no
+`SupplementaryGroups=`. It adds `RemoveIPC=yes`, the one thing
+`DynamicUser=` implied that was not set already. `systemd-analyze security
+--offline=true` now rates it 0.5 SAFE, down from 0.6.
+
+What is given up: the user stays in /etc/passwd while the service is
+installed, where a throwaway user existed only while it ran. With
+`ProtectSystem=strict` the only place it can write is its runtime
+directory, so it has nothing to leave behind either way. uninstall.sh
+removes the user (`userdel`) and then the group, both only when the
+sysusers file was this tool's.
+
+`led_install_conflict` now also refuses when a user named `tpm-keyring-led`
+exists and the sysusers file is not this tool's: the service would run as
+somebody else's account. Before, only the group was checked.
+
+**The VM scenario's checks**, all passing:
+
+- one main process outlasts `RestartSec=2`, the test `led_service_install`
+  itself makes;
+- it runs as `tpm-keyring-led` and with that group's gid;
+- its gdbus, a child of the watcher, is among the bus's connections
+  (`busctl list`, by PID), so the system bus has it;
+- `uninstall.sh`, next, takes out the unit, the user, the group and the
+  watcher.
+
+**For whoever answered yes on 1.7.0.** The installer removed the service
+again, so 1.7.1's `--upgrade` finds nothing installed and asks the LED
+question afresh. Both changelogs say so.
+
+**Why 1.7.1.** A bug fix to what 1.7.0 claimed to do, nothing new: a patch
+release. The bump is in the fix's own PR. The owner pointed out on #29 that a
+merge without a `VERSION` change publishes nothing.
+
+**Checked.** `test/led-test.sh`: 136 ok. `test/upgrade-test.sh`: 44 ok.
+`test/run-all.sh`: all PASS (arm64 skipped here). `make test-vm`: all 49
+checks ok, the LED unit's among them. `systemd-analyze verify` on the
+rendered unit: clean. `udevadm verify` on the rule: no failures. The
+release workflow's five-file check, run locally: all 1.7.1.
+`dpkg-parsechangelog` reads `1.7.1-1`, `rpmspec -q` reads `1.7.1-0`.
+
+Not checked: the service on the owner's Framework, under the real system
+manager, blinking on a real prompt. That needs root, so it waits for the
+owner's own `./install.sh --upgrade` on this branch.
